@@ -256,14 +256,16 @@ class LadderVAE(nn.Module):
         return self._global_step
 
     # TODO: check forward function
-    def forward(self, x, y=None, x_orig=None, threshold=0.99):
+    def forward(self, x, y=None, x_orig=None, confidence_threshold=0.99):
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
         x_pad = self.pad_input(x, self.conv_mult)
         # Bottom-up inference: return list of length n_layers (bottom to top)
         bu_values = self.bottomup_pass(x_pad)
         # Top-down inference/generation
-        out, td_data = self.topdown_pass(y, bu_values, threshold=threshold)
+        out, td_data = self.topdown_pass(
+            y, bu_values, confidence_threshold=confidence_threshold
+        )
         # Restore original image size
         out = crop_img_tensor(out, img_size)
         # Log likelihood and other info (per data point)
@@ -332,7 +334,7 @@ class LadderVAE(nn.Module):
         mode_layers=None,
         constant_layers=None,
         forced_latent=None,
-        threshold=0.99,
+        confidence_threshold=0.99,
     ):
         # Default: no layer is sampled from the distribution's mode
         if mode_layers is None:
@@ -408,7 +410,7 @@ class LadderVAE(nn.Module):
                 forced_latent=forced_latent[i],
                 mode_pred=self.mode_pred,
                 use_uncond_mode=use_uncond_mode,
-                threshold=threshold,
+                considence_threshold=confidence_threshold,
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
             kl[i] = aux["kl"]  # (batch, )
@@ -436,6 +438,95 @@ class LadderVAE(nn.Module):
             "pseudo_labels": pseudo_labels,
         }
         return out, data
+
+    def _mask_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Zero out the centre mask according to self.mask_size."""
+        x_masked = x.clone()
+        ps = x.shape[-1]
+        ms = self.mask_size
+        b = (ps - ms) // 2
+        e = b + ms
+        if self.conv_mult == 2:
+            x_masked[:, :, b:e, b:e] = 0
+        else:
+            x_masked[:, :, b:e, b:e, b:e] = 0
+        return x_masked
+
+    def _centre_crop(self, x: torch.Tensor) -> torch.Tensor:
+        """Crop the centre window used for inpainting loss."""
+        ps = x.shape[-1]
+        ms = self.mask_size
+        b = (ps - ms) // 2
+        e = b + ms
+        if self.conv_mult == 2:
+            return x[:, :, b:e, b:e]
+        else:
+            return x[:, :, b:e, b:e, b:e]
+
+    def _step_common(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        threshold: float = 0.99,
+        amp: bool = True,
+    ) -> dict:
+        """
+        Shared compute for train/val: runs forward with masked input and returns all
+        component losses + useful tensors.
+        """
+        from torch.cuda.amp import autocast
+
+        # 1) mask input
+        x_masked = self._mask_input(x).to(x.device)
+
+        # 2) forward
+        with autocast(enabled=amp):
+            out = self(x=x_masked, y=y, x_orig=x, threshold=threshold)
+
+        # 3) inpainting loss is centre of -loglikelihood
+        recons_sep = -out["ll"]
+        inpainting_loss = self._centre_crop(recons_sep).mean()
+
+        # 4) other components (guard cl for NaN)
+        kl = out["kl"]
+        cl = out.get("cl", torch.tensor(0.0, dtype=torch.float32, device=x.device))
+        if torch.isnan(cl):
+            cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        ce = out.get("ce", torch.tensor(0.0, dtype=torch.float32, device=x.device))
+        entropy = out.get(
+            "entropy", torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        )
+
+        return {
+            "inpainting_loss": inpainting_loss,
+            "kl_loss": kl,
+            "cl_loss": cl,
+            "ce": ce,
+            "entropy": entropy,
+            "q": out.get("q"),
+            "out_mean": out.get("out_mean"),
+            "out_sample": out.get("out_sample"),
+        }
+
+    def training_step(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        threshold: float = 0.99,
+        amp: bool = True,
+    ) -> dict:
+        """Return per-batch component losses/metrics for training."""
+        return self._step_common(x, y, threshold=threshold, amp=amp)
+
+    @torch.no_grad()
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, *, amp: bool = True
+    ) -> dict:
+        """Return per-batch component losses/metrics for validation."""
+        # If threshold annealing is only for semi-supervised, you can just use 0.99 here
+        return self._step_common(x, y, threshold=0.99, amp=amp)
 
     def pad_input(self, x, dim):
         """

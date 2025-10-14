@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from typing import Type, Union
-from torch.distributions.normal import Normal, kl_divergence
+from torch.distributions import Normal, kl_divergence
 import torch.nn.functional as F
 from lib.nn import ResidualBlock, ResidualGatedBlock
 
@@ -241,12 +241,16 @@ class TopDownLayer(nn.Module):
 
         # Sample from either q(z_i | z_{i+1}, x) or p(z_i | z_{i+1})
         # depending on whether q_params is None
-        x, data_stoch = self.stochastic(
-            label=label,
-            p_params=p_params,
-            q_params=q_params,
-            confidence_threshold=confidence_threshold,
-        )
+        if self.is_top_layer:
+            x, data_stoch = self.stochastic(
+                p_params=p_params, q_params=q_params,
+                label=label, confidence_threshold=confidence_threshold
+            )
+        else:
+            x, data_stoch = self.stochastic(
+                p_params=p_params, q_params=q_params
+            )
+
 
         # Skip connection from previous layer
         if self.stochastic_skip and not self.is_top_layer:
