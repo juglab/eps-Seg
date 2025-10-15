@@ -18,6 +18,7 @@ from eps_seg.modules.lvae.layers import (
     BottomUpDeterministicResBlock,
     BlurPool,
 )
+from torch.cuda.amp import autocast
 
 
 class LadderVAE(nn.Module):
@@ -57,6 +58,7 @@ class LadderVAE(nn.Module):
         n_components=4,
         training_mode="supervised",
         labeled_ratio=0.75,
+        
     ):
         super().__init__()
         self.training_mode = training_mode
@@ -142,11 +144,14 @@ class LadderVAE(nn.Module):
                 res_block_type=res_block_type,
                 grad_checkpoint=grad_checkpoint,
             ),
-        )
+        ).to(self.device)
 
         # Init lists of layers
         self.top_down_layers = nn.ModuleList([])
         self.bottom_up_layers = nn.ModuleList([])
+
+        # Z dimensions for stochastic layers are downscaled by factor 2
+        self.head_z_dims = [max(int(self.input_array_shape[0]/2**(i+1)), 1) for i in range(self.n_layers)]
 
         for i in range(self.n_layers):
             # Whether this is the top layer
@@ -171,11 +176,12 @@ class LadderVAE(nn.Module):
             )
 
             # Add top-down stochastic layer at level i.
-
+            # FIXME: Review commented out parameters and reimplement
             self.top_down_layers.append(
                 TopDownLayer(
                     z_dim=z_dims[i],
-                    n_layers=self.n_layers,
+                    seg_head_dim=self.head_z_dims[i],
+                    #n_layers=self.n_layers,
                     n_res_blocks=blocks_per_layer,
                     n_filters=n_filters,
                     is_top_layer=is_top,
@@ -195,11 +201,11 @@ class LadderVAE(nn.Module):
                     grad_checkpoint=grad_checkpoint,
                     analytical_kl=analytical_kl,
                     stochastic_block_type=stochastic_block_type,
-                    conditional=conditional,
-                    condition_type=condition_type,
+                    #conditional=conditional,
+                    #condition_type=condition_type,
                     n_components=n_components,
                     training_mode=training_mode,
-                    labeled_ratio=labeled_ratio,
+                    #labeled_ratio=labeled_ratio,
                 )
             )
 
@@ -411,7 +417,7 @@ class LadderVAE(nn.Module):
                 forced_latent=forced_latent[i],
                 mode_pred=self.mode_pred,
                 use_uncond_mode=use_uncond_mode,
-                considence_threshold=confidence_threshold,
+                confidence_threshold=confidence_threshold,
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
             kl[i] = aux["kl"]  # (batch, )
@@ -463,6 +469,50 @@ class LadderVAE(nn.Module):
             return x[:, :, b:e, b:e]
         else:
             return x[:, :, b:e, b:e, b:e]
+
+    # Function imported from HDN boilerplate.py
+    # TODO: what is the difference with _step_common?
+    # FIXME: Candidate to be deleted
+    def forward_pass(self, x, y, amp=True, threshold=0.99):
+        
+        x_masked = self._mask_input(x)
+        x_masked = x_masked.to(x.device, non_blocking=True)
+        assert not torch.isnan(x_masked).any(), "Input contains NaNs!"
+        assert not torch.isinf(x_masked).any(), "Input contains Infs!"
+
+        with autocast(enabled=amp):
+            model_out = self(x=x_masked, y=y, x_orig=x, threshold=threshold)
+        if self.mode_pred is False:
+
+            recons_sep = -model_out["ll"]
+            inpainting_loss = self._centre_crop(recons_sep).mean()
+            
+            kl_loss = model_out["kl"]
+            cl_loss = model_out["cl"]
+            entropy = model_out["entropy"]
+            ce = model_out["ce"]
+
+            output = {
+                "inpainting_loss": inpainting_loss,
+                "kl_loss": kl_loss,
+                "cl_loss": cl_loss,
+                "out_mean": model_out["out_mean"],
+                "out_sample": model_out["out_sample"],
+                "ce":ce,
+                "entropy": entropy,
+                "q": model_out["q"],
+            }
+
+        else:
+            output = {
+                "inpainting_loss": 0,
+                "kl_loss": 0,
+                "cl_loss": 0,
+                "out_mean": model_out["out_mean"],
+                "out_sample": model_out["out_sample"],
+            }
+
+        return output
 
     def _step_common(
         self,

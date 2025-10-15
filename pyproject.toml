@@ -17,5 +17,10 @@ dependencies = [
     "wandb>=0.22.2",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "torchvista>=0.2.6",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]

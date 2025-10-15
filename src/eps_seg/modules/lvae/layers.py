@@ -184,6 +184,7 @@ class TopDownLayer(nn.Module):
         analytical_kl=False,
         n_components=4,  # Used only for Mixture block
         training_mode="supervised",
+        stochastic_block_type="mixture",
     ):
         super().__init__()
         self.training_mode = training_mode
@@ -195,7 +196,10 @@ class TopDownLayer(nn.Module):
         self.analytical_kl = analytical_kl
         self.n_components = n_components
         self.top_prior_param_shape = top_prior_param_shape
-        self.top_prior_params = self._get_top_prior_params()
+        self.stochastic_block_type = stochastic_block_type
+
+        if self.is_top_layer:
+            self.top_prior_params = self._get_top_prior_params()
 
         # Downsampling steps left to do in this layer
         dws_left = downsampling_steps
@@ -285,7 +289,7 @@ class TopDownLayer(nn.Module):
                 self.n_components, self.top_prior_param_shape, self.learn_top_prior
             )
         else:
-            raise NotImplementedError(
+            raise ValueError(
                 "Top prior can only be initialized for mixture stochastic block type."
             )
 
@@ -341,7 +345,34 @@ class TopDownLayer(nn.Module):
         n_img_prior=None,
         use_uncond_mode=False,
         confidence_threshold=0.5,
+        use_mode=False,
+        force_constant_output=False,
+        forced_latent=None,
+        mode_pred=None,
     ):
+        """
+        Forward pass through top-down layer.
+        Args:
+            label: segmentation label (if available)
+            input_: input from layer above (prior parameters)
+            skip_connection_input: input from previous top-down layer
+            inference_mode: whether to run in inference mode (True) or
+                generative mode (False)
+            bu_value: bottom-up value at this layer (inference mode only)
+            n_img_prior: number of images to sample from prior (generative mode only)
+            use_uncond_mode: whether to use unconditional mode (generative mode only)
+            confidence_threshold: threshold for pseudo-labeling in unsupervised mode
+            use_mode: whether to use mode of distribution instead of sampling
+
+        """
+        if use_mode:
+            print("TODO: use_mode is not implemented yet")
+        if force_constant_output:
+            print("TODO: force_constant_output is not implemented yet")
+        if forced_latent is not None:
+            print("TODO: forced_latent is not implemented yet")
+        if mode_pred is not None:
+            print("TODO: mode_pred is not implemented yet")
         # Check consistency of arguments
         inputs_none = input_ is None and skip_connection_input is None
         if self.is_top_layer and not inputs_none:
@@ -420,6 +451,7 @@ class BottomUpLayer(nn.Module):
         res_block_type=None,
         gated=None,
         grad_checkpoint=False,
+        device=None,
     ):
         super().__init__()
 
@@ -444,7 +476,9 @@ class BottomUpLayer(nn.Module):
                     grad_checkpoint=grad_checkpoint,
                 )
             )
-        self.net = nn.Sequential(*bu_blocks)
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = nn.Sequential(*bu_blocks).to(self.device)
 
     def forward(self, x):
         return self.net(x)

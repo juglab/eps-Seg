@@ -359,6 +359,11 @@ dependencies = [
     { name = "wandb" },
 ]
 
+[package.optional-dependencies]
+dev = [
+    { name = "torchvista" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "ipykernel", specifier = ">=7.0.0" },
@@ -369,9 +374,11 @@ requires-dist = [
     { name = "tifffile", specifier = ">=2025.10.4" },
     { name = "torch", specifier = ">=2.8.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
+    { name = "torchvista", marker = "extra == 'dev'", specifier = ">=0.2.6" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "wandb", specifier = ">=0.22.2" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "executing"
@@ -1883,6 +1890,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1d/9d/406cea60a9eb9882145bcd62a184ee61e823e8e1d550cdc3c3ea866a9445/torchvision-0.23.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:2a3299d2b1d5a7aed2d3b6ffb69c672ca8830671967eb1cee1497bacd82fe47b", size = 2359295, upload-time = "2025-08-06T14:58:17.469Z" },
     { url = "https://files.pythonhosted.org/packages/2b/f4/34662f71a70fa1e59de99772142f22257ca750de05ccb400b8d2e3809c1d/torchvision-0.23.0-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:76bc4c0b63d5114aa81281390f8472a12a6a35ce9906e67ea6044e5af4cab60c", size = 8800474, upload-time = "2025-08-06T14:58:22.53Z" },
     { url = "https://files.pythonhosted.org/packages/6e/f5/b5a2d841a8d228b5dbda6d524704408e19e7ca6b7bb0f24490e081da1fa1/torchvision-0.23.0-cp313-cp313t-win_amd64.whl", hash = "sha256:b9e2dabf0da9c8aa9ea241afb63a8f3e98489e706b22ac3f30416a1be377153b", size = 1527667, upload-time = "2025-08-06T14:58:14.446Z" },
+]
+
+[[package]]
+name = "torchvista"
+version = "0.2.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ipython" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/f7/fef72a2948899c854a6d4022eb13dd2a95f8d6cb7f9004b9624593a2acf9/torchvista-0.2.6.tar.gz", hash = "sha256:66dfbdf670e9f8b3b418bfeb9de48d61c03c0b46b322b48883192f31c8336cae", size = 1033542, upload-time = "2025-08-20T21:44:35.514Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/07/d6f4d555291b61f511e4574b59659b7a697959c44640f054109064d03070/torchvista-0.2.6-py3-none-any.whl", hash = "sha256:4716a8a865ddb4659bd5040e1134b4c56378b813d65697f5f7318e2b57aa8f08", size = 1049387, upload-time = "2025-08-20T21:44:34.165Z" },
 ]
 
 [[package]]

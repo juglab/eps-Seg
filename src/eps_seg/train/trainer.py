@@ -37,7 +37,7 @@ class Trainer:
             model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        self.optimizer, self.scheduler = boilerplate._make_optimizer_and_scheduler(
+        self.optimizer, self.scheduler = _make_optimizer_and_scheduler(
             self.model, cfg.lr, 0.0
         )
         self.scaler = GradScaler(init_scale=cfg.gradient_scale, enabled=cfg.amp)
@@ -117,8 +117,9 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             threshold = float(self.extra_state.get("threshold", 0.50))
-            outputs = boilerplate.forward_pass(x, y, self.device, self.model, self.gaussian_noise_std, amp=self.cfg.amp)
-
+            print(f"TODO: threshold is not used in forward_pass")
+            outputs = self.model.forward_pass(x, y, amp=self.cfg.amp)
+            
 
             # UNSUP confusion-matrix metrics (only if provided like your code)
             if getattr(self.model, "training_mode", "") == "unsupervised" and isinstance(
