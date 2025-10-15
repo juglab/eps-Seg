@@ -2,16 +2,16 @@ import numpy as np
 import torch
 from torch import nn
 from typing import Type, Union
+from eps_seg.modules.lvae.likelihoods import GaussianLikelihood  
 
-from lib.likelihoods import GaussianLikelihood, NoiseModelLikelihood
-from lib.utils import (
+from eps_seg.modules.lvae.utils import (
     crop_img_tensor,
     pad_img_tensor,
     Interpolate,
     free_bits_kl,
     compute_cl_loss,
 )
-from .lvae_layers import (
+from eps_seg.modules.lvae.layers import (
     TopDownLayer,
     BottomUpLayer,
     TopDownDeterministicResBlock,
@@ -226,15 +226,16 @@ class LadderVAE(nn.Module):
         # Define likelihood
         if self.likelihood_form == "gaussian":
             self.likelihood = GaussianLikelihood(n_filters, color_ch, conv_mult)
-        elif self.likelihood_form == "noise_model":
-            self.likelihood = NoiseModelLikelihood(
-                n_filters,
-                color_ch,
-                conv_mult,
-                data_mean,
-                data_std,
-                noiseModel,
-            )
+        # In eps-Seg we use only use a Gaussian likelihood
+        # elif self.likelihood_form == "noise_model":
+        #     self.likelihood = NoiseModelLikelihood(
+        #         n_filters,
+        #         color_ch,
+        #         conv_mult,
+        #         data_mean,
+        #         data_std,
+        #         noiseModel,
+        #     )
         else:
             msg = "Unrecognized likelihood '{}'".format(self.likelihood_form)
             raise RuntimeError(msg)

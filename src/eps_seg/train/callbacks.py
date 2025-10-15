@@ -7,7 +7,7 @@ import torch
 import numpy as np
 import shutil
 import time
-
+from eps_seg.train.optimizers import LabelSizeScheduler
 
 class Callback:
     # Override the hooks you need.
@@ -108,7 +108,6 @@ class LabelMaskSizeScheduler(Callback):
         final_mask: int,
         step_interval: int,
     ):
-        from boilerplate.boilerplate import LabelSizeScheduler
 
         self._label_sched = LabelSizeScheduler(initial_label, final_label, step_interval)
         self._mask_sched = LabelSizeScheduler(initial_mask, final_mask, step_interval)

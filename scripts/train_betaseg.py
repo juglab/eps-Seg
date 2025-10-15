@@ -3,23 +3,23 @@ import os, argparse, numpy as np, torch, tifffile as tiff
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.lvae import LadderVAE
-from boilerplate.dataloader import (
-    SemisupervisedDataset,
-    ModeAwareBalancedAnchorBatchSampler,
-    flex_collate,
-)
-from engine.trainer import Trainer, TrainConfig
-from engine.callbacks import (
-    ModelCheckpoint,
-    EarlyStopping,
-    ReduceLROnPlateauStep,
-    LabelMaskSizeScheduler,
-    ThresholdScheduler,
-    PlateauActions,
-    NaNDetector,
-    WandbLogger,
-)
+from eps_seg.modules.lvae import LadderVAE
+from eps_seg.dataloaders.datasets import SemisupervisedDataset
+from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
+from eps_seg.dataloaders.utils import flex_collate
+
+from eps_seg.config.train import TrainConfig
+from eps_seg.train import Trainer
+from eps_seg.train.callbacks import (
+                                            ModelCheckpoint,
+                                            EarlyStopping,
+                                            ReduceLROnPlateauStep,
+                                            LabelMaskSizeScheduler,
+                                            ThresholdScheduler,
+                                            PlateauActions,
+                                            NaNDetector,
+                                            WandbLogger,
+                                    )
 
 
 def build_data(args):
@@ -130,7 +130,7 @@ def main():
     parser.add_argument("--image", type=str)
     parser.add_argument("--labels", type=str)
     parser.add_argument(
-        "--directory_path", type=str, default="/group/jug/Sheida/HVAE/segmentation/65/"
+        "--directory_path", type=str, default="./results/test_refactoring/"
     )
     parser.add_argument("--contrastive_learning", type=bool, default=True)
     parser.add_argument("--mode", type=str, default="semisupervised")
@@ -189,7 +189,7 @@ def main():
     cbs = [
         WandbLogger(
             use_wandb=cfg.use_wandb,
-            project="segmentation",
+            project="refactor_test",
             config={
                 "learning rate": cfg.lr,
                 "epochs": cfg.max_epochs,

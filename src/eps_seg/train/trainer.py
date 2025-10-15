@@ -1,30 +1,15 @@
 # mlproject/engine/trainer.py
 from __future__ import annotations
 from typing import Dict, Any, Optional, Iterable
-from dataclasses import dataclass
 import torch
 from torch.amp import GradScaler
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
 import numpy as np
 
-from boilerplate import boilerplate  # your existing helper
-from .callbacks import Callback
-
-
-@dataclass
-class TrainConfig:
-    lr: float = 3e-5
-    max_epochs: int = 1000
-    batch_size: int = 256
-    amp: bool = True
-    gradient_scale: int = 256
-    max_grad_norm: Optional[float] = 1.0
-    alpha: float = 1.0
-    beta: float = 1e-1
-    gamma: float = 1.0
-    use_wandb: bool = True
-
+from eps_seg.config.train import TrainConfig
+from eps_seg.train.callbacks import Callback
+from eps_seg.train.optimizers import _make_optimizer_and_scheduler
 
 class Trainer:
     def __init__(
@@ -60,11 +45,11 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self.should_stop = False
-        self.bad_epochs = 0  # mirrors your patience_
+        self.bad_epochs = 0
         self.best_metric = np.inf
         self.extra_state: Dict[str, Any] = {
             "threshold": 0.50
-        }  # compatible with your code
+        }
 
         cudnn.benchmark = True
         cudnn.fastest = True
