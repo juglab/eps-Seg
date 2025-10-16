@@ -917,6 +917,9 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         if label is None:
             # Inference mode: use softmax for y
             y = F.softmax(qy_logits, dim=1)
+            # TODO: check if this is the right way to handle KL in inference
+            y_pred = y.argmax(dim=1)
+            kl = self._compute_kl_mixture(q, p_components, label, y_pred)
         elif self.training_mode == "semisupervised":
             # Semi-supervised learning: use pseudo-labeling for unlabeled data
             y, pseudo_label, cross_entropy = self._semisupervised_forward(
