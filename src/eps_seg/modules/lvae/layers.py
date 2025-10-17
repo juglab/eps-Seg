@@ -160,6 +160,13 @@ class TopDownLayer(nn.Module):
     If this is the top layer, at inference time, the uppermost bottom-up value
     is used directly as q_params, and p_params are defined in this layer
     (while they are usually taken from the previous layer), and can be learned.
+
+    Args:
+        - stochastic_skip (bool): whether to use skip connection around stochastic block
+        - skip_connection (bool): whether to use skip connection at this layer (from encoder to decoder)
+        - seg_head_dim (int): 
+            dimension of the segmentation head - Only used in the top layers
+
     """
 
     def __init__(
@@ -172,16 +179,16 @@ class TopDownLayer(nn.Module):
         downsampling_steps=None,
         conv_mult=2,
         nonlin=None,
-        merge_type=None,
+        skip_connection_merge_type=None,
         batchnorm=True,
         dropout=None,
-        stochastic_skip=False,
+        enable_top_down_residual=False,
+        skip_connection=True,
         res_block_type=None,
         gated=None,
         grad_checkpoint=False,
         learn_top_prior=False,
         top_prior_param_shape=None,
-        analytical_kl=False,
         n_components=4,  # Used only for Mixture block
         training_mode="supervised",
         stochastic_block_type="mixture",
@@ -191,12 +198,12 @@ class TopDownLayer(nn.Module):
         self.is_top_layer = is_top_layer
         self.z_dim = z_dim
         self.seg_head_dim = seg_head_dim
-        self.stochastic_skip = stochastic_skip
+        self.enable_top_down_residual = enable_top_down_residual
         self.learn_top_prior = learn_top_prior
-        self.analytical_kl = analytical_kl
         self.n_components = n_components
         self.top_prior_param_shape = top_prior_param_shape
         self.stochastic_block_type = stochastic_block_type
+        self.skip_connection = skip_connection
 
         if self.is_top_layer:
             self.top_prior_params = self._get_top_prior_params()
@@ -254,9 +261,9 @@ class TopDownLayer(nn.Module):
         if not is_top_layer:
             # Merge layer, combine bottom-up inference with top-down
             # generative to give posterior parameters
-            self.merge = MergeLayer(
+            self.skip_connection_merger = MergeLayer(
                 channels=n_filters,
-                merge_type=merge_type,
+                merge_type=skip_connection_merge_type,
                 conv_mult=conv_mult,
                 nonlin=nonlin,
                 batchnorm=batchnorm,
@@ -266,9 +273,10 @@ class TopDownLayer(nn.Module):
             )
 
             # Skip connection that goes around the stochastic top-down layer
-            if stochastic_skip:
-                self.skip_connection_merger = SkipConnectionMerger(
+            if enable_top_down_residual:
+                self.top_down_residual = MergeLayer(
                     channels=n_filters,
+                    merge_type="residual",
                     conv_mult=conv_mult,
                     nonlin=nonlin,
                     batchnorm=batchnorm,
@@ -343,7 +351,6 @@ class TopDownLayer(nn.Module):
         inference_mode=False,
         bu_value=None,
         n_img_prior=None,
-        use_uncond_mode=False,
         confidence_threshold=0.5,
         use_mode=False,
         force_constant_output=False,
@@ -360,7 +367,6 @@ class TopDownLayer(nn.Module):
                 generative mode (False)
             bu_value: bottom-up value at this layer (inference mode only)
             n_img_prior: number of images to sample from prior (generative mode only)
-            use_uncond_mode: whether to use unconditional mode (generative mode only)
             confidence_threshold: threshold for pseudo-labeling in unsupervised mode
             use_mode: whether to use mode of distribution instead of sampling
 
@@ -395,11 +401,11 @@ class TopDownLayer(nn.Module):
             if self.is_top_layer:
                 q_params = bu_value
             else:
-                if use_uncond_mode:
-                    q_params = p_params
+                if self.skip_connection:
+                    q_params = self.skip_connection_merger(bu_value, p_params)
                 else:
-                    # q_params = self.merge(bu_value, p_params)
                     q_params = p_params
+                    
 
         # In generative mode, q is not used
         else:
@@ -419,8 +425,8 @@ class TopDownLayer(nn.Module):
 
 
         # Skip connection from previous layer
-        if self.stochastic_skip and not self.is_top_layer:
-            x = self.skip_connection_merger(x, skip_connection_input)
+        if self.enable_top_down_residual and not self.is_top_layer:
+            x = self.top_down_residual(x, skip_connection_input)
 
         # Save activation before residual block: could be the skip
         # connection input in the next layer
@@ -675,7 +681,7 @@ class MergeLayer(nn.Module):
         return self.layer(x)
 
 
-class SkipConnectionMerger(MergeLayer):
+class ResidualMerger(MergeLayer):
     """
     By default for now simply a merge layer.
     """
@@ -843,6 +849,9 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
     Top layer stochastic block with Gaussian Mixture Model and conditioning.
     Uses q(y|x) and q(z|x,y) with FiLM modulation.
     Always conditional, always mixture prior.
+
+
+
     """
 
     def __init__(
@@ -886,6 +895,15 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
 
     def forward(self, p_params, q_params, label, confidence_threshold=None):
+        """
+        
+        Outputs:
+        out: output tensor after sampling and conv
+        data: 
+            pi: `q(y|x)` class probabilities
+        
+        
+        """
         self.batch_size = q_params.shape[0]
 
         # Process prior parameters (mixture of Gaussians)
@@ -918,8 +936,8 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
             # Inference mode: use softmax for y
             y = F.softmax(qy_logits, dim=1)
             # TODO: check if this is the right way to handle KL in inference
-            y_pred = y.argmax(dim=1)
-            kl = self._compute_kl_mixture(q, p_components, label, y_pred)
+            # Class is computed outside
+            kl = 0.0
         elif self.training_mode == "semisupervised":
             # Semi-supervised learning: use pseudo-labeling for unlabeled data
             y, pseudo_label, cross_entropy = self._semisupervised_forward(
@@ -952,7 +970,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
             "kl": kl,
             "mu": q_mu,
             "lv": q_lv,
-            "pi": y,
+            "class_probabilities": y,
             "cross_entropy": cross_entropy,
             "pseudo_labels": pseudo_label,
         }

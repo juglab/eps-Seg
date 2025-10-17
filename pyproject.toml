@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "ipykernel>=7.0.0",
+    "lightning>=2.5.5",
     "matplotlib>=3.10.7",
     "numpy>=2.3.3",
+    "pydantic>=2.12.2",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.7.2",
     "tifffile>=2025.10.4",

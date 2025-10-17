@@ -19,54 +19,23 @@ from eps_seg.modules.lvae.layers import (
     BlurPool,
 )
 from torch.cuda.amp import autocast
-
+from eps_seg.config import LVAEConfig
 
 class LadderVAE(nn.Module):
-    def __init__(
-        self,
-        z_dims,
-        device,
-        data_mean,
-        data_std,
-        color_ch=1,
-        noiseModel=None,
-        blocks_per_layer=5,
-        conv_mult=3,
-        nonlin=nn.ELU,
-        merge_type="residual",
-        batchnorm=True,
-        stochastic_skip=True,
-        n_filters=64,
-        dropout=0.2,
-        free_bits=0.0,
-        learn_top_prior=False,
-        img_shape=None,
-        res_block_type="bacdbacd",
-        gated=True,
-        grad_checkpoint=False,
-        no_initial_downscaling=True,
-        analytical_kl=True,
-        mode_pred=False,
-        use_uncond_mode_at=[],
-        mask_size=5,
-        contrastive_learning=False,
-        margin=50,
-        lambda_contrastive=0.5,
-        stochastic_block_type="normal",
-        conditional=False,
-        condition_type="mlp",
-        n_components=4,
-        training_mode="supervised",
-        labeled_ratio=0.75,
-        
-    ):
+    def __init__(self, cfg: LVAEConfig, device, data_mean, data_std, mode_pred=False):
         super().__init__()
-        self.training_mode = training_mode
-        self.color_ch = color_ch
-        self.z_dims = z_dims
-        self.blocks_per_layer = blocks_per_layer
-        # Get class of convolutional layer
-        self.conv_mult = conv_mult
+        self.cfg = cfg
+        self.device = device
+        self.training_mode = cfg.training_mode
+        
+        self.data_mean = torch.Tensor([data_mean]).to(self.device)
+        self.data_std = torch.Tensor([data_std]).to(self.device)
+
+        self.n_layers = cfg.n_layers
+        self.z_dims = cfg.z_dims
+        self.blocks_per_layer = cfg.blocks_per_layer
+        self.conv_mult = cfg.conv_mult
+
         # Standard convolution
         self.conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
             nn, f"Conv{self.conv_mult}d"
@@ -74,32 +43,35 @@ class LadderVAE(nn.Module):
         self.up_conv_type: Type[Union[nn.ConvTranspose2d, nn.ConvTranspose3d]] = getattr(
             nn, f"ConvTranspose{self.conv_mult}d"
         )
+        self.nonlin: Type[Union[nn.ReLU, nn.LeakyReLU, nn.ELU, nn.SELU]] = getattr(
+            nn, cfg.nonlin
+        )
 
-        # Get class of nonlinear activation from string description
-        self.nonlin: Type[Union[nn.ReLU, nn.LeakyReLU, nn.ELU, nn.SELU]] = nonlin
-        self.n_layers = len(self.z_dims)
-        self.stochastic_skip = stochastic_skip
-        self.n_filters = n_filters
-        self.dropout = dropout
-        self.free_bits = free_bits
-        self.learn_top_prior = learn_top_prior
-        self.input_array_shape = tuple(img_shape)
-        self.res_block_type = res_block_type
-        self.gated = gated
-        self.device = device
-        self.data_mean = torch.Tensor([data_mean]).to(self.device)
-        self.data_std = torch.Tensor([data_std]).to(self.device)
-        self.noiseModel = noiseModel
+        self.enable_top_down_residuals = cfg.enable_top_down_residuals
+        self.skip_connections = cfg.skip_connections
+        self.skip_connections_merge_type = cfg.skip_connections_merge_type
+        self.batchnorm = cfg.use_batchnorm
+        self.color_ch = cfg.color_channels
+        self.n_filters = cfg.n_fiters
+        self.dropout = cfg.dropout
+        self.kl_free_bits = cfg.kl_free_bits
+        self.learn_top_prior = cfg.learn_top_prior
+        self.res_block_type = cfg.res_block_type
+        self.use_gated_convs = cfg.use_gated_convs
+        self.use_grad_checkpoint = cfg.grad_checkpoint
+        # TODO: This should be managed during training mode switch
         self.mode_pred = mode_pred
-        self.use_uncond_mode_at = use_uncond_mode_at
-        self._global_step = 0
-        self.mask_size = mask_size
-        self.contrastive_learning = contrastive_learning
-        self.margin = margin
-        self.lambda_contrastive = lambda_contrastive
-        self.prior_type = stochastic_block_type
-        self.n_components = n_components
+        self.no_initial_downscaling = cfg.no_initial_downscaling
+        self.mask_size = cfg.mask_size
+        self.use_contrastive_learning = cfg.use_contrastive_learning
+        self.margin = cfg.margin
+        self.n_components = cfg.n_components
 
+        
+        # Derived paramters
+        self.input_array_shape = cfg.img_shape
+        self.likelihood_form = "gaussian"
+       
         assert self.data_std is not None, "Data std is not specified"
         assert self.data_mean is not None, "Data mean is not specified"
         assert self.conv_mult in [
@@ -111,16 +83,16 @@ class LadderVAE(nn.Module):
             2,
             3,
         ], "Please specify correct number of input channels"
-        if self.noiseModel is None:
-            self.likelihood_form = "gaussian"
-        else:
-            self.likelihood_form = "noise_model"
+ 
+        self.build_architecture()
+
+    def build_architecture(self):
 
         self.downsample = [1] * self.n_layers
 
         # Downsample by a factor of 2 at each downsampling operation
         self.overall_downscale_factor = np.power(2, sum(self.downsample))
-        if not no_initial_downscaling:  # by default do another downscaling
+        if not self.no_initial_downscaling:  # by default do another downscaling
             self.overall_downscale_factor *= 2
 
         assert max(self.downsample) <= self.blocks_per_layer
@@ -128,21 +100,21 @@ class LadderVAE(nn.Module):
 
         # First bottom-up layer: change num channels + downsample by factor 2
         # unless we want to prevent this
-        stride = 1 if no_initial_downscaling else 2
+        stride = 1 if self.no_initial_downscaling else 2
         self.first_bottom_up = nn.Sequential(
             # self.conv_type(color_ch, n_filters, 5, padding=2, stride=stride),
-            self.conv_type(color_ch, n_filters, 5, padding=2, stride=1),  # No stride here
-            BlurPool(n_filters, stride=stride),  # Add BlurPool for downsampling
+            self.conv_type(self.color_ch, self.n_filters, 5, padding=2, stride=1),  # No stride here
+            BlurPool(self.n_filters, stride=stride),  # Add BlurPool for downsampling
             self.nonlin(),
             BottomUpDeterministicResBlock(
-                c_in=n_filters,
-                c_out=n_filters,
+                c_in=self.n_filters,
+                c_out=self.n_filters,
                 conv_mult=self.conv_mult,
                 nonlin=self.nonlin,
-                batchnorm=batchnorm,
-                dropout=dropout,
-                res_block_type=res_block_type,
-                grad_checkpoint=grad_checkpoint,
+                batchnorm=self.batchnorm,
+                dropout=self.dropout,
+                res_block_type=self.res_block_type,
+                grad_checkpoint=self.use_grad_checkpoint,
             ),
         ).to(self.device)
 
@@ -151,7 +123,7 @@ class LadderVAE(nn.Module):
         self.bottom_up_layers = nn.ModuleList([])
 
         # Z dimensions for stochastic layers are downscaled by factor 2
-        self.head_z_dims = [max(int(self.input_array_shape[0]/2**(i+1)), 1) for i in range(self.n_layers)]
+        self.head_z_dims =  int(self.input_array_shape[0]/(2**self.n_layers))
 
         for i in range(self.n_layers):
             # Whether this is the top layer
@@ -163,15 +135,15 @@ class LadderVAE(nn.Module):
             self.bottom_up_layers.append(
                 BottomUpLayer(
                     n_res_blocks=self.blocks_per_layer,
-                    n_filters=n_filters,
+                    n_filters=self.n_filters,
                     downsampling_steps=self.downsample[i],
                     conv_mult=self.conv_mult,
                     nonlin=self.nonlin,
-                    batchnorm=batchnorm,
-                    dropout=dropout,
-                    res_block_type=res_block_type,
-                    gated=gated,
-                    grad_checkpoint=grad_checkpoint,
+                    batchnorm=self.batchnorm,
+                    dropout=self.dropout,
+                    res_block_type=self.res_block_type,
+                    gated=self.use_gated_convs,
+                    grad_checkpoint=self.use_grad_checkpoint,
                 )
             )
 
@@ -179,72 +151,58 @@ class LadderVAE(nn.Module):
             # FIXME: Review commented out parameters and reimplement
             self.top_down_layers.append(
                 TopDownLayer(
-                    z_dim=z_dims[i],
-                    seg_head_dim=self.head_z_dims[i],
+                    z_dim=self.z_dims[i],
+                    seg_head_dim=self.head_z_dims,
                     #n_layers=self.n_layers,
-                    n_res_blocks=blocks_per_layer,
-                    n_filters=n_filters,
+                    n_res_blocks=self.blocks_per_layer,
+                    n_filters=self.n_filters,
                     is_top_layer=is_top,
                     downsampling_steps=self.downsample[i],
                     conv_mult=self.conv_mult,
                     nonlin=self.nonlin,
-                    merge_type=merge_type,
-                    batchnorm=batchnorm,
-                    dropout=dropout,
-                    stochastic_skip=stochastic_skip,
-                    learn_top_prior=learn_top_prior,
+                    skip_connection_merge_type=self.skip_connections_merge_type,
+                    batchnorm=self.batchnorm,
+                    dropout=self.dropout,
+                    enable_top_down_residual=self.enable_top_down_residuals[i],
+                    skip_connection=self.skip_connections[i],
+                    learn_top_prior=self.learn_top_prior,
                     top_prior_param_shape=self.get_top_prior_param_shape(
                         dim=self.conv_mult
                     ),
-                    res_block_type=res_block_type,
-                    gated=gated,
-                    grad_checkpoint=grad_checkpoint,
-                    analytical_kl=analytical_kl,
-                    stochastic_block_type=stochastic_block_type,
+                    res_block_type=self.res_block_type,
+                    gated=self.use_gated_convs,
+                    grad_checkpoint=self.use_grad_checkpoint,
+                    stochastic_block_type=self.stochastic_block_type,
                     #conditional=conditional,
                     #condition_type=condition_type,
-                    n_components=n_components,
-                    training_mode=training_mode,
+                    n_components=self.n_components,
+                    training_mode=self.training_mode,
                     #labeled_ratio=labeled_ratio,
                 )
             )
 
         # Final top-down layer
         modules = list()
-        if not no_initial_downscaling:
+        if not self.no_initial_downscaling:
             modules.append(Interpolate(scale=2))
-        for i in range(blocks_per_layer):
+        for i in range(self.blocks_per_layer):
             modules.append(
                 TopDownDeterministicResBlock(
-                    c_in=n_filters,
-                    c_out=n_filters,
+                    c_in=self.n_filters,
+                    c_out=self.n_filters,
                     conv_mult=self.conv_mult,
                     nonlin=self.nonlin,
-                    batchnorm=batchnorm,
-                    dropout=dropout,
-                    res_block_type=res_block_type,
-                    gated=gated,
-                    grad_checkpoint=grad_checkpoint,
+                    batchnorm=self.batchnorm,
+                    dropout=self.dropout,
+                    res_block_type=self.res_block_type,
+                    gated=self.use_gated_convs,
+                    grad_checkpoint=self.use_grad_checkpoint,
                 )
             )
         self.final_top_down = nn.Sequential(*modules)
 
         # Define likelihood
-        if self.likelihood_form == "gaussian":
-            self.likelihood = GaussianLikelihood(n_filters, color_ch, conv_mult)
-        # In eps-Seg we use only use a Gaussian likelihood
-        # elif self.likelihood_form == "noise_model":
-        #     self.likelihood = NoiseModelLikelihood(
-        #         n_filters,
-        #         color_ch,
-        #         conv_mult,
-        #         data_mean,
-        #         data_std,
-        #         noiseModel,
-        #     )
-        else:
-            msg = "Unrecognized likelihood '{}'".format(self.likelihood_form)
-            raise RuntimeError(msg)
+        self.likelihood = GaussianLikelihood(self.n_filters, self.color_ch, self.conv_mult)
 
     def increment_global_step(self):
         """Increments global step by 1."""
@@ -263,7 +221,7 @@ class LadderVAE(nn.Module):
         return self._global_step
 
     # TODO: check forward function
-    def forward(self, x, y=None, x_orig=None, confidence_threshold=0.99):
+    def forward(self, x, y=None, x_orig=None, confidence_threshold=0.99, amp=True):
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
         x_pad = self.pad_input(x, self.conv_mult)
@@ -287,14 +245,14 @@ class LadderVAE(nn.Module):
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
             kl = torch.stack(td_data["kl"]).sum(0)
-            if self.free_bits > 0:
-                kl = free_bits_kl(kl, self.free_bits)
+            if self.kl_free_bits > 0:
+                kl = free_bits_kl(kl, self.kl_free_bits)
         q = None
-        if self.contrastive_learning and self.mode_pred is False:
+        if self.use_contrastive_learning and self.mode_pred is False:
             cl, q = compute_cl_loss(
                 mus=td_data["mu"],
                 logvars=td_data["logvar"],
-                pis=td_data["pi"] if "pi" in td_data else None,
+                pis=td_data["class_probabilities"] if "class_probabilities" in td_data else None,
                 labels=td_data["pseudo_labels"],
                 # labels=y,
                 margin=self.margin,
@@ -313,10 +271,8 @@ class LadderVAE(nn.Module):
             "out_mode": likelihood_info["mode"],
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
-            "ce": td_data["ce"][-1],
-            "entropy": td_data["entropy"][-1],
-            "pi": td_data["pi"][-1] if "pi" in td_data else None,
-            "q": q,
+            "cross_entropy": td_data["cross_entropy"][-1],
+            "class_probabilities": td_data["class_probabilities"][-1] if "class_probabilities" in td_data else None,
         }
         return output
 
@@ -373,12 +329,11 @@ class LadderVAE(nn.Module):
 
         # KL divergence of each layer
         kl = [0.0] * self.n_layers
-        ce = [0.0] * self.n_layers
-        entropy = [0.0] * self.n_layers
+        ce = [0.0] * self.n_layers # There is only one cross-entropy, at the top layer
 
         mu = [None] * self.n_layers
         logvar = [None] * self.n_layers
-        pi = [None] * self.n_layers
+        class_prob = [None] * self.n_layers
         pseudo_labels = [None] * self.n_layers
 
         if forced_latent is None:
@@ -399,7 +354,6 @@ class LadderVAE(nn.Module):
             # Whether the current layer should be sampled from the mode
             use_mode = i in mode_layers
             constant_out = i in constant_layers
-            use_uncond_mode = i in self.use_uncond_mode_at
 
             # Input for skip connection
             skip_input = out  # TODO or out_pre_residual? or both?
@@ -416,15 +370,13 @@ class LadderVAE(nn.Module):
                 force_constant_output=constant_out,
                 forced_latent=forced_latent[i],
                 mode_pred=self.mode_pred,
-                use_uncond_mode=use_uncond_mode,
                 confidence_threshold=confidence_threshold,
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
             kl[i] = aux["kl"]  # (batch, )
-            ce[i] = aux["cross_entropy"]
-            entropy[i] = aux["entropy"]
+            ce[i] = aux.get("cross_entropy", None)
             mu[i] = aux["mu"]
-            pi[i] = aux["pi"] if "pi" in aux else None
+            class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
             pseudo_labels[i] = aux["pseudo_labels"] if "pseudo_labels" in aux else None
             if self.mode_pred is False:
                 logprob_p += aux["logprob_p"].mean()  # mean over batch
@@ -439,9 +391,8 @@ class LadderVAE(nn.Module):
             "logprob_p": logprob_p,  # scalar, mean over batch
             "mu": mu,
             "logvar": logvar,
-            "pi": pi,
-            "ce": ce,
-            "entropy": entropy,
+            "class_probabilities": class_prob,
+            "cross_entropy": ce,
             "pseudo_labels": pseudo_labels,
         }
         return out, data
@@ -470,50 +421,6 @@ class LadderVAE(nn.Module):
         else:
             return x[:, :, b:e, b:e, b:e]
 
-    # Function imported from HDN boilerplate.py
-    # TODO: what is the difference with _step_common?
-    # FIXME: Candidate to be deleted
-    def forward_pass(self, x, y, amp=True, threshold=0.99):
-        
-        x_masked = self._mask_input(x)
-        x_masked = x_masked.to(x.device, non_blocking=True)
-        assert not torch.isnan(x_masked).any(), "Input contains NaNs!"
-        assert not torch.isinf(x_masked).any(), "Input contains Infs!"
-
-        with autocast(enabled=amp):
-            model_out = self(x=x_masked, y=y, x_orig=x, threshold=threshold)
-        if self.mode_pred is False:
-
-            recons_sep = -model_out["ll"]
-            inpainting_loss = self._centre_crop(recons_sep).mean()
-            
-            kl_loss = model_out["kl"]
-            cl_loss = model_out["cl"]
-            entropy = model_out["entropy"]
-            ce = model_out["ce"]
-
-            output = {
-                "inpainting_loss": inpainting_loss,
-                "kl_loss": kl_loss,
-                "cl_loss": cl_loss,
-                "out_mean": model_out["out_mean"],
-                "out_sample": model_out["out_sample"],
-                "ce":ce,
-                "entropy": entropy,
-                "q": model_out["q"],
-            }
-
-        else:
-            output = {
-                "inpainting_loss": 0,
-                "kl_loss": 0,
-                "cl_loss": 0,
-                "out_mean": model_out["out_mean"],
-                "out_sample": model_out["out_sample"],
-            }
-
-        return output
-
     def _step_common(
         self,
         x: torch.Tensor,
@@ -523,8 +430,8 @@ class LadderVAE(nn.Module):
         amp: bool = True,
     ) -> dict:
         """
-        Shared compute for train/val: runs forward with masked input and returns all
-        component losses + useful tensors.
+            Shared compute for train/val: runs forward with masked input and returns all
+            component losses + useful tensors.
         """
         from torch.cuda.amp import autocast
 
@@ -533,7 +440,7 @@ class LadderVAE(nn.Module):
 
         # 2) forward
         with autocast(enabled=amp):
-            out = self(x=x_masked, y=y, x_orig=x, threshold=threshold)
+            out = self(x=x_masked, y=y, x_orig=x, confidence_threshold=threshold)
 
         # 3) inpainting loss is centre of -loglikelihood
         recons_sep = -out["ll"]
@@ -544,18 +451,13 @@ class LadderVAE(nn.Module):
         cl = out.get("cl", torch.tensor(0.0, dtype=torch.float32, device=x.device))
         if torch.isnan(cl):
             cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        ce = out.get("ce", torch.tensor(0.0, dtype=torch.float32, device=x.device))
-        entropy = out.get(
-            "entropy", torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        )
+        ce = out.get("cross_entropy", torch.tensor(0.0, dtype=torch.float32, device=x.device))
 
         return {
             "inpainting_loss": inpainting_loss,
             "kl_loss": kl,
             "cl_loss": cl,
-            "ce": ce,
-            "entropy": entropy,
-            "q": out.get("q"),
+            "cross_entropy": ce,
             "out_mean": out.get("out_mean"),
             "out_sample": out.get("out_sample"),
         }
@@ -631,8 +533,8 @@ class LadderVAE(nn.Module):
         dwnsc = self.overall_downscale_factor
         sz = self.get_padded_size(self.input_array_shape, dim)
         c = self.z_dims[-1] * 2  # mu and logvar
-        if self.prior_type == "mixture":
-            c *= self.n_components
+        # For mixture model, we need parameters for each component
+        c *= self.n_components
         if self.conv_mult == 2:
             h = sz[0] // dwnsc
             w = sz[1] // dwnsc

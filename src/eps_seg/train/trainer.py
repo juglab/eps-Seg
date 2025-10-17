@@ -118,7 +118,7 @@ class Trainer:
 
             threshold = float(self.extra_state.get("threshold", 0.50))
             print(f"TODO: threshold is not used in forward_pass")
-            outputs = self.model.forward_pass(x, y, amp=self.cfg.amp)
+            outputs = self.model(x, y, amp=self.cfg.amp)
             
 
             # UNSUP confusion-matrix metrics (only if provided like your code)
@@ -171,15 +171,13 @@ class Trainer:
             cl_loss = outputs.get("cl_loss", torch.tensor(0.0, device=self.device))
             if torch.isnan(cl_loss):
                 cl_loss = torch.tensor(0.0, device=self.device)
-            ce = outputs.get("ce", torch.tensor(0.0, device=self.device))
-            entropy = outputs.get("entropy", torch.tensor(0.0, device=self.device))
+            ce = outputs.get("cross_entropy", torch.tensor(0.0, device=self.device))
 
             loss = (
                 self.cfg.alpha * inpainting_loss
                 + self.cfg.beta * kl_loss
                 + self.cfg.gamma * cl_loss
                 + ce
-                + entropy
             )
 
             self.scaler.scale(loss).backward()
@@ -199,7 +197,6 @@ class Trainer:
             running["KL"] += float(kl_loss.item() * self.cfg.beta)
             running["CL"] += float(cl_loss.item() * self.cfg.gamma)
             running["CE"] += float(ce.item())
-            running["EL"] += float(entropy.item())
             running["Total"] += float(loss.item())
 
             if (batch_idx + 1) % log_interval == 0:
@@ -232,19 +229,17 @@ class Trainer:
             outputs = self.model.validation_step(x, y, amp=self.cfg.amp)
             ip = outputs["inpainting_loss"]
             kl = outputs["kl_loss"]
-            ce = outputs.get("ce", torch.tensor(0.0, device=self.device))
-            en = outputs.get("entropy", torch.tensor(0.0, device=self.device))
+            ce = outputs.get("cross_entropy", torch.tensor(0.0, device=self.device))
             cl = outputs.get("cl_loss", torch.tensor(0.0, device=self.device))
             if torch.isnan(cl):
                 cl = torch.tensor(0.0, device=self.device)
             total = (
-                self.cfg.alpha * ip + self.cfg.beta * kl + self.cfg.gamma * cl + ce + en
+                self.cfg.alpha * ip + self.cfg.beta * kl + self.cfg.gamma * cl + ce
             )
 
             agg["val_IP"] += float(self.cfg.alpha * ip)
             agg["val_KL"] += float(self.cfg.beta * kl)
             agg["val_CE"] += float(ce)
-            agg["val_EL"] += float(en)
             agg["val_CL"] += float(self.cfg.gamma * cl)
             agg["val_total"] += float(total)
             n_batches += 1
