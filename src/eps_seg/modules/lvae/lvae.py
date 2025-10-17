@@ -172,12 +172,8 @@ class LadderVAE(nn.Module):
                     res_block_type=self.res_block_type,
                     gated=self.use_gated_convs,
                     grad_checkpoint=self.use_grad_checkpoint,
-                    stochastic_block_type=self.stochastic_block_type,
-                    #conditional=conditional,
-                    #condition_type=condition_type,
                     n_components=self.n_components,
                     training_mode=self.training_mode,
-                    #labeled_ratio=labeled_ratio,
                 )
             )
 
@@ -251,14 +247,7 @@ class LadderVAE(nn.Module):
         if self.use_contrastive_learning and self.mode_pred is False:
             cl, q = compute_cl_loss(
                 mus=td_data["mu"],
-                logvars=td_data["logvar"],
-                pis=td_data["class_probabilities"] if "class_probabilities" in td_data else None,
                 labels=td_data["pseudo_labels"],
-                # labels=y,
-                margin=self.margin,
-                lambda_contrastive=self.lambda_contrastive,
-                training_mode=self.training_mode,
-                prior=self.prior_type,
             )
         output = {
             "ll": ll,

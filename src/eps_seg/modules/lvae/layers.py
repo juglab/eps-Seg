@@ -191,7 +191,6 @@ class TopDownLayer(nn.Module):
         top_prior_param_shape=None,
         n_components=4,  # Used only for Mixture block
         training_mode="supervised",
-        stochastic_block_type="mixture",
     ):
         super().__init__()
         self.training_mode = training_mode
@@ -202,7 +201,6 @@ class TopDownLayer(nn.Module):
         self.learn_top_prior = learn_top_prior
         self.n_components = n_components
         self.top_prior_param_shape = top_prior_param_shape
-        self.stochastic_block_type = stochastic_block_type
         self.skip_connection = skip_connection
 
         if self.is_top_layer:
@@ -292,7 +290,7 @@ class TopDownLayer(nn.Module):
 
     def _get_top_prior_params(self) -> Union[None, nn.Parameter]:
         # Define top layer prior parameters, possibly learnable
-        if self.is_top_layer and self.stochastic_block_type == "mixture":
+        if self.is_top_layer:
             return self._initialize_gmm_prior(
                 self.n_components, self.top_prior_param_shape, self.learn_top_prior
             )

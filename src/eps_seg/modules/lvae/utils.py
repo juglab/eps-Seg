@@ -371,13 +371,7 @@ def get_normalized_tensor(img, model, device):
 
 def compute_cl_loss(
     mus,
-    logvars,
-    pis,
     labels,
-    margin=50,
-    lambda_contrastive=0.5,
-    training_mode='supervised',
-    prior="normal",
 ):
     return multiscale_supervised_cl_sup(mus, labels)
     # if training_mode == 'supervised':
