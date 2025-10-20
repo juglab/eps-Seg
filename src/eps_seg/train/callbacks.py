@@ -8,7 +8,144 @@ import numpy as np
 import shutil
 import time
 from eps_seg.train.optimizers import LabelSizeScheduler
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
 
+class EarlyStoppingWithWaitCount(EarlyStopping):
+    """
+        EarlyStopping that also stores into the model the number of bad epochs (wait_count).
+        This is useful for other callbacks that want to use the same patience counter.
+    """
+    def on_validation_end(self, trainer, pl_module):
+        super().on_validation_end(trainer, pl_module)
+        # Update the model's current_wait_count buffer
+        pl_module.current_wait_count = torch.tensor(self.wait_count)
+
+class RadiusIncreaseCallback(pl.Callback):
+    """
+        Increases the dataset radius by 1 when EarlyStopping patience hits a certain threshold.
+        Loads the best model checkpoint before increasing the radius.
+    """
+    def __init__(self, dirpath: str, patience_threshold: int = 50):
+        self.dirpath = dirpath
+        self.patience_threshold = patience_threshold
+
+    def on_epoch_end(self, trainer, pl_module):
+        # Check the wait_count from EarlyStopping
+        if pl_module.current_wait_count.item() >= self.patience_threshold:
+            model_folder = self.dirpath
+            # Load best to model
+            best_path = os.path.join(model_folder, "best.net")
+            if os.path.exists(best_path):
+                checkpoint = torch.load(best_path, weights_only=False)
+                pl_module.load_state_dict(checkpoint.state_dict())
+    
+            # Increase dataset radius
+            ds = trainer.train_dataloader.dataset
+            if hasattr(ds, "increase_radius"):
+                ds.increase_radius()
+                print(f"Increased dataset radius to {ds.radius}")
+            else:
+                print("WARNING: Dataset does not have increase_radius method.")
+            shutil.copy(best_path, os.path.join(model_folder, "best_semisupervised.net"))
+            # FIXME: This should ideally be done on the EarlyStopping callback. How?
+            pl_module.current_wait_count = torch.tensor(0)
+
+class ModeSwitchCallback(pl.Callback):
+    """
+        Switches the model and dataset from supervised to semisupervised mode
+        when EarlyStopping patience hits a certain threshold.
+        Loads the best model checkpoint before switching.
+    """
+    def __init__(self, dirpath: str, patience_threshold: int = 50):
+        self.dirpath = dirpath
+        self.patience_threshold = patience_threshold
+
+    def on_epoch_end(self, trainer, pl_module):
+        # Check the wait_count from EarlyStopping
+        if pl_module.current_wait_count.item() >= self.patience_threshold:
+            model_folder = self.dirpath
+            # Load best to model
+            best_path = os.path.join(model_folder, "best.net")
+            if os.path.exists(best_path):
+                checkpoint = torch.load(best_path, weights_only=False)
+                pl_module.load_state_dict(checkpoint.state_dict())
+    
+            # Switch dataset and model to semisupervised mode
+            ds = trainer.train_dataloader.dataset
+            if getattr(ds, "mode", None) == "supervised":
+                print("Switching to semi-supervised mode")
+                if hasattr(ds, "set_mode"):
+                    ds.set_mode("semisupervised")
+                else:
+                    print("WARNING: Dataset does not have set_mode method.")
+                if hasattr(pl_module, "update_mode"):
+                    pl_module.update_mode("semisupervised")
+                else:
+                    print("WARNING: Model does not have update_mode method.")
+                shutil.copy(best_path, os.path.join(model_folder, "best_supervised.net"))
+                # Reset wait_count
+                # FIXME: This should ideally be done on the EarlyStopping callback. How?
+                pl_module.current_wait_count = torch.tensor(0)
+            
+    
+
+class MaskLabelSizeSchedulerCallback(pl.Callback):
+    def __init__(
+        self,
+        initial_label: int,
+        final_label: int,
+        initial_mask: int,
+        final_mask: int,
+        step_interval: int,
+        use_patience: bool
+    ):
+
+        self._label_sched = LabelSizeScheduler(initial_label, final_label, step_interval)
+        self._mask_sched = LabelSizeScheduler(initial_mask, final_mask, step_interval)
+        self.enabled_label = initial_label != final_label
+        self.enabled_mask = initial_mask != final_mask
+        self.use_patience = use_patience
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if self.use_patience:
+            step = trainer.model.current_wait_count.item()
+        else:
+            step = trainer.global_step
+        
+        if self.enabled_label and trainer.train_dataloader is not None:
+            size = self._label_sched.get_label_size(step)
+            if hasattr(trainer.train_dataloader.dataset, "update_patches"):
+                trainer.train_dataloader.dataset.update_patches(size)
+            if trainer.val_dataloaders is not None:
+                for val_loader in trainer.val_dataloaders:
+                    if hasattr(val_loader.dataset, "update_patches"):
+                        val_loader.dataset.update_patches(size)
+        if self.enabled_mask:
+            size = self._mask_sched.get_label_size(step)
+            pl_module.model.current_mask_size = size
+        if self.enabled_label:
+            size = self._label_sched.get_label_size(step)
+            pl_module.model.current_label_size = size
+        
+            
+
+class ThresholdSchedulerCallback(pl.Callback):
+    def __init__(self, increment=0.005, max_value=0.99, mode="semisupervised"):
+        self.increment = increment
+        self.max_value = max_value
+        self.mode = mode
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Only update if in semisupervised mode
+        if getattr(pl_module.model, "training_mode", None) == self.mode:
+            pl_module.current_threshold = min(
+                pl_module.current_threshold + self.increment, self.max_value
+            )
+            pl_module.log("threshold", pl_module.current_threshold)
+
+
+# FIXME: Make these into Lightning callbacks.
 class Callback:
     # Override the hooks you need.
     def on_fit_start(self, trainer): ...

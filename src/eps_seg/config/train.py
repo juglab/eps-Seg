@@ -25,3 +25,7 @@ class TrainConfig(BaseEPSConfig):
     initial_mask_size: int = Field(default=1, description="Initial mask size for mask size scheduler")
     final_mask_size: int = Field(default=10, description="Final mask size for mask size scheduler")
     step_interval: int = Field(default=20, description="Step interval for label/mask size scheduler")
+    log_every_n_steps: int = Field(default=5, description="Logging frequency in steps")
+    initial_threshold: float = Field(default=0.50, description="Initial confidence threshold for training in semisupervised mode")
+    max_threshold: float = Field(default=0.99, description="Maximum confidence threshold for training in semisupervised mode")
+    threshold_step: float = Field(default=0.005, description="Step size for confidence threshold increase")
