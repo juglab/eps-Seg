@@ -133,7 +133,7 @@ def main():
         "--directory_path", type=str, default="./results/test_refactoring/"
     )
     parser.add_argument("--contrastive_learning", type=bool, default=True)
-    parser.add_argument("--mode", type=str, default="semisupervised")
+    parser.add_argument("--mode", type=str, default="supervised")
     parser.add_argument("--labeled_ratio", type=float, default=1)
     parser.add_argument("--stochastic_block_type", type=str, default="mixture")
     parser.add_argument("--conditional", type=bool, default=True)
