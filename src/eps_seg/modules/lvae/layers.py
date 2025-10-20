@@ -353,7 +353,6 @@ class TopDownLayer(nn.Module):
         use_mode=False,
         force_constant_output=False,
         forced_latent=None,
-        mode_pred=None,
     ):
         """
         Forward pass through top-down layer.
@@ -375,8 +374,7 @@ class TopDownLayer(nn.Module):
             print("TODO: force_constant_output is not implemented yet")
         if forced_latent is not None:
             print("TODO: forced_latent is not implemented yet")
-        if mode_pred is not None:
-            print("TODO: mode_pred is not implemented yet")
+            
         # Check consistency of arguments
         inputs_none = input_ is None and skip_connection_input is None
         if self.is_top_layer and not inputs_none:

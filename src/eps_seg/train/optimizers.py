@@ -1,21 +1,6 @@
 import torch.optim as optim
 from torch.optim import Optimizer
 
-def _make_optimizer_and_scheduler(model, lr, weight_decay) -> Optimizer:
-    """
-    Implements Adamax optimizer and learning rate scheduler.
-    Args:
-        model: An instance of ladderVAE class
-        lr (float): learning rate
-        weight_decay (float): weight decay
-    """
-    optimizer = optim.Adamax(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "min", patience=10, factor=0.9, min_lr=1e-12
-    )
-    return optimizer, scheduler
-
-
 class LabelSizeScheduler:
     def __init__(self, initial_size, final_size=None, step_interval=None):
         """

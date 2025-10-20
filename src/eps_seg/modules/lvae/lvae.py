@@ -22,14 +22,13 @@ from torch.cuda.amp import autocast
 from eps_seg.config import LVAEConfig
 
 class LadderVAE(nn.Module):
-    def __init__(self, cfg: LVAEConfig, device, data_mean, data_std, mode_pred=False):
+    def __init__(self, cfg: LVAEConfig):
         super().__init__()
         self.cfg = cfg
-        self.device = device
         self.training_mode = cfg.training_mode
         
-        self.data_mean = torch.Tensor([data_mean]).to(self.device)
-        self.data_std = torch.Tensor([data_std]).to(self.device)
+        #self.data_mean = torch.Tensor([data_mean]).to(self.device)
+        #self.data_std = torch.Tensor([data_std]).to(self.device)
 
         self.n_layers = cfg.n_layers
         self.z_dims = cfg.z_dims
@@ -59,21 +58,18 @@ class LadderVAE(nn.Module):
         self.res_block_type = cfg.res_block_type
         self.use_gated_convs = cfg.use_gated_convs
         self.use_grad_checkpoint = cfg.grad_checkpoint
-        # TODO: This should be managed during training mode switch
-        self.mode_pred = mode_pred
         self.no_initial_downscaling = cfg.no_initial_downscaling
         self.mask_size = cfg.mask_size
         self.use_contrastive_learning = cfg.use_contrastive_learning
         self.margin = cfg.margin
         self.n_components = cfg.n_components
-
         
         # Derived paramters
         self.input_array_shape = cfg.img_shape
         self.likelihood_form = "gaussian"
        
-        assert self.data_std is not None, "Data std is not specified"
-        assert self.data_mean is not None, "Data mean is not specified"
+        #assert self.data_std is not None, "Data std is not specified"
+        #assert self.data_mean is not None, "Data mean is not specified"
         assert self.conv_mult in [
             2,
             3,
@@ -116,7 +112,7 @@ class LadderVAE(nn.Module):
                 res_block_type=self.res_block_type,
                 grad_checkpoint=self.use_grad_checkpoint,
             ),
-        ).to(self.device)
+        )
 
         # Init lists of layers
         self.top_down_layers = nn.ModuleList([])
@@ -216,8 +212,23 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-    # TODO: check forward function
-    def forward(self, x, y=None, x_orig=None, confidence_threshold=0.99, amp=True):
+
+    def forward(self, x, y=None, mask_input=False, confidence_threshold=0.99):
+        """
+            Forward pass through the LVAE model.
+
+            Args:
+                x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
+                y: Optional labels tensor
+                mask_input: Whether to mask the input (used during training and validation)
+                confidence_threshold: Confidence threshold for assigning pseudo-labels
+        """
+        # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
+        # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
+        assert (self.training and mask_input) or (not self.training), "Input masking should only be done during training/validation."
+        x_orig = x if mask_input else None
+        x = self._mask_input(x) if mask_input else x
+        
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
         x_pad = self.pad_input(x, self.conv_mult)
@@ -231,24 +242,34 @@ class LadderVAE(nn.Module):
         out = crop_img_tensor(out, img_size)
         # Log likelihood and other info (per data point)
 
-        cl = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        kl = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        if x_orig is not None:
-            ll, likelihood_info = self.likelihood(out, x_orig)
-        else:
-            ll, likelihood_info = self.likelihood(out, x)
-        if self.mode_pred is False:
+        cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        kl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+
+        # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
+        ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
+
+        inpainting_loss = None
+        if mask_input:
+            # 3) inpainting loss is centre of -loglikelihood
+            recons_sep = -out["ll"]
+            inpainting_loss = self._centre_crop(recons_sep).mean()
+
+        if self.training:
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
             kl = torch.stack(td_data["kl"]).sum(0)
             if self.kl_free_bits > 0:
                 kl = free_bits_kl(kl, self.kl_free_bits)
-        q = None
-        if self.use_contrastive_learning and self.mode_pred is False:
+        
+        if self.use_contrastive_learning and self.training:
             cl, q = compute_cl_loss(
                 mus=td_data["mu"],
                 labels=td_data["pseudo_labels"],
             )
+
+        if torch.isnan(cl):
+            cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+
         output = {
             "ll": ll,
             "z": td_data["z"],
@@ -262,6 +283,7 @@ class LadderVAE(nn.Module):
             "likelihood_params": likelihood_info["params"],
             "cross_entropy": td_data["cross_entropy"][-1],
             "class_probabilities": td_data["class_probabilities"][-1] if "class_probabilities" in td_data else None,
+            "inpainting_loss": inpainting_loss,
         }
         return output
 
@@ -358,7 +380,6 @@ class LadderVAE(nn.Module):
                 use_mode=use_mode,
                 force_constant_output=constant_out,
                 forced_latent=forced_latent[i],
-                mode_pred=self.mode_pred,
                 confidence_threshold=confidence_threshold,
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
@@ -367,7 +388,8 @@ class LadderVAE(nn.Module):
             mu[i] = aux["mu"]
             class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
             pseudo_labels[i] = aux["pseudo_labels"] if "pseudo_labels" in aux else None
-            if self.mode_pred is False:
+            
+            if self.training:
                 logprob_p += aux["logprob_p"].mean()  # mean over batch
             else:
                 logprob_p = None
@@ -409,66 +431,6 @@ class LadderVAE(nn.Module):
             return x[:, :, b:e, b:e]
         else:
             return x[:, :, b:e, b:e, b:e]
-
-    def _step_common(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        *,
-        threshold: float = 0.99,
-        amp: bool = True,
-    ) -> dict:
-        """
-            Shared compute for train/val: runs forward with masked input and returns all
-            component losses + useful tensors.
-        """
-        from torch.cuda.amp import autocast
-
-        # 1) mask input
-        x_masked = self._mask_input(x).to(x.device)
-
-        # 2) forward
-        with autocast(enabled=amp):
-            out = self(x=x_masked, y=y, x_orig=x, confidence_threshold=threshold)
-
-        # 3) inpainting loss is centre of -loglikelihood
-        recons_sep = -out["ll"]
-        inpainting_loss = self._centre_crop(recons_sep).mean()
-
-        # 4) other components (guard cl for NaN)
-        kl = out["kl"]
-        cl = out.get("cl", torch.tensor(0.0, dtype=torch.float32, device=x.device))
-        if torch.isnan(cl):
-            cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        ce = out.get("cross_entropy", torch.tensor(0.0, dtype=torch.float32, device=x.device))
-
-        return {
-            "inpainting_loss": inpainting_loss,
-            "kl_loss": kl,
-            "cl_loss": cl,
-            "cross_entropy": ce,
-            "out_mean": out.get("out_mean"),
-            "out_sample": out.get("out_sample"),
-        }
-
-    def training_step(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        *,
-        threshold: float = 0.99,
-        amp: bool = True,
-    ) -> dict:
-        """Return per-batch component losses/metrics for training."""
-        return self._step_common(x, y, threshold=threshold, amp=amp)
-
-    @torch.no_grad()
-    def validation_step(
-        self, x: torch.Tensor, y: torch.Tensor, *, amp: bool = True
-    ) -> dict:
-        """Return per-batch component losses/metrics for validation."""
-        # If threshold annealing is only for semi-supervised, you can just use 0.99 here
-        return self._step_common(x, y, threshold=0.99, amp=amp)
 
     def pad_input(self, x, dim):
         """
