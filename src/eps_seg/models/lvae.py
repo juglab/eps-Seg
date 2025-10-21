@@ -115,7 +115,7 @@ class LVAEModel(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_total_loss",
+                "monitor": "val/total_loss",
             },
         }
 
