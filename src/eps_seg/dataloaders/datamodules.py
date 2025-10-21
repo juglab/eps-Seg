@@ -4,7 +4,7 @@ from eps_seg.config.datasets import BetaSegDatasetConfig
 from pathlib import Path
 import tifffile as tiff
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
@@ -56,6 +56,14 @@ class BetaSegDataModule(L.LightningDataModule):
             ratio=self.cfg.initial_labeled_ratio,
             indices_dict=self.val_idx,
         )
+
+    def get_data_statistics(self) -> Tuple[float, float]:
+        """
+            Returns the data mean and standard deviation.
+            This function is called from the model during setup, to register the statistics as buffers.
+            Mean and std are then used during inference for normalization.
+        """
+        return self.data_mean, self.data_std
 
     def _cache_dataset_splits(self):
         assert self.cfg.cache_dir is not None, "cache_dir must be specified to cache dataset splits."

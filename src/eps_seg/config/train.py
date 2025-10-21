@@ -12,6 +12,7 @@ class TrainConfig(BaseEPSConfig):
     lr_min: float = Field(default=1e-12, description="Minimum learning rate")
     weight_decay: float = Field(default=0.0, description="Weight decay for optimizer")
     max_epochs: int = Field(default=1000, description="Maximum number of training epochs")
+    early_stopping_patience: int = Field(default=50, description="Patience for early stopping")
     batch_size: int = Field(default=256, description="Batch size for training")
     amp: bool = Field(default=True, description="Use mixed precision training")
     gradient_scale: int = Field(default=256, description="Gradient scaling factor")

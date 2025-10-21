@@ -251,7 +251,8 @@ class LadderVAE(nn.Module):
         inpainting_loss = None
         if mask_input:
             # 3) inpainting loss is centre of -loglikelihood
-            recons_sep = -out["ll"]
+            # FIXME: This "out" is not a dictionary. 
+            recons_sep = -ll
             inpainting_loss = self._centre_crop(recons_sep).mean()
 
         if self.training:

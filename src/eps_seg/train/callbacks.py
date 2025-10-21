@@ -1,32 +1,38 @@
 # mlproject/engine/callbacks.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 import torch
 import numpy as np
 import shutil
 import time
 from eps_seg.train.optimizers import LabelSizeScheduler
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping
+import lightning as L
+from lightning.pytorch.callbacks import EarlyStopping, Callback
 
-class EarlyStoppingWithWaitCount(EarlyStopping):
+# FIXME: Continue this
+class EarlyStoppingWithContinuation(EarlyStopping):
     """
-        EarlyStopping that also stores into the model the number of bad epochs (wait_count).
-        This is useful for other callbacks that want to use the same patience counter.
+        EarlyStopping callback that triggers another callback when patience is hit.
     """
+    def __init__(self, monitor="val_total", mode="min", patience=50, min_delta=0):
+        super().__init__(monitor, mode, patience, min_delta)
+
+
     def on_validation_end(self, trainer, pl_module):
         super().on_validation_end(trainer, pl_module)
         # Update the model's current_wait_count buffer
         pl_module.current_wait_count = torch.tensor(self.wait_count)
 
-class RadiusIncreaseCallback(pl.Callback):
+class RadiusIncreaseCallback(L.Callback):
     """
         Increases the dataset radius by 1 when EarlyStopping patience hits a certain threshold.
         Loads the best model checkpoint before increasing the radius.
     """
-    def __init__(self, dirpath: str, patience_threshold: int = 50):
+    def __init__(self, 
+                 dirpath: str, 
+                 patience_threshold: int = 50):
         self.dirpath = dirpath
         self.patience_threshold = patience_threshold
 
@@ -196,31 +202,31 @@ class ModelCheckpoint(Callback):
             )[: self.top_k]
 
 
-class EarlyStopping(Callback):
-    def __init__(self, monitor="val_total", mode="min", patience=50, min_delta=0.0):
-        self.monitor = monitor
-        self.mode = mode
-        self.patience = patience
-        self.min_delta = min_delta
-        self.best = float("inf") if mode == "min" else -float("inf")
-        self.bad_epochs = 0
+# class EarlyStopping(Callback):
+#     def __init__(self, monitor="val_total", mode="min", patience=50, min_delta=0.0):
+#         self.monitor = monitor
+#         self.mode = mode
+#         self.patience = patience
+#         self.min_delta = min_delta
+#         self.best = float("inf") if mode == "min" else -float("inf")
+#         self.bad_epochs = 0
 
-    def _improved(self, val):
-        if self.mode == "min":
-            return val < self.best - self.min_delta
-        return val > self.best + self.min_delta
+#     def _improved(self, val):
+#         if self.mode == "min":
+#             return val < self.best - self.min_delta
+#         return val > self.best + self.min_delta
 
-    def on_validation_end(self, trainer, logs: Dict[str, float]):
-        val = float(logs.get(self.monitor, np.inf))
-        if np.isnan(val):
-            return
-        if self._improved(val):
-            self.best = val
-            self.bad_epochs = 0
-        else:
-            self.bad_epochs += 1
-            if self.bad_epochs > self.patience:
-                trainer.should_stop = True
+#     def on_validation_end(self, trainer, logs: Dict[str, float]):
+#         val = float(logs.get(self.monitor, np.inf))
+#         if np.isnan(val):
+#             return
+#         if self._improved(val):
+#             self.best = val
+#             self.bad_epochs = 0
+#         else:
+#             self.bad_epochs += 1
+#             if self.bad_epochs > self.patience:
+#                 trainer.should_stop = True
 
 
 class ReduceLROnPlateauStep(Callback):
