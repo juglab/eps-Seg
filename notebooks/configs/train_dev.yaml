@@ -1,0 +1,4 @@
+model_name: "dev_eseg_plus_mini"
+max_epochs: 10
+early_stopping_patience: 6
+radius_increment_patience: 3

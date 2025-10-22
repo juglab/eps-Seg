@@ -6,14 +6,23 @@ from typing import Literal
 import torch 
 
 class LVAEModel(L.LightningModule):
-    def __init__(self, model_config: LVAEConfig, train_config: TrainConfig = None):
+    def __init__(self, model_cfg: LVAEConfig, train_cfg: TrainConfig = None):
         super().__init__()
-        self.cfg = model_config
-        self.train_cfg = train_config
-        self.model: LadderVAE = LadderVAE(model_config)
-        self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.99
+        self.cfg = model_cfg
+        self.train_cfg = train_cfg
+        self.model: LadderVAE = LadderVAE(model_cfg)
         self.current_training_mode = "supervised"
-        self.save_hyperparameters()
+
+        # Placeholders for data statistics
+        self.model.register_buffer("data_mean", torch.tensor(0.0))
+        self.model.register_buffer("data_std", torch.tensor(0.0))
+
+        self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.5
+        self.current_radius = 1
+        # Patience counter for radius increase
+        self.current_radius_patience = 0
+        self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
+                                   "train_config": train_cfg.model_dump() if train_cfg else None})
 
     def forward(self, x, y=None, mask_input=False, confidence_threshold: float = 0.99):
         """
@@ -32,15 +41,17 @@ class LVAEModel(L.LightningModule):
         y = y.squeeze(0)
 
         return self.model(x, y=y, mask_input=mask_input, confidence_threshold=confidence_threshold)
+    
     def on_fit_start(self):
         # Add data statistics to the model before training or prediction (so that they are saved in checkpoints)
-        if not hasattr(self.model, "data_mean") or not hasattr(self.model, "data_std"):
-            print(f"Data Statistics not found in LadderVAE model. Retrieving from datamodule...")
+        # TODO: Fix this with a better method
+        if self.model.data_std.sum() == 0:
+            print("Data Statistics not found. Retrieving from datamodule...")
             mean, std = self.trainer.datamodule.get_data_statistics()
-            self.model.register_buffer("data_mean", torch.as_tensor(mean))
-            self.model.register_buffer("data_std", torch.as_tensor(std))
+            self.model.data_mean = torch.as_tensor(mean, device=self.device)
+            self.model.data_std = torch.as_tensor(std, device=self.device)
         else:
-            print(f"Using existing data statistics in LadderVAE checkpoint.")
+            print("Using existing data statistics from checkpoint.")
 
     def training_step(self, batch, batch_idx):
         x, y, z, _ = batch
@@ -104,7 +115,6 @@ class LVAEModel(L.LightningModule):
         return self.forward(x, y, mask_input=False, confidence_threshold=0.99)  
 
     def configure_optimizers(self):
-        super().configure_optimizers()
         optimizer = torch.optim.Adamax(self.model.parameters(),
                                        lr=self.train_cfg.lr, 
                                        weight_decay=self.train_cfg.weight_decay)

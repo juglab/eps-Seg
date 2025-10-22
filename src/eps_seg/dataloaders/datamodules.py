@@ -185,4 +185,14 @@ class BetaSegDataModule(L.LightningDataModule):
             collate_fn=flex_collate,
         )
     
+    def set_mode(self, mode: str):
+        """Switch between supervised and semisupervised modes."""
+        print(f"Switching datamodule mode to {mode}...")
+        self.train_dataset.set_mode(mode)
+
+    def increase_radius(self):
+        """Increase the radius used for semisupervised sampling."""
+        print("Increasing semisupervised sampling radius...")
+        self.train_dataset.increase_radius()
+
     # TODO: implement test_dataloader / predict_dataloader if needed

@@ -937,7 +937,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         elif self.training_mode == "semisupervised":
             # Semi-supervised learning: use pseudo-labeling for unlabeled data
             y, pseudo_label, cross_entropy = self._semisupervised_forward(
-                label, q_mu, qy_logits, confidence_threshold
+                label, q_mu, confidence_threshold
             )
             kl = self._compute_kl_mixture(q, p_components, label=pseudo_label)
         elif self.training_mode == "supervised":
