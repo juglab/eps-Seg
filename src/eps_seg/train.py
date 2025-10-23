@@ -8,6 +8,7 @@ from eps_seg.dataloaders.datamodules import BetaSegDataModule
 from eps_seg.train.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
+import wandb
 
 def train(exp_config: ExperimentConfig):
     """
@@ -69,6 +70,9 @@ def train(exp_config: ExperimentConfig):
     supervised_trainer.fit(model, datamodule=dm)
 
     print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
+    # Finish the wandb run to avoid next run to log into the same run
+    if train_config.use_wandb:
+        wandb.finish()
 
     semisupervised_modelcheckpoint = ModelCheckpoint(
         monitor="val/total_loss_epoch",
@@ -119,6 +123,8 @@ def train(exp_config: ExperimentConfig):
     semisupervised_trainer.fit(model, datamodule=dm)
 
     print("Semisupervised training complete. Best model at:", semisupervised_modelcheckpoint.best_model_path)
+    if train_config.use_wandb:
+            wandb.finish()
 
 def main():
     # Allows to be run as: python -m eps_seg.train --exp_config path/to/exp_config.yaml --env_file path/to/.env
