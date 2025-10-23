@@ -262,14 +262,13 @@ class LadderVAE(nn.Module):
             if self.kl_free_bits > 0:
                 kl = free_bits_kl(kl, self.kl_free_bits)
         
-        if self.use_contrastive_learning and self.training:
-            cl, q = compute_cl_loss(
-                mus=td_data["mu"],
-                labels=td_data["pseudo_labels"],
-            )
-
-        if torch.isnan(cl):
-            cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        if self.use_contrastive_learning:
+            if td_data.get("pseudo_labels", None) is not None:
+                # i.e., we are in either training or validation mode (we have labels)
+                cl, q = compute_cl_loss(
+                    mus=td_data["mu"],
+                    labels=td_data["pseudo_labels"],
+                )
 
         output = {
             "ll": ll,

@@ -18,7 +18,7 @@ class LVAEModel(L.LightningModule):
         self.model.register_buffer("data_std", torch.tensor(0.0))
 
         self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.5
-        self.current_radius = 1
+        self.current_radius = self.train_cfg.initial_radius if self.train_cfg else 5
         # Patience counter for radius increase
         self.current_radius_patience = 0
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 

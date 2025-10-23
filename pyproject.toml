@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib>=3.10.7",
     "numpy>=2.3.3",
     "pydantic>=2.12.2",
+    "python-dotenv>=1.1.1",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.7.2",
     "tensorboard>=2.20.0",

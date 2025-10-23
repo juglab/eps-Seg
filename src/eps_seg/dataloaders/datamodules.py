@@ -10,7 +10,7 @@ from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
 from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
-
+import yaml
 
 class BetaSegDataModule(L.LightningDataModule):
     def __init__(self, cfg: BetaSegDatasetConfig, train_cfg: TrainConfig):
@@ -43,6 +43,7 @@ class BetaSegDataModule(L.LightningDataModule):
             ignore_lbl=-1,
             ratio=self.cfg.initial_labeled_ratio,
             indices_dict=self.train_idx,
+            radius=self.train_cfg.initial_radius,
         )
 
         self.val_dataset = SemisupervisedDataset(

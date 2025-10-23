@@ -25,5 +25,6 @@ class TrainConfig(BaseEPSConfig):
     initial_threshold: float = Field(default=0.50, description="Initial confidence threshold for training in semisupervised mode")
     max_threshold: float = Field(default=0.99, description="Maximum confidence threshold for training in semisupervised mode")
     threshold_increment: float = Field(default=0.005, description="Step size for confidence threshold increase")
-    max_radius: float = Field(default=10.0, description="Maximum radius for training in semisupervised mode")
+    initial_radius: int = Field(default=5, description="Initial radius for training in semisupervised mode")
+    max_radius: int = Field(default=10, description="Maximum radius for training in semisupervised mode")
     radius_increment_patience: int = Field(default=10, description="Number of epochs without improvement before increasing radius in semisupervised mode")

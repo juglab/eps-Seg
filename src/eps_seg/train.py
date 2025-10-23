@@ -3,11 +3,11 @@ from eps_seg.config import LVAEConfig
 from eps_seg.models import LVAEModel
 from eps_seg.config.train import TrainConfig
 from eps_seg.dataloaders.datamodules import BetaSegDataModule
-from eps_seg.config.datasets import BetaSegDatasetConfig
+from eps_seg.config.datasets import BetaSegDatasetConfig, EPSBaseDatasetConfig
 import torch 
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 
 class EarlyStoppingWithPatiencePropagation(EarlyStopping):
@@ -70,6 +70,7 @@ class RadiusSchedulerCallback(L.Callback):
 
 def train(train_config: TrainConfig, dataset_config: BetaSegDatasetConfig, model_config: LVAEConfig):
   
+    # TODO: write a factory also for datamodules
     dm = BetaSegDataModule(cfg=dataset_config, train_cfg=train_config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -83,10 +84,17 @@ def train(train_config: TrainConfig, dataset_config: BetaSegDatasetConfig, model
         save_last=True,
     )
 
-    supervised_logger = TensorBoardLogger(
-        name=train_config.model_name + "_supervised",
-        save_dir=f"logs/{train_config.model_name}/",
-    )
+    if train.config.use_wandb:
+        supervised_logger = WandbLogger(
+            name=train_config.model_name + "_supervised",
+            project="eps-seg",
+            save_dir=f"logs/{train_config.model_name}/",
+        )
+    else:
+        supervised_logger = TensorBoardLogger(
+            name=train_config.model_name + "_supervised",
+            save_dir=f"logs/{train_config.model_name}/",
+        )
 
     #### SUPERVISED MODE ####
     supervised_trainer = L.Trainer(
@@ -164,7 +172,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     train_config = TrainConfig.from_yaml(args.train_config)
-    dataset_config = BetaSegDatasetConfig.from_yaml(args.dataset_config)
+    dataset_config = EPSBaseDatasetConfig.from_yaml(args.dataset_config)
     if args.model_config:
         model_config = LVAEConfig.from_yaml(args.model_config)
     else:

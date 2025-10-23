@@ -3,6 +3,21 @@ from pydantic import Field
 from typing import List, Optional, Literal, Dict
 from pathlib import Path
 from pydantic import model_validator
+import yaml
+
+class EPSBaseDatasetConfig(BaseEPSConfig):
+    
+    @classmethod
+    def from_yaml(cls, yaml_path: str):
+        """Load dataset configuration from a YAML file."""
+        with open(yaml_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        dataset_type = config_dict.get("type")
+        if dataset_type == "BetaSegDatasetConfig":
+            return BetaSegDatasetConfig(**config_dict)
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
 
 class BetaSegDatasetConfig(BaseEPSConfig):
     data_dir: str = Field(..., description="Path to the dataset directory")
