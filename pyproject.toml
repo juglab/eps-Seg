@@ -16,7 +16,7 @@ dependencies = [
     "tensorboard>=2.20.0",
     "tifffile>=2025.10.4",
     "torch>=2.8.0",
-    "torchvision>=0.23.0",
+    "torchvision>=0.23.0", 
     "tqdm>=4.67.1",
     "wandb>=0.22.2",
 ]
@@ -28,3 +28,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+eps-train = "eps_seg.train:main"

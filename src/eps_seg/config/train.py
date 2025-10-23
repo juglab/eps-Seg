@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from typing import Optional
 from pydantic import BaseModel, Field
 from eps_seg.config.base import BaseEPSConfig
-
+from eps_seg.config.datasets import BaseEPSDatasetConfig
+from eps_seg.config.models import BaseEPSModelConfig, LVAEConfig
+from pathlib import Path
+import yaml
 
 class TrainConfig(BaseEPSConfig):
     model_name: str = Field(default="eps_seg_default", description="Name of the model"),
@@ -28,3 +31,56 @@ class TrainConfig(BaseEPSConfig):
     initial_radius: int = Field(default=5, description="Initial radius for training in semisupervised mode")
     max_radius: int = Field(default=10, description="Maximum radius for training in semisupervised mode")
     radius_increment_patience: int = Field(default=10, description="Number of epochs without improvement before increasing radius in semisupervised mode")
+
+
+class ExperimentConfig(BaseEPSConfig):
+    project_name: str = Field(default="eps-seg-default-project", description="Name of the project, e.g. used in WandB logging")
+    train_cfg_path: str = Field(default=None, description="Path to the training configuration YAML file")
+    dataset_cfg_path: str = Field(description="Path to the dataset configuration YAML file")
+    model_cfg_path: str = Field(default=None, description="Path to the model configuration YAML file")
+
+    def get_configs(self) -> tuple[TrainConfig, BaseEPSDatasetConfig, BaseEPSConfig]:
+        """Load and return the training, dataset, and model configurations objects from the provided paths."""
+
+        if self.train_cfg_path:
+            train_cfg = TrainConfig.from_yaml(self.train_cfg_path)
+            print(f"Loaded training config from {self.train_cfg_path}")
+        else:
+            train_cfg = TrainConfig()
+            print("Using default training config")
+
+        dataset_cfg = BaseEPSDatasetConfig.from_yaml(self.dataset_cfg_path)
+
+        if self.model_cfg_path:
+            model_cfg = BaseEPSModelConfig.from_yaml(self.model_cfg_path)
+            print(f"Loaded model config from {self.model_cfg_path}")
+        else:
+            model_cfg = LVAEConfig()
+            print("Using default LVAE config")
+
+        return train_cfg, dataset_cfg, model_cfg
+
+    @property
+    def experiment_root(self) -> Path:
+        """Return the root directory of the experiment based on the config YAML path."""
+        if self.config_yaml_path is None:
+            raise ValueError("config_yaml_path is not set.")
+        return Path(self.config_yaml_path).parent
+    
+    @property
+    def experiment_name(self) -> str:
+        """Return the name of the experiment based on the config YAML file name."""
+        if self.config_yaml_path is None:
+            raise ValueError("config_yaml_path is not set.")
+        return Path(self.config_yaml_path).stem
+    
+    @property
+    def checkpoints_dir(self) -> Path:
+        """Return the directory path for saving checkpoints."""
+        return self.experiment_root / "checkpoints"
+    
+    @property
+    def logs_dir(self) -> Path:
+        """Return the directory path for saving logs."""
+        return self.experiment_root / "logs"
+

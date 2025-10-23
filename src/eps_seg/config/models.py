@@ -1,9 +1,25 @@
 from eps_seg.config.base import BaseEPSConfig
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Literal, Tuple
+import yaml
+
+class BaseEPSModelConfig(BaseEPSConfig):
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str):
+        """Load model configuration from a YAML file."""
+        with open(yaml_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        model_type = config_dict.get("type")
+        config_dict["config_yaml_path"] = yaml_path
+        if model_type == "LVAEConfig":
+            return LVAEConfig(**config_dict)
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
 
 
-class LVAEConfig(BaseEPSConfig):
+class LVAEConfig(BaseEPSModelConfig):
     n_components: int = Field(default=4, description="Number of components (classes) for the mixture model.")
     n_layers: int = Field(default=3, description="Number of layers in the LVAE.")
     z_dims: List[int] = Field(default=[32,]*3, description="Latent variable dimensions for each layer.")

@@ -5,21 +5,22 @@ from pathlib import Path
 from pydantic import model_validator
 import yaml
 
-class EPSBaseDatasetConfig(BaseEPSConfig):
+class BaseEPSDatasetConfig(BaseEPSConfig):
     
     @classmethod
     def from_yaml(cls, yaml_path: str):
         """Load dataset configuration from a YAML file."""
         with open(yaml_path, 'r') as f:
             config_dict = yaml.safe_load(f)
-        
+
+        config_dict["config_yaml_path"] = yaml_path
         dataset_type = config_dict.get("type")
         if dataset_type == "BetaSegDatasetConfig":
             return BetaSegDatasetConfig(**config_dict)
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 
-class BetaSegDatasetConfig(BaseEPSConfig):
+class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     data_dir: str = Field(..., description="Path to the dataset directory")
     cache_dir: Optional[str] = Field(None, description="Path to cache directory where normalized data and split indices are stored")
     enable_cache: bool = Field(True, description="Whether to use/store cached dataset splits if available. Set to false to preserve disk space.")
