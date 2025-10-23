@@ -63,6 +63,7 @@ class LadderVAE(nn.Module):
         self.use_contrastive_learning = cfg.use_contrastive_learning
         self.margin = cfg.margin
         self.n_components = cfg.n_components
+        self.nips = cfg.nips
         
         # Derived paramters
         self.input_array_shape = cfg.img_shape
@@ -268,6 +269,7 @@ class LadderVAE(nn.Module):
                 cl, q = compute_cl_loss(
                     mus=td_data["mu"],
                     labels=td_data["pseudo_labels"],
+                    nips=True,
                 )
 
         output = {

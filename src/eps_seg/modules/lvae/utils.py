@@ -7,6 +7,7 @@ from sklearn.feature_extraction import image
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 
+
 class Interpolate(nn.Module):
     """Wrapper for torch.nn.functional.interpolate."""
 
@@ -40,7 +41,9 @@ class CropImage(nn.Module):
         self.size = size
 
     def forward(self, x):
-        return crop_img_tensor(x, self.size) # tODO: Fix this assertion error assert len(size) in [2, 3], "Invalid input depth dimension"
+        return crop_img_tensor(
+            x, self.size
+        )  # tODO: Fix this assertion error assert len(size) in [2, 3], "Invalid input depth dimension"
         # return x
 
 
@@ -372,233 +375,61 @@ def get_normalized_tensor(img, model, device):
 def compute_cl_loss(
     mus,
     labels,
+    nips=False,
 ):
-    return multiscale_supervised_cl_sup(mus, labels)
-    # if training_mode == 'supervised':
-    #     return multiscale_supervised_cl_sup(mus, labels)
-    # elif training_mode == 'semisupervised':
-    #     return multiscale_supervised_cl_semi(mus, labels)
-    
-    # if training_mode == 'supervised':
-    #     labeled_ratio = 1
-    #     return multiscale_supervised_cl(mus, labels)
-    # elif training_mode == 'semisupervised':
-    #     labeled_ratio = 0.25
-    #     return compute_semisupervised_cl_loss(mus, labels)
-    # elif training_mode == 'unsupervised':
-    #     labeled_ratio = 0
-    #     return compute_unsupervised_cl_loss(mus, labels)
-        
-        
-    # if prior == "mixture":
-    #     pos_pair_loss, neg_pair_loss_terms = pos_neg_loss(
-    #         mus, labels, margin=margin, labeled_ratio=labeled_ratio
-    #     )
-    # elif prior == "normal":
-    #     pos_pair_loss, neg_pair_loss_terms = pos_neg_loss_normal(
-    #         mus, labels, margin=margin, labeled_ratio=labeled_ratio
-    #     )
-
-    # neg_thetas = get_thetas(neg_pair_loss_terms)
-    # weighted_neg = compute_weighted_neg(neg_pair_loss_terms, neg_thetas)
-    # contrastive_loss = (
-    #     lambda_contrastive * pos_pair_loss + (1 - lambda_contrastive) * weighted_neg
-    # )
-    # return contrastive_loss, None
-
-def pct_equal_blocks(x: torch.Tensor) -> float:
-    assert x.numel() % 4 == 0, "Length must be multiple of 4"
-    blocks = x.view(-1, 4)                         # [B/4, 4]
-    row_ok = (blocks == blocks[:, :1]).all(dim=1)  # [B/4] True if all 4 equal
-    return (row_ok.float().mean().item() * 100.0)  # percentage
+    if not nips:
+        return multiscale_cl(mus, labels)
+    else:
+        lambda_contrastive = 0.5
+        pos_pair_loss, neg_pair_loss_terms = pos_neg_loss(mus, labels, margin=50.0)
+        neg_thetas = get_thetas(neg_pair_loss_terms)
+        weighted_neg = compute_weighted_neg(neg_pair_loss_terms, neg_thetas)
+        contrastive_loss = (
+            lambda_contrastive * pos_pair_loss + (1 - lambda_contrastive) * weighted_neg
+        )
+        return contrastive_loss
 
 
-def compute_unsupervised_cl_loss(mus, coords):
-    """
-    Computes unsupervised contrastive loss.
-    This function computes the contrastive loss based on the latent representation distances
-    and the distance of the patches in pixel space.
-    It uses the coordinates of the patches to calculate the distances in pixel space.
-    Rank and extract specific patch pairs:
-    16 closest in both (pixel + latent) → positive
-    16 farthest in both (pixel + latent) → negative
-    16 close in pixel but far in latent → negative
-    16 far in pixel but close in latent → positive
-
-
-    Args:
-        mus (list): List of latent representations.
-        coords (torch.Tensor): Coordinates of the patches.
-    """
-    B = coords.size(0)
-    flat = [m.view(m.size(0), -1) for m in mus]
-    z = torch.cat(flat, dim=1)
-    
-    latent_dist = torch.cdist(z, z, p=2)
-    pixel_dist = torch.cdist(coords.float(), coords.float(), p=2)
-    top_k = int(B / 128)
-
-    latent_high_pixel_low, both_high, both_low, latent_low_pixel_high, q = get_contrastive_pairs(pixel_dist, latent_dist, top_k=top_k)
-    positives = torch.stack(both_low + latent_low_pixel_high)  # These are semantically and spatially similar
-    negatives = torch.stack(both_high + latent_high_pixel_low)  # These are dissimilar in either space
-    m = 150
-    target = torch.ones_like(positives)
-    
-    return F.margin_ranking_loss(negatives, positives, target, margin=m), q
-    # return compute(positives, positive=True) + compute(negatives, positive=False), q
-
-def compute(d, positive=True):
-    return (d.pow(2).mean() if positive else F.relu(100 - d).pow(2).mean())
-
-def get_contrastive_pairs(pixel_dist, latent_dist, top_k):
-    N = pixel_dist.shape[0]
-    # Extract upper triangle (i < j)
-    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
-    pixel_vals = torch.tensor([pixel_dist[i, j] for i, j in pairs], device=pixel_dist.device)
-    latent_vals = torch.tensor([latent_dist[i, j] for i, j in pairs], device=latent_dist.device)
-    q = get_percentile(pixel_vals, latent_vals, k=top_k)
-    
-    latent_high_pixel_low = [latent_dist[j] for j in [pairs[i] for i in q['top_left']]]  # High latent, low pixel
-    both_high = [latent_dist[j] for j in [pairs[i] for i in q['top_right']]]  # High in both
-    both_low = [latent_dist[j] for j in [pairs[i] for i in q['bottom_left']]]  # Low in both
-    latent_low_pixel_high = [latent_dist[j] for j in [pairs[i] for i in q['bottom_right']]]  # Low latent, high pixel
-    
-    return both_low, both_high, latent_high_pixel_low, latent_low_pixel_high, q
-
-def get_percentile(pixel_vals, latent_vals, k=4):
-    
-    x_10 = pixel_vals.kthvalue(int(0.10 * len(pixel_vals)))[0]
-    x_25 = pixel_vals.kthvalue(int(0.25 * len(pixel_vals)))[0]
-    x_75 = pixel_vals.kthvalue(int(0.75 * len(pixel_vals)))[0]
-    x_90 = pixel_vals.kthvalue(int(0.90 * len(pixel_vals)))[0]
-
-    y_05 = latent_vals.kthvalue(int(0.05 * len(latent_vals)))[0]
-    y_15 = latent_vals.kthvalue(int(0.15 * len(latent_vals)))[0]
-    y_85 = latent_vals.kthvalue(int(0.85 * len(latent_vals)))[0]
-    y_95 = latent_vals.kthvalue(int(0.95 * len(latent_vals)))[0]
-
-    quadrants = {}
-
-    # Define inter-percentile masks
-    masks = {
-        "top_left":     (pixel_vals >= x_10) & (pixel_vals <= x_25) & (latent_vals >= y_85) & (latent_vals <= y_95),
-        "top_right":    (pixel_vals >= x_75) & (pixel_vals <= x_90) & (latent_vals >= y_85) & (latent_vals <= y_95),
-        "bottom_left":  (pixel_vals >= x_10) & (pixel_vals <= x_25) & (latent_vals >= y_05) & (latent_vals <= y_15),
-        "bottom_right": (pixel_vals >= x_75) & (pixel_vals <= x_90) & (latent_vals >= y_05) & (latent_vals <= y_15),
-    }
-
-    for name, mask in masks.items():
-        x = pixel_vals[mask]
-        y = latent_vals[mask]
-        indices = torch.arange(len(pixel_vals), device=pixel_vals.device)[mask]
-
-        if x.numel() == 0:
-            print(f"Warning: No points found in {name} quadrant.")
-            quadrants[name] = []
-            continue
-
-        # Sort logic: for top -> highest y, for bottom -> lowest y
-        if name.startswith("top"):
-            sort_key = torch.stack([-y, x], dim=1)
-        else:
-            sort_key = torch.stack([y, x], dim=1)
-
-        x_sort = torch.argsort(sort_key[:, 1], stable=True)
-        yx_sort = torch.argsort(sort_key[x_sort, 0], stable=True)
-        selected = indices[x_sort[yx_sort]][:k]
-        quadrants[name] = selected
-
-    return quadrants
-
-def multiscale_supervised_cl_sup(mus, labels, margin=1.5):
+def multiscale_cl(mus, labels, margin=1.5):
     B = len(mus[0])
     device = mus[0].device
-    # num_classes = torch.unique(labels).size(0)
     if labels is not None:
         labels = labels[2].view(-1)
-    # print("unique percentage:", pct_equal_blocks(labels))
-    same = labels.unsqueeze(0).eq(labels.unsqueeze(1))            # [B,B]
+    same = labels.unsqueeze(0).eq(labels.unsqueeze(1))  # [B,B]
     eye = torch.eye(B, dtype=torch.bool, device=device)
-    pos_mask = same & ~eye                                        # same class, not self
-    neg_mask = ~same 
+    pos_mask = same & ~eye  # same class, not self
+    neg_mask = ~same
     tri = torch.triu(torch.ones(B, B, dtype=torch.bool, device=device), diagonal=1)
     pos_mask = pos_mask & tri
     neg_mask = neg_mask & tri
-    
+
     valid = labels != -1
-    valid_mask = valid.unsqueeze(0) & valid.unsqueeze(1)   # both labels must be valid
+    valid_mask = valid.unsqueeze(0) & valid.unsqueeze(1)  # both labels must be valid
     pos_mask = pos_mask & valid_mask
     neg_mask = neg_mask & valid_mask
-    
-    descriptors = torch.cat([F.adaptive_avg_pool2d(mus[i], (1,1)).squeeze(-1).squeeze(-1) for i in range(len(mus))], dim=1)
+
+    descriptors = torch.cat(
+        [
+            F.adaptive_avg_pool2d(mus[i], (1, 1)).squeeze(-1).squeeze(-1)
+            for i in range(len(mus))
+        ],
+        dim=1,
+    )
     descriptors = F.normalize(descriptors, dim=1)
     dist = torch.cdist(descriptors, descriptors, p=2)
     dist = torch.clamp(dist, min=0, max=1e6)
     pos_d = dist[pos_mask]
     neg_d = dist[neg_mask]
-    pos_loss = (pos_d ** 2).mean() if pos_d.numel() > 0 else dist.new_tensor(0.)
-    neg_loss = (F.relu(margin - neg_d) ** 2).mean() if neg_d.numel() > 0 else dist.new_tensor(0.)
-    return pos_loss + neg_loss, None
+    pos_loss = (pos_d**2).mean() if pos_d.numel() > 0 else dist.new_tensor(0.0)
+    neg_loss = (
+        (F.relu(margin - neg_d) ** 2).mean()
+        if neg_d.numel() > 0
+        else dist.new_tensor(0.0)
+    )
+    return pos_loss + neg_loss
 
-def multiscale_supervised_cl_semi(
-    mus,
-    labels,
-    margin=1.0,
-):
-    """
-    Contrastive (Siamese hinge) with masks that ignore noisy positives *and* negatives.
-    Batch layout: groups of 4, anchor at i%4==0 and neighbors at i+1..i+3.
-    labels: [B], anchor labels are gold; neighbors inherit anchor label but may be noisy.
-    """
-    B = mus[0].size(0)
-    device = mus[0].device
-    idx = torch.arange(B, device=device)
-    
-    is_anchor  = (idx % 8 == 0)                 # [B]
-    group_id   = idx // 8                      # [B]
-    same_label = labels[:, None].eq(labels[None, :])     # [B,B]
-    same_group = group_id[:, None].eq(group_id[None, :]) # [B,B]
-    eye        = torch.eye(B, dtype=torch.bool, device=device)
-
-    # helpers
-    both_anchors   = (is_anchor[:, None]  &  is_anchor[None, :])     # both anchors
-    one_anchor     = is_anchor[:, None] ^  is_anchor[None, :]        # exactly one is anchor
-    neither_anchor = (~is_anchor[:, None] & ~is_anchor[None, :])  # neither is anchor
-
-    # strong positives
-    pos_mask = (both_anchors & same_label)# | (one_anchor & same_group)
-
-    # strong negatives
-    neg_mask = both_anchors & ~same_label
-    
-    # weak positives and negatives
-    # weak_pos_mask = one_anchor & ~same_group & same_label
-    # weak_neg_mask = one_anchor & ~same_group & ~same_label
-    
-    # weakest positives and negatives
-    # weakest_pos_mask = neither_anchor & ~same_group & same_label
-    # weakest_neg_mask = neither_anchor & ~same_group & ~same_label
-    
-    # pos_mask = pos_mask | weak_pos_mask | weakest_pos_mask
-    # neg_mask = neg_mask | weak_neg_mask | weakest_neg_mask
-    
-    # --- descriptors (pooled + L2-normalized) ---
-    z = torch.cat([F.adaptive_avg_pool2d(x, (1,1)).flatten(1) for x in mus], dim=1)
-    z = F.normalize(z, dim=1)
-    dist = torch.cdist(z, z, p=2)
-    dist = torch.clamp(dist, min=0, max=1e6)
-
-    # ===== compute loss =====
-    tri = torch.triu(torch.ones(B, B, dtype=torch.bool, device=device), diagonal=1)
-    pos_d = dist[pos_mask & tri & ~eye]
-    neg_d = dist[neg_mask & tri & ~eye]
-
-    pos_loss = (pos_d ** 2).mean() if pos_d.numel() else dist.new_tensor(0.)
-    neg_loss = (F.relu(margin - neg_d) ** 2).mean() if neg_d.numel() else dist.new_tensor(0.)
-    return pos_loss + neg_loss, None
 
 def pos_neg_loss(mus, labels, margin=50.0, labeled_ratio=1):
-
     batch_size = len(mus[0])
     device = mus[0].device
     small_batch_size = int(batch_size * labeled_ratio)
@@ -669,59 +500,6 @@ def pos_neg_loss(mus, labels, margin=50.0, labeled_ratio=1):
     return pos_pair_loss, neg_pair_loss_terms
 
 
-def pos_neg_loss_normal(mus, labels, margin=50.0, labeled_ratio=1):
-
-    batch_size = len(mus[0])
-    device = mus[0].device
-    small_batch_size = int(batch_size * labeled_ratio)
-
-    labels = labels[:small_batch_size]
-    num_classes = torch.unique(labels).size(0)
-    labels = labels.unsqueeze(0)
-    boolean_matrix = (labels == labels.T).to(device=device)
-    mask = torch.eye(small_batch_size, dtype=torch.bool).to(device)
-    boolean_matrix = boolean_matrix.masked_fill(mask, 0)
-
-    pos_pair_loss = 0
-    neg_pair_loss_terms = {}
-
-    for index, mu in enumerate(mus):
-        mus = mu.view(1, batch_size, -1)
-        mus = mus[:, :small_batch_size]
-
-        dist = torch.cdist(mus, mus, p=2).squeeze(0)
-
-        dist = torch.clamp(dist, min=1e-6, max=1e6)
-
-        pos_pair_loss += torch.sum(boolean_matrix * dist) / (
-            torch.sum(boolean_matrix) * (2 ** (2 - index))
-        )
-
-        for i in range(num_classes - 1):
-            for j in range(i + 1, num_classes):
-                mask_i = labels == i
-                mask_j = labels == j
-                mask_ij = mask_i & mask_j.T
-
-                neg_bool_matrix = mask_ij.to(device=device)
-                neg_loss = custom_distance_loss_masked(
-                    dist, neg_bool_matrix, margin=margin
-                )
-
-                num_neg_pairs = torch.sum(neg_bool_matrix)
-                if num_neg_pairs == 0:
-                    neg_loss = torch.tensor(0.0, device=device)
-                else:
-                    neg_loss /= num_neg_pairs * (2 ** (2 - index))
-
-                if f"{i}{j}" in neg_pair_loss_terms.keys():
-                    neg_pair_loss_terms[f"{i}{j}"] += neg_loss
-                else:
-                    neg_pair_loss_terms[f"{i}{j}"] = neg_loss
-
-    return pos_pair_loss, neg_pair_loss_terms
-
-
 def custom_distance_loss_masked(distances, mask, margin=16.0, epsilon=1e-6, alpha=1.0):
     """
     Custom loss function to compute penalties only for selected elements based on a mask.
@@ -757,12 +535,9 @@ def custom_distance_loss_masked(distances, mask, margin=16.0, epsilon=1e-6, alph
 
 
 def get_thetas(neg_pair_loss_terms):
-
     losses = torch.tensor(list(neg_pair_loss_terms.values()))
     if torch.all(losses == 0):
-        normalized_losses = torch.ones_like(losses) / len(
-            losses
-        )  # Distribute uniformly
+        normalized_losses = torch.ones_like(losses) / len(losses)  # Distribute uniformly
     else:
         normalized_losses = F.softmax(losses, dim=0)
     thetas = {
@@ -773,7 +548,6 @@ def get_thetas(neg_pair_loss_terms):
 
 
 def compute_weighted_neg(neg_pair_loss_terms, neg_thetas):
-
     weighted_neg = 0
     for pair, loss in neg_pair_loss_terms.items():
         weight = neg_thetas.get(pair, 1.0)

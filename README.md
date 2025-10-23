@@ -12,5 +12,6 @@ A hierarchical variational autoencoder based method for semantic segmentation of
 2. Use [uv](https://docs.astral.sh/uv/getting-started/installation/) to create a virtual environment and install the package:
    ```bash
     uv venv
+    source .venv/bin/activate
     uv pip install -e . # Editable install for development
    ```

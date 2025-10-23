@@ -29,4 +29,5 @@ class LVAEConfig(BaseEPSConfig):
     # Should be part of training config
     use_contrastive_learning: bool = Field(default=True, description="Whether to use contrastive loss during training.")
     margin: float = Field(default=1.5, description="Margin value for contrastive loss.")
+    nips: bool = Field(default=False, description="Whether to use NeurIPS-paper contrastive learning.")
     
