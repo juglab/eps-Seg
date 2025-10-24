@@ -16,12 +16,15 @@ def train(exp_config: ExperimentConfig):
         Args:
             exp_config (ExperimentConfig): The experiment configuration object containing paths to training, dataset, and model configs.
     """
-
-
     train_config, dataset_config, model_config = exp_config.get_configs()
 
     # TODO: write a factory also for datamodules
     dm = BetaSegDataModule(cfg=dataset_config, train_cfg=train_config)
+
+    # Set random seed for reproducibility if provided
+    if train_config.seed is not None:
+        print(f"Setting random seed to {train_config.seed} for training...")
+        L.seed_everything(train_config.seed, workers=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
@@ -62,6 +65,7 @@ def train(exp_config: ExperimentConfig):
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
+        deterministic=train_config.deterministic,
         )
 
     # First phase: Supervised training
@@ -113,6 +117,7 @@ def train(exp_config: ExperimentConfig):
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
+        deterministic=train_config.deterministic,
         )
 
     # TODO: This resets the optimizers and the global_step, but calling .fit(ckpt_path=...) gives weird behavior when used on another trainer.
