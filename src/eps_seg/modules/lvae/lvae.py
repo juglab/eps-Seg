@@ -266,7 +266,7 @@ class LadderVAE(nn.Module):
         if self.use_contrastive_learning:
             if td_data.get("pseudo_labels", None) is not None:
                 # i.e., we are in either training or validation mode (we have labels)
-                cl, q = compute_cl_loss(
+                cl = compute_cl_loss(
                     mus=td_data["mu"],
                     labels=td_data["pseudo_labels"],
                     nips=True,

@@ -375,13 +375,13 @@ def get_normalized_tensor(img, model, device):
 def compute_cl_loss(
     mus,
     labels,
-    nips=False,
+    nips=True,
 ):
     if not nips:
         return multiscale_cl(mus, labels)
     else:
         lambda_contrastive = 0.5
-        pos_pair_loss, neg_pair_loss_terms = pos_neg_loss(mus, labels, margin=50.0)
+        pos_pair_loss, neg_pair_loss_terms = pos_neg_loss(mus, labels, margin=5.0)
         neg_thetas = get_thetas(neg_pair_loss_terms)
         weighted_neg = compute_weighted_neg(neg_pair_loss_terms, neg_thetas)
         contrastive_loss = (
@@ -429,78 +429,94 @@ def multiscale_cl(mus, labels, margin=1.5):
     return pos_loss + neg_loss
 
 
-def pos_neg_loss(mus, labels, margin=50.0, labeled_ratio=1):
-    batch_size = len(mus[0])
+def pos_neg_loss(mus, labels, margin=5.0):
     device = mus[0].device
-    small_batch_size = int(batch_size * labeled_ratio)
+    labeled_mask = labels[-1] != -1
+    labeled_indices = torch.nonzero(labeled_mask, as_tuple=False).squeeze(-1)
 
-    labels = labels[:small_batch_size]
-    num_classes = torch.unique(labels).size(0)
-    labels = labels.unsqueeze(0)
-    boolean_matrix = (labels == labels.T).to(device=device)
-    mask = torch.eye(small_batch_size, dtype=torch.bool).to(device)
-    boolean_matrix = boolean_matrix.masked_fill(mask, 0)
+    # If fewer than 2 labeled samples, there are no pairs to compare
+    if labeled_indices.numel() < 2:
+        return torch.tensor(0.0, device=device, dtype=torch.float32), {}
 
-    top_mus = mus[-1][:small_batch_size].view(small_batch_size, -1)
-    top_mus = top_mus.unsqueeze(0)
-    dist = torch.cdist(top_mus, top_mus, p=2).squeeze(0)
-    dist = torch.clamp(dist, min=0, max=1e6)
+    labels_l = labels[-1][labeled_indices]
+    classes = torch.unique(labels_l)
 
-    pos_pair_loss = torch.sum(boolean_matrix * dist) / torch.sum(boolean_matrix)
+    # 2) Build positive-pair boolean matrix (diag excluded)
+    n = labels_l.size(0)
+    labels_row = labels_l.unsqueeze(0)  # [1, n]
+    pos_mask = labels_row == labels_row.T  # [n, n]
+    pos_mask.fill_diagonal_(False)
+    pos_count = pos_mask.sum().clamp(min=1)  # avoid div-by-zero later
 
+    # Helper to compute pairwise distances for a given level on the labeled subset
+    def pairwise_dist(x):
+        # x: [n, ...] -> flatten features per sample
+        x = x.view(n, -1).unsqueeze(0)  # [1, n, d]
+        d = torch.cdist(x, x, p=2).squeeze(0)  # [n, n]
+        return torch.clamp(d, min=0, max=1e6)
+
+    # 3) Top level distances and positive loss
+    top = mus[-1][labeled_indices]
+    dist_top = pairwise_dist(top)
+
+    pos_pair_loss = (pos_mask.to(device) * dist_top).sum() / pos_count
+
+    # 4) Negative pair losses per class pair
     neg_pair_loss_terms = {}
-    for i in range(num_classes - 1):
-        for j in range(i + 1, num_classes):
-            mask_i = labels == i
-            mask_j = labels == j
-            mask_ij = mask_i & mask_j.T
+    # Iterate over *actual* class ids (not reindexed), excluding -1 already
+    class_list = classes.tolist()
+    class_list.sort()
+    for idx_a in range(len(class_list) - 1):
+        for idx_b in range(idx_a + 1, len(class_list)):
+            ca, cb = class_list[idx_a], class_list[idx_b]
 
-            neg_bool_matrix = mask_ij.to(device=device)
-            neg_loss = custom_distance_loss_masked(dist, neg_bool_matrix, margin=margin)
+            mask_i = (labels_l == ca).unsqueeze(0)  # [1, n]
+            mask_j = (labels_l == cb).unsqueeze(0)  # [1, n]
+            neg_mask = (mask_i.T & mask_j) | (mask_j.T & mask_i)  # symmetrical [n, n]
 
-            num_neg_pairs = torch.sum(neg_bool_matrix)
-            if num_neg_pairs == 0:
+            num_neg_pairs = neg_mask.sum()
+            if num_neg_pairs.item() == 0:
                 neg_loss = torch.tensor(0.0, device=device)
             else:
-                neg_loss /= num_neg_pairs
-
-            neg_pair_loss_terms[f"{i}{j}"] = neg_loss
-
-    for index, mu in enumerate(mus[:-1]):
-        mus = mu.view(1, batch_size, -1)
-        mus = mus[:, :small_batch_size]
-
-        dist = torch.cdist(mus, mus, p=2).squeeze(0)
-
-        dist = torch.clamp(dist, min=0, max=1e6)
-
-        pos_pair_loss += torch.sum(boolean_matrix * dist) / (
-            torch.sum(boolean_matrix) * (2 ** (2 - index))
-        )
-
-        for i in range(num_classes - 1):
-            for j in range(i + 1, num_classes):
-                mask_i = labels == i
-                mask_j = labels == j
-                mask_ij = mask_i & mask_j.T
-
-                neg_bool_matrix = mask_ij.to(device=device)
                 neg_loss = custom_distance_loss_masked(
-                    dist, neg_bool_matrix, margin=margin
+                    dist_top, neg_mask.to(device), margin=margin
                 )
+                neg_loss = neg_loss / num_neg_pairs
 
-                num_neg_pairs = torch.sum(neg_bool_matrix)
-                if num_neg_pairs == 0:
-                    neg_loss = torch.tensor(0.0, device=device)
+            neg_pair_loss_terms[f"{ca}-{cb}"] = neg_loss
+
+    # 5) Other levels: accumulate with your original weights
+    for level_idx, mu in enumerate(mus[:-1]):
+        x = mu[labeled_indices]
+        dist = pairwise_dist(x)
+
+        # weight factor matches your original (top level handled separately)
+        weight_div = 2 ** (2 - level_idx)
+        pos_pair_loss += (pos_mask.to(device) * dist).sum() / (pos_count * weight_div)
+
+        for idx_a in range(len(class_list) - 1):
+            for idx_b in range(idx_a + 1, len(class_list)):
+                ca, cb = class_list[idx_a], class_list[idx_b]
+
+                mask_i = (labels_l == ca).unsqueeze(0)
+                mask_j = (labels_l == cb).unsqueeze(0)
+                neg_mask = (mask_i.T & mask_j) | (mask_j.T & mask_i)
+
+                num_neg_pairs = neg_mask.sum()
+                if num_neg_pairs.item() == 0:
+                    add_loss = torch.tensor(0.0, device=device)
                 else:
-                    neg_loss /= num_neg_pairs * (2 ** (2 - index))
+                    add_loss = custom_distance_loss_masked(
+                        dist, neg_mask.to(device), margin=margin
+                    )
+                    add_loss = add_loss / (num_neg_pairs * weight_div)
 
-                neg_pair_loss_terms[f"{i}{j}"] += neg_loss
+                neg_pair_loss_terms[f"{ca}-{cb}"] += add_loss
 
     return pos_pair_loss, neg_pair_loss_terms
 
 
-def custom_distance_loss_masked(distances, mask, margin=16.0, epsilon=1e-6, alpha=1.0):
+def custom_distance_loss_masked(distances, mask, margin=5.0, epsilon=1e-6, alpha=1.0):
     """
     Custom loss function to compute penalties only for selected elements based on a mask.
 
