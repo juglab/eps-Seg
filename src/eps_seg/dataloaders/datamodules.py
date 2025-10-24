@@ -26,7 +26,10 @@ class BetaSegDataModule(L.LightningDataModule):
         except Exception as e:
             print(f"Could not load cached dataset splits. Loading original data.")
             self.images, self.labels = self._load_original_img_lbls()
-            self.train_idx, self.val_idx = self._shuffle_dataset(self.labels)
+
+            # Split the data, only shuffle if 2D data 
+            self.train_idx, self.val_idx = self._shuffle_and_split(self.labels, 
+                                                                 shuffle=self.cfg.dim == 2)
             self.data_mean, self.data_std = self._compute_statistics(self.images, self.train_idx)
             self.images = self._normalize_data_inplace(self.images, self.data_mean, self.data_std)
             print(f"Caching dataset splits...")
@@ -44,6 +47,7 @@ class BetaSegDataModule(L.LightningDataModule):
             ratio=self.cfg.initial_labeled_ratio,
             indices_dict=self.train_idx,
             radius=self.train_cfg.initial_radius,
+            dim=self.cfg.dim,
         )
 
         self.val_dataset = SemisupervisedDataset(
@@ -56,6 +60,7 @@ class BetaSegDataModule(L.LightningDataModule):
             ignore_lbl=-1,
             ratio=self.cfg.initial_labeled_ratio,
             indices_dict=self.val_idx,
+            dim=self.cfg.dim,
         )
 
     def get_data_statistics(self) -> Tuple[float, float]:
@@ -103,12 +108,14 @@ class BetaSegDataModule(L.LightningDataModule):
         lbls = {key: tiff.imread(path).astype(np.float16) for key, path in zip(keys, lbl_paths)}
         return imgs, lbls
 
-    def _shuffle_dataset(self, labels: Dict[str, np.ndarray]):
+    def _shuffle_and_split(self, labels: Dict[str, np.ndarray], shuffle=True) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
             Splits dataset into training and validation sets (85% - 15%).
+            And shuffles the indices if specified.
 
             Args:
                 labels (dict): Dictionary mapping keys to label arrays.
+                shuffle (bool): Whether to shuffle the indices before splitting.
             Returns:
                 train_idx (dict): Dictionary mapping keys to training indices.
                 val_idx (dict): Dictionary mapping keys to validation indices.
@@ -124,7 +131,8 @@ class BetaSegDataModule(L.LightningDataModule):
             #             
             valid_indices = np.where(~np.all(labels[key] == -1, axis=(1, 2)))[0]
             total_samples = valid_indices.shape[0]
-            np.random.shuffle(valid_indices)  # Shuffles in place
+            if shuffle:
+                np.random.shuffle(valid_indices)  # Shuffles in place
 
             # Compute split index
             split_idx = int(0.85 * total_samples)

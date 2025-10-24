@@ -1,7 +1,7 @@
 type: "BetaSegDatasetConfig"
-dim: 2
+dim: 3
 data_dir: "/group/jug/Sheida/pancreatic beta cells/download/"
-cache_dir: "/group/jug/edoardo/datasets/eps_seg/cache/pancreatic_beta_cells/"
+cache_dir: "/group/jug/edoardo/datasets/eps_seg/cache/pancreatic_beta_cells_3d/"
 enable_cache: True
 keys: ["high_c1", "high_c2", "high_c3"]
 seed: 42

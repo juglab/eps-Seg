@@ -21,7 +21,10 @@ class SemisupervisedDataset(Dataset):
         ignore_lbl=-1,
         ratio=0.75,
         indices_dict=None,
-        radius=5,  # TODO
+        radius=5,
+        dim=2,
+        seed = 42,
+        n_neighbors=7,
     ):
         self.patch_size = patch_size
         self.label_size = label_size
@@ -36,8 +39,8 @@ class SemisupervisedDataset(Dataset):
         self.mode = mode
         self.indices_dict = indices_dict or {}
         self.radius = radius
-        self.n_neighbors = 7  # TODO  # Number of neighbors to sample
-        self.seed = 42
+        self.n_neighbors = n_neighbors
+        self.seed = seed
         self.rng = random.Random(self.seed)
         self.samples_per_class: Dict[int, int] = {1: 2}
         self.default_samples_per_class: int = 1  # TODO
@@ -50,6 +53,7 @@ class SemisupervisedDataset(Dataset):
             c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c]
             for c in range(self.n_classes)
         }
+        self.dim = dim
 
     def set_mode(self, mode: str):
         """Switch between supervised and semisupervised modes."""

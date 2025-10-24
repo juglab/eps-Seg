@@ -21,6 +21,7 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 
 class BetaSegDatasetConfig(BaseEPSDatasetConfig):
+    dim: int = Field(2, description="Dimensionality of the data (2D or 3D)")
     data_dir: str = Field(..., description="Path to the dataset directory")
     cache_dir: Optional[str] = Field(None, description="Path to cache directory where normalized data and split indices are stored")
     enable_cache: bool = Field(True, description="Whether to use/store cached dataset splits if available. Set to false to preserve disk space.")
@@ -30,6 +31,7 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     n_classes: int = Field(4, description="Number of segmentation classes in the dataset")
     mode: Literal["supervised", "semisupervised"] = Field("supervised", description="Dataset mode: supervised or semisupervised")    
     initial_labeled_ratio: float = Field(1.0, description="Initial ratio of labeled data in semisupervised mode")
+
 
     @model_validator(mode="after")
     def check_dirs_not_equal(self) -> "BetaSegDatasetConfig":
