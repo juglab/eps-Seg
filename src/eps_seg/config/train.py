@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel, Field
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
@@ -8,7 +8,10 @@ from pathlib import Path
 import yaml
 
 class TrainConfig(BaseEPSConfig):
-    model_name: str = Field(default="eps_seg_default", description="Name of the model"),
+    model_name: str = Field(default="eps_seg_default", description="Name of the model")
+    supervised_seed: Union[int, None] = Field(default=None, description="Random seed for supervised training. Does not affect data shuffling if a dataset seed is provided. See config.dataset.")
+    semisupervised_seed: Union[int, None] = Field(default=None, description="Random seed for semisupervised training.")
+    deterministic: bool = Field(default=False, description="Whether to use deterministic training (may slow down training but ensures reproducibility)")
     lr: float = Field(default=3e-5, description="Learning rate")
     lr_patience: int = Field(default=10, description="Patience for learning rate scheduler")
     lr_factor: float = Field(default=0.9, description="Factor for learning rate scheduler")

@@ -16,12 +16,15 @@ def train(exp_config: ExperimentConfig):
         Args:
             exp_config (ExperimentConfig): The experiment configuration object containing paths to training, dataset, and model configs.
     """
-
-
     train_config, dataset_config, model_config = exp_config.get_configs()
 
     # TODO: write a factory also for datamodules
     dm = BetaSegDataModule(cfg=dataset_config, train_cfg=train_config)
+
+    # Set random seed for reproducibility if provided
+    if train_config.supervised_seed is not None:
+        print(f"Setting random seed to {train_config.supervised_seed} for supervised training...")
+        L.seed_everything(train_config.supervised_seed, workers=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
@@ -62,17 +65,23 @@ def train(exp_config: ExperimentConfig):
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
+        deterministic=train_config.deterministic,
         )
 
-    # First phase: Supervised training
     model.update_mode("supervised")
-
     supervised_trainer.fit(model, datamodule=dm)
 
     print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
     # Finish the wandb run to avoid next run to log into the same run
     if train_config.use_wandb:
         wandb.finish()
+
+    #### SEMISUPERVISED TRAINING ####
+
+    # Set random seed for reproducibility if provided
+    if train_config.semisupervised_seed is not None:
+        print(f"Setting random seed to {train_config.semisupervised_seed} for semisupervised training...")
+        L.seed_everything(train_config.semisupervised_seed, workers=True)
 
     semisupervised_modelcheckpoint = ModelCheckpoint(
         monitor="val/total_loss_epoch",
@@ -99,7 +108,7 @@ def train(exp_config: ExperimentConfig):
         logger=semisupervised_logger,
         max_epochs=train_config.max_epochs,
         callbacks=[
-                SemiSupervisedModeCallback(),
+                SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
                 semisupervised_modelcheckpoint, 
                 EarlyStoppingWithPatiencePropagation(
                         monitor="val/total_loss_epoch",
@@ -113,6 +122,7 @@ def train(exp_config: ExperimentConfig):
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
+        deterministic=train_config.deterministic,
         )
 
     # TODO: This resets the optimizers and the global_step, but calling .fit(ckpt_path=...) gives weird behavior when used on another trainer.

@@ -124,7 +124,9 @@ class BetaSegDataModule(L.LightningDataModule):
         # Function adapted from original boilerplate.dataloader script to preserve reproducible splits
         keys = self.cfg.keys
         train_idx, val_idx = {}, {}
-        np.random.seed(self.cfg.seed)
+        # WARNING: Here RandomState is used to ensure backward compatibility with paper results (that were generated with np.random.seed)
+        # DO NOT CHANGE TO np.random.default_rng unless you are ok with having different dataset splits than in the paper
+        rng = np.random.RandomState(self.cfg.seed)
         for key in keys:
             # Create a mask for valid indices where labels are not all -1
             # -1 indicates outside of the cell
@@ -132,7 +134,7 @@ class BetaSegDataModule(L.LightningDataModule):
             valid_indices = np.where(~np.all(labels[key] == -1, axis=(1, 2)))[0]
             total_samples = valid_indices.shape[0]
             if shuffle:
-                np.random.shuffle(valid_indices)  # Shuffles in place
+                rng.shuffle(valid_indices)  # Shuffles in place
 
             # Compute split index
             split_idx = int(0.85 * total_samples)
