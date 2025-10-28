@@ -9,7 +9,8 @@ import yaml
 
 class TrainConfig(BaseEPSConfig):
     model_name: str = Field(default="eps_seg_default", description="Name of the model")
-    seed: Union[int, None] = Field(default=None, description="Random seed for training. Does not affect data shuffling if a dataset seed is provided. See config.dataset.")
+    supervised_seed: Union[int, None] = Field(default=None, description="Random seed for supervised training. Does not affect data shuffling if a dataset seed is provided. See config.dataset.")
+    semisupervised_seed: Union[int, None] = Field(default=None, description="Random seed for semisupervised training.")
     deterministic: bool = Field(default=False, description="Whether to use deterministic training (may slow down training but ensures reproducibility)")
     lr: float = Field(default=3e-5, description="Learning rate")
     lr_patience: int = Field(default=10, description="Patience for learning rate scheduler")

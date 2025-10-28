@@ -22,9 +22,9 @@ def train(exp_config: ExperimentConfig):
     dm = BetaSegDataModule(cfg=dataset_config, train_cfg=train_config)
 
     # Set random seed for reproducibility if provided
-    if train_config.seed is not None:
-        print(f"Setting random seed to {train_config.seed} for training...")
-        L.seed_everything(train_config.seed, workers=True)
+    if train_config.supervised_seed is not None:
+        print(f"Setting random seed to {train_config.supervised_seed} for supervised training...")
+        L.seed_everything(train_config.supervised_seed, workers=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
@@ -68,15 +68,20 @@ def train(exp_config: ExperimentConfig):
         deterministic=train_config.deterministic,
         )
 
-    # First phase: Supervised training
     model.update_mode("supervised")
-
     supervised_trainer.fit(model, datamodule=dm)
 
     print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
     # Finish the wandb run to avoid next run to log into the same run
     if train_config.use_wandb:
         wandb.finish()
+
+    #### SEMISUPERVISED TRAINING ####
+
+    # Set random seed for reproducibility if provided
+    if train_config.semisupervised_seed is not None:
+        print(f"Setting random seed to {train_config.semisupervised_seed} for semisupervised training...")
+        L.seed_everything(train_config.semisupervised_seed, workers=True)
 
     semisupervised_modelcheckpoint = ModelCheckpoint(
         monitor="val/total_loss_epoch",
@@ -103,7 +108,7 @@ def train(exp_config: ExperimentConfig):
         logger=semisupervised_logger,
         max_epochs=train_config.max_epochs,
         callbacks=[
-                SemiSupervisedModeCallback(),
+                SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
                 semisupervised_modelcheckpoint, 
                 EarlyStoppingWithPatiencePropagation(
                         monitor="val/total_loss_epoch",
