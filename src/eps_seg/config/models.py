@@ -23,7 +23,7 @@ class LVAEConfig(BaseEPSModelConfig):
     n_components: int = Field(default=4, description="Number of components (classes) for the mixture model.")
     n_layers: int = Field(default=3, description="Number of layers in the LVAE.")
     z_dims: List[int] = Field(default=[32,]*3, description="Latent variable dimensions for each layer.")
-    img_shape: Tuple[int] = Field(default=(64, 64), description="Shape of the input images (height, width[, depth]).")
+    img_shape: List[int] = Field(default=[64, 64], description="Shape of the input images (height, width[, depth]).")
     color_channels: int = Field(default=1, description="Number of color channels in the input images.")
     blocks_per_layer: int = Field(default=5, description="Number of blocks per layer in the LVAE.")
     conv_mult: Literal[2, 3] = Field(default=2, description="Dimensions of the Conv layers (2D or 3D).")
