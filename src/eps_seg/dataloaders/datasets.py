@@ -298,3 +298,45 @@ class SemisupervisedDataset(Dataset):
             for k in sorted(counts):
                 print(f"  Class {k} ({title}): {counts[k]} samples")
 
+
+
+class PredictionDataset(Dataset):
+    """
+    Yields only 64x64 patches whose center (31,31) has label != -1 for a fixed z slice.
+    image: (Z,H,W)  (or (C,H,W) if you adapt for multichannel)
+    label: (Z,H,W)
+    """
+    def __init__(self, image, label, z, patch_size=64):
+        self.image = image
+        self.label = label
+        self.z = int(z)
+        self.ps = int(patch_size)
+        assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
+        self.half = self.ps // 2  # 32 for 64x64 -> center at (31,31)
+
+        H, W = image[self.z].shape
+        assert (H, W) == label[self.z].shape
+
+        # Valid centers: label!= -1 and full patch inside bounds
+        y0, y1 = self.half, H - self.half
+        x0, x1 = self.half, W - self.half
+        mask = (label[self.z] != -1)
+        mask[:y0, :] = False
+        mask[y1:, :] = False
+        mask[:, :x0] = False
+        mask[:, x1:] = False
+
+        ys, xs = np.where(mask)
+        self.centers = np.stack([ys, xs], axis=1).astype(np.int32)
+
+    def __len__(self):
+        return len(self.centers)
+
+    def __getitem__(self, idx):
+        y, x = self.centers[idx]
+        y0, y1 = y - self.half, y + self.half
+        x0, x1 = x - self.half, x + self.half
+        patch = self.image[self.z, y0:y1, x0:x1]              # (64,64)
+        patch = torch.from_numpy(patch).float().unsqueeze(0)  # (1,64,64)
+        center_label = int(self.label[self.z, y, x])
+        return {"patch": patch, "z": self.z, "y": int(y), "x": int(x), "center_label": center_label}
