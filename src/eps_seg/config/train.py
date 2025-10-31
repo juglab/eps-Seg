@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, Literal
 from pydantic import BaseModel, Field
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
 from eps_seg.config.models import BaseEPSModelConfig, LVAEConfig
 from pathlib import Path
-import yaml
+
 
 class TrainConfig(BaseEPSConfig):
     model_name: str = Field(default="eps_seg_default", description="Name of the model")
@@ -38,25 +38,38 @@ class TrainConfig(BaseEPSConfig):
 
 class ExperimentConfig(BaseEPSConfig):
     project_name: str = Field(default="eps-seg-default-project", description="Name of the project, e.g. used in WandB logging")
-    train_cfg_path: str = Field(default=None, description="Path to the training configuration YAML file")
-    dataset_cfg_path: str = Field(description="Path to the dataset configuration YAML file")
-    model_cfg_path: str = Field(default=None, description="Path to the model configuration YAML file")
+    train_cfg_path: str = Field(default=None, description="Path to the training configuration YAML file. Can be either absolute or relative to the experiment config file")
+    dataset_cfg_path: str = Field(description="Path to the dataset configuration YAML file. Can be either absolute or relative to the experiment config file")
+    model_cfg_path: str = Field(default=None, description="Path to the model configuration YAML file. Can be either absolute or relative to the experiment config file")
 
     def get_configs(self) -> tuple[TrainConfig, BaseEPSDatasetConfig, BaseEPSConfig]:
         """Load and return the training, dataset, and model configurations objects from the provided paths."""
 
+        # Paths can be either absolute or relative to the experiment config file
+
         if self.train_cfg_path:
-            train_cfg = TrainConfig.from_yaml(self.train_cfg_path)
-            print(f"Loaded training config from {self.train_cfg_path}")
+            train_cfg_path = Path(self.train_cfg_path)
+            if not train_cfg_path.is_absolute():
+                train_cfg_path = Path(self.config_yaml_path).parent / train_cfg_path
+
+            train_cfg = TrainConfig.from_yaml(train_cfg_path)
+            print(f"Loaded training config from {train_cfg_path}")
         else:
             train_cfg = TrainConfig()
             print("Using default training config")
 
-        dataset_cfg = BaseEPSDatasetConfig.from_yaml(self.dataset_cfg_path)
+
+        dataset_cfg_path = Path(self.dataset_cfg_path)
+        if not dataset_cfg_path.is_absolute():
+            dataset_cfg_path = Path(self.config_yaml_path).parent / dataset_cfg_path
+        dataset_cfg = BaseEPSDatasetConfig.from_yaml(dataset_cfg_path)
 
         if self.model_cfg_path:
-            model_cfg = BaseEPSModelConfig.from_yaml(self.model_cfg_path)
-            print(f"Loaded model config from {self.model_cfg_path}")
+            model_cfg_path = Path(self.model_cfg_path)
+            if not model_cfg_path.is_absolute():
+                model_cfg_path = Path(self.config_yaml_path).parent / model_cfg_path
+            model_cfg = BaseEPSModelConfig.from_yaml(model_cfg_path)
+            print(f"Loaded model config from {model_cfg_path}")
         else:
             model_cfg = LVAEConfig()
             print("Using default LVAE config")
@@ -87,3 +100,14 @@ class ExperimentConfig(BaseEPSConfig):
         """Return the directory path for saving logs."""
         return self.experiment_root / "logs"
 
+    def best_checkpoint_path(self, mode: Literal["supervised", "semisupervised"]) -> Path:
+        """Return the path to the best model checkpoint based on the training mode."""
+        train_cfg, dataset_cfg, model_cfg = self.get_configs()
+
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"best_{mode}.ckpt"
+    
+    def get_log_dir(self) -> Path:
+        """Return the directory path for saving logs."""
+        train_cfg, dataset_cfg, model_cfg = self.get_configs()
+
+        return self.logs_dir.resolve() / self.experiment_name / train_cfg.model_name

@@ -29,10 +29,11 @@ def train(exp_config: ExperimentConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
 
+    supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
     supervised_modelcheckpoint = ModelCheckpoint(
         monitor="val/total_loss_epoch",
-        dirpath=exp_config.checkpoints_dir.resolve() / exp_config.experiment_name / train_config.model_name,
-        filename="best_supervised",
+        dirpath=supervised_best_ckpt_path.parent,
+        filename=supervised_best_ckpt_path.stem,
         mode="min",
         save_last=True,
     )
@@ -41,12 +42,12 @@ def train(exp_config: ExperimentConfig):
         supervised_logger = WandbLogger(
             name=f"{exp_config.experiment_name}_supervised",
             project=exp_config.project_name,
-            save_dir=exp_config.logs_dir.resolve() / exp_config.experiment_name / train_config.model_name,
+            save_dir=exp_config.get_log_dir(),
         )
     else:
         supervised_logger = TensorBoardLogger(
             name=f"{exp_config.experiment_name}_supervised",
-            save_dir=exp_config.logs_dir.resolve() / exp_config.experiment_name / train_config.model_name,
+            save_dir=exp_config.get_log_dir(),
         )
 
     #### SUPERVISED MODE ####
@@ -83,10 +84,12 @@ def train(exp_config: ExperimentConfig):
         print(f"Setting random seed to {train_config.semisupervised_seed} for semisupervised training...")
         L.seed_everything(train_config.semisupervised_seed, workers=True)
 
+
+    semisupervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="semisupervised")
     semisupervised_modelcheckpoint = ModelCheckpoint(
         monitor="val/total_loss_epoch",
-        dirpath=exp_config.checkpoints_dir.resolve() / exp_config.experiment_name / train_config.model_name,
-        filename="best_semisupervised",
+        dirpath=semisupervised_best_ckpt_path.parent,
+        filename=semisupervised_best_ckpt_path.stem,
         mode="min",
         save_last=True,
     )
@@ -95,12 +98,12 @@ def train(exp_config: ExperimentConfig):
         semisupervised_logger = WandbLogger(
             name=f"{exp_config.experiment_name}_semisupervised",
             project=exp_config.project_name,
-            save_dir=exp_config.logs_dir.resolve() / exp_config.experiment_name / train_config.model_name,
+            save_dir=exp_config.get_log_dir(),
         )
     else:
         semisupervised_logger = TensorBoardLogger(
             name=f"{exp_config.experiment_name}_semisupervised",
-            save_dir=exp_config.logs_dir.resolve() / exp_config.experiment_name / train_config.model_name,
+            save_dir=exp_config.get_log_dir(),
         )
 
     semisupervised_trainer = L.Trainer(
