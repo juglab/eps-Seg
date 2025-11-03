@@ -5,14 +5,14 @@ from pathlib import Path
 import tifffile as tiff
 import numpy as np
 from typing import Dict, Tuple
-from eps_seg.dataloaders.datasets import SemisupervisedDataset
+from eps_seg.dataloaders.datasets import SemisupervisedDataset, PredictionDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
 from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
 import yaml
 
-class BetaSegDataModule(L.LightningDataModule):
+class BetaSegTrainDataModule(L.LightningDataModule):
     def __init__(self, cfg: BetaSegDatasetConfig, train_cfg: TrainConfig):
         super().__init__()
         self.cfg = cfg
@@ -80,7 +80,7 @@ class BetaSegDataModule(L.LightningDataModule):
         np.save(Path(self.cfg.cache_dir) / "val_idx.npy", self.val_idx)
         np.save(Path(self.cfg.cache_dir) / "data_mean.npy", self.data_mean)
         np.save(Path(self.cfg.cache_dir) / "data_std.npy", self.data_std)
-        for key in self.cfg.keys:
+        for key in self.cfg.train_keys:
             tiff.imwrite(Path(self.cfg.cache_dir) / f"{key}_normalized.tif", self.images[key].astype(np.float16))
             tiff.imwrite(Path(self.cfg.cache_dir) / f"{key}_labels.tif", self.labels[key].astype(np.float16))
     
@@ -94,13 +94,13 @@ class BetaSegDataModule(L.LightningDataModule):
         self.data_std = np.load(Path(self.cfg.cache_dir) / "data_std.npy")
         self.images = {}
         self.labels = {}
-        for key in self.cfg.keys:
+        for key in self.cfg.train_keys:
             self.images[key] = tiff.imread(Path(self.cfg.cache_dir) / f"{key}_normalized.tif").astype(np.float16)
             self.labels[key] = tiff.imread(Path(self.cfg.cache_dir) / f"{key}_labels.tif").astype(np.float16)
         print(f"Loaded cached dataset splits from {self.cfg.cache_dir}.")
 
     def _load_original_img_lbls(self):
-        keys = self.cfg.keys
+        keys = self.cfg.train_keys
         data_dir = self.cfg.data_dir
         img_paths = [Path(data_dir) / key / f"{key}_source.tif" for key in keys]
         lbl_paths = [Path(data_dir) / key / f"{key}_gt.tif" for key in keys]
@@ -122,7 +122,7 @@ class BetaSegDataModule(L.LightningDataModule):
         
         """
         # Function adapted from original boilerplate.dataloader script to preserve reproducible splits
-        keys = self.cfg.keys
+        keys = self.cfg.train_keys
         train_idx, val_idx = {}, {}
         # WARNING: Here RandomState is used to ensure backward compatibility with paper results (that were generated with np.random.seed)
         # DO NOT CHANGE TO np.random.default_rng unless you are ok with having different dataset splits than in the paper
@@ -155,7 +155,7 @@ class BetaSegDataModule(L.LightningDataModule):
                 data_mean (float): Mean of the training data.
                 data_std (float): Standard deviation of the training data.
         """
-        all_elements = np.concatenate([images[key][train_idx[key]].flatten() for key in self.cfg.keys])
+        all_elements = np.concatenate([images[key][train_idx[key]].flatten() for key in self.cfg.train_keys])
         data_mean = np.mean(all_elements)
         data_std = np.std(all_elements.astype(np.float32))
         return data_mean, data_std
@@ -172,7 +172,7 @@ class BetaSegDataModule(L.LightningDataModule):
             Returns:
                 normalized_images (dict): Dictionary mapping keys to normalized image arrays.
         """
-        for key in tqdm(self.cfg.keys, "Normalizing data"):
+        for key in tqdm(self.cfg.train_keys, "Normalizing data"):
             images[key] = (images[key] - data_mean) / data_std
         return images
         
@@ -206,4 +206,14 @@ class BetaSegDataModule(L.LightningDataModule):
         print("Increasing semisupervised sampling radius...")
         self.train_dataset.increase_radius()
 
+
+    class BetaSegTestDataModule(L.LightningDataModule):
+        def __init__(self, cfg: BetaSegDatasetConfig):
+            super().__init__()
+            self.cfg = cfg
+        
+        def setup(self, stage):
+            super().setup(stage)
+            # Load original images and labels
+            
     # TODO: implement test_dataloader / predict_dataloader if needed

@@ -4,7 +4,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
-from eps_seg.dataloaders.datamodules import BetaSegDataModule
+from eps_seg.dataloaders.datamodules import BetaSegTrainDataModule
 from eps_seg.train.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
@@ -19,7 +19,7 @@ def train(exp_config: ExperimentConfig):
     train_config, dataset_config, model_config = exp_config.get_configs()
 
     # TODO: write a factory also for datamodules
-    dm = BetaSegDataModule(cfg=dataset_config, train_cfg=train_config)
+    dm = BetaSegTrainDataModule(cfg=dataset_config, train_cfg=train_config)
 
     # Set random seed for reproducibility if provided
     if train_config.supervised_seed is not None:

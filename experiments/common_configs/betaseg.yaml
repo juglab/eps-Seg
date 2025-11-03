@@ -3,6 +3,7 @@ dim: 2
 data_dir: "/group/jug/Sheida/pancreatic beta cells/download/"
 cache_dir: "/group/jug/edoardo/datasets/eps_seg/cache/pancreatic_beta_cells/"
 enable_cache: True
-keys: ["high_c1", "high_c2", "high_c3"]
+train_keys: ["high_c1", "high_c2", "high_c3"]
+test_keys: ["high_c4"]
 seed: 42
 patch_size: 64
