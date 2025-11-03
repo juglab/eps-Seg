@@ -214,19 +214,19 @@ class LadderVAE(nn.Module):
         return self._global_step
 
 
-    def forward(self, x, y=None, mask_input=False, confidence_threshold=0.99):
+    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99):
         """
             Forward pass through the LVAE model.
 
             Args:
                 x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
                 y: Optional labels tensor
-                mask_input: Whether to mask the input (used during training and validation)
+                validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
                 confidence_threshold: Confidence threshold for assigning pseudo-labels
         """
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
         # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
-        assert (self.training and mask_input) or (not self.training), "Input masking should only be done during training/validation."
+        mask_input = self.training or validation_mode
         x_orig = x if mask_input else None
         x = self._mask_input(x) if mask_input else x
         
@@ -256,7 +256,7 @@ class LadderVAE(nn.Module):
             recons_sep = -ll
             inpainting_loss = self._centre_crop(recons_sep).mean()
 
-        if self.training:
+        if self.training or validation_mode: # TODO: Merge with above condition?
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
             kl = torch.stack(td_data["kl"]).sum(0)
