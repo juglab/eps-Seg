@@ -24,15 +24,19 @@ class LVAEModel(L.LightningModule):
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
                                    "train_config": train_cfg.model_dump() if train_cfg else None})
 
-    def forward(self, x, y=None, mask_input=False, confidence_threshold: float = 0.99):
+    def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
             Forward pass through the LVAE model.
 
             Args:
                 inputs (torch.Tensor): Input tensor.
                 labels (torch.Tensor, optional): Labels tensor. Defaults to None.
-                mask_input: (bool, optional): Whether to mask the input. Defaults to False. 
-                                              Must be true during training/validation.
+                validation_mode (bool, optional): Whether we are in validation mode 
+                                                  (used to distinguish between validation and prediction). 
+                                                  Controls whether to mask input or not and compute losses.
+                                                  Defaults to False.
+                confidence_threshold (float, optional): Confidence threshold for assigning pseudo-labels. 
+                                                       Defaults to 0.99.
         """
         if torch.isnan(x).any() or torch.isinf(x).any():
             print("x has nan or inf")
@@ -40,8 +44,8 @@ class LVAEModel(L.LightningModule):
         x = x.squeeze(0)
         y = y.squeeze(0)
 
-        return self.model(x, y=y, mask_input=mask_input, confidence_threshold=confidence_threshold)
-    
+        return self.model(x, y=y, validation_mode=validation_mode, confidence_threshold=confidence_threshold)
+
     def on_fit_start(self):
         # Add data statistics to the model before training or prediction (so that they are saved in checkpoints)
         # TODO: Fix this with a better method
@@ -55,9 +59,9 @@ class LVAEModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y, z, _ = batch
-        
-        outputs = self.model(x, y, mask_input=True, confidence_threshold=self.current_threshold)
-        
+
+        outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold)
+
         inpainting_loss = outputs["inpainting_loss"]
         kld_loss = outputs["kl"]
         contrastive_loss = outputs["cl"]
@@ -71,8 +75,11 @@ class LVAEModel(L.LightningModule):
         )
 
         self.log("train/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/CL", contrastive_loss.item() * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
@@ -84,7 +91,11 @@ class LVAEModel(L.LightningModule):
         y = y.squeeze(0)
         z = z.squeeze(0)
         # FIXME: What threshold to use during validation?
-        outputs = self.model(x, y, mask_input=True, confidence_threshold=self.current_threshold)
+        outputs = self.forward(x, 
+                             y, 
+                             validation_mode=True, 
+                             confidence_threshold=self.current_threshold,
+                             )
 
         inpainting_loss = outputs["inpainting_loss"]
         kld_loss = outputs["kl"]
@@ -101,18 +112,19 @@ class LVAEModel(L.LightningModule):
         )
 
         self.log("val/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/CL", contrastive_loss.item() * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
         return outputs
 
-        # FIXME: Continue
-
     def predict_step(self, batch, batch_idx, dataloader_idx):
         x, y = batch
-        return self.forward(x, y, mask_input=False, confidence_threshold=0.99)  
+        return self.forward(x, y, validation_mode=False, confidence_threshold=0.99)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),
