@@ -101,7 +101,7 @@ class LadderVAE(nn.Module):
         self.first_bottom_up = nn.Sequential(
             # self.conv_type(color_ch, n_filters, 5, padding=2, stride=stride),
             self.conv_type(self.color_ch, self.n_filters, 5, padding=2, stride=1),  # No stride here
-            BlurPool(self.n_filters, stride=stride),  # Add BlurPool for downsampling
+            BlurPool(self.n_filters, stride=stride, dim=self.conv_mult),  # Add BlurPool for downsampling
             self.nonlin(),
             BottomUpDeterministicResBlock(
                 c_in=self.n_filters,
@@ -129,8 +129,7 @@ class LadderVAE(nn.Module):
             # Add bottom-up deterministic layer at level i.
             # It's a sequence of residual blocks (BottomUpDeterministicResBlock)
             # possibly with downsampling between them.
-            self.bottom_up_layers.append(
-                BottomUpLayer(
+            new_layer = BottomUpLayer(
                     n_res_blocks=self.blocks_per_layer,
                     n_filters=self.n_filters,
                     downsampling_steps=self.downsample[i],
@@ -142,7 +141,7 @@ class LadderVAE(nn.Module):
                     gated=self.use_gated_convs,
                     grad_checkpoint=self.use_grad_checkpoint,
                 )
-            )
+            self.bottom_up_layers.append(new_layer)
 
             # Add top-down stochastic layer at level i.
             # FIXME: Review commented out parameters and reimplement
@@ -263,14 +262,14 @@ class LadderVAE(nn.Module):
             if self.kl_free_bits > 0:
                 kl = free_bits_kl(kl, self.kl_free_bits)
         
-        if self.use_contrastive_learning:
-            if td_data.get("pseudo_labels", None) is not None:
-                # i.e., we are in either training or validation mode (we have labels)
-                cl = compute_cl_loss(
-                    mus=td_data["mu"],
-                    labels=td_data["pseudo_labels"],
-                    nips=True,
-                )
+            if self.use_contrastive_learning:
+                if td_data.get("pseudo_labels", None) is not None:
+                    # i.e., we are in either training or validation mode (we have labels)
+                    cl = compute_cl_loss(
+                        mus=td_data["mu"],
+                        labels=td_data["pseudo_labels"],
+                        nips=True,
+                    )
 
         output = {
             "ll": ll,

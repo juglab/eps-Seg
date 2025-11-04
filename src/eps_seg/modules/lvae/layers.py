@@ -202,6 +202,7 @@ class TopDownLayer(nn.Module):
         self.n_components = n_components
         self.top_prior_param_shape = top_prior_param_shape
         self.skip_connection = skip_connection
+        self.conv_mult = conv_mult
 
         if self.is_top_layer:
             self.top_prior_params = self._get_top_prior_params()
@@ -303,7 +304,7 @@ class TopDownLayer(nn.Module):
         # TODO write tests for this function
         # Extract spatial dimensions and channels
         total_channels = top_prior_param_shape[1]  # Total number of channels
-        spatial_res = top_prior_param_shape[2]  # Spatial resolution
+        spatial_dims: tuple = top_prior_param_shape[-self.conv_mult:]  # Spatial resolution
 
         # Each GMM component uses an equal fraction of the channels
         channels_per_component = total_channels // (
@@ -312,7 +313,7 @@ class TopDownLayer(nn.Module):
 
         # Initialize the tensor for means (mus)
         chunk_values = torch.zeros(
-            (n_components, channels_per_component, spatial_res, spatial_res)
+            (n_components, channels_per_component,) + spatial_dims
         )
         # TODO hardcoded 2.0, better initialization strategy?
         # Dynamically assign values to means
@@ -324,9 +325,8 @@ class TopDownLayer(nn.Module):
                 2.0  # Equidistant initialization for means
             )
 
-        # Reshape means into the required format
         mus = chunk_values.view(
-            1, n_components * channels_per_component, spatial_res, spatial_res
+            (1, n_components * channels_per_component,) + spatial_dims
         )
 
         # Initialize standard deviations (sigmas) as zeros (or another value if needed)
@@ -545,7 +545,7 @@ class ResBlockWithResampling(nn.Module):
                     # groups=groups,
                 )
                 # self.pre_conv = conv_type(c_in, c_out, kernel_size=3, padding=1)
-                self.blurpool = BlurPool(inner_filters, stride=2)
+                self.blurpool = BlurPool(inner_filters, stride=2, dim=conv_mult)
             elif mode == "top-down":  # upsample
                 self.pre_conv = upsample_conv(
                     in_channels=c_in,
@@ -711,31 +711,46 @@ class BlurPool(nn.Module):
     BlurPool Layer: Applies a blur filter before downsampling to reduce aliasing artifacts.
     """
 
-    def __init__(self, channels, stride=2):
+    def __init__(self, channels, stride=2, dim=2):
         """
         Args:
             channels (int): Number of input channels.
             stride (int): Downsampling factor.
+            dim (int): Dimensionality of the input (2 or 3).
         """
         super(BlurPool, self).__init__()
         self.stride = stride
+        self.dim = dim
 
         # Define a simple low-pass filter (approximating Gaussian)
         kernel = torch.tensor([1, 2, 1], dtype=torch.float32)
-        kernel = kernel[:, None] * kernel[None, :]
+        
+        kernel = kernel[:, None] * kernel[None, :] if dim == 2 else kernel[:, None, None] * kernel[None, :, None] * kernel[None, None, :]
         kernel = kernel / kernel.sum()  # Normalize kernel
 
         # Expand kernel to all input channels
-        kernel = kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+        kernel = kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1) if dim == 2 else kernel.view(1, 1, 3, 3, 3).repeat(channels, 1, 1, 1, 1)   
+
         self.register_buffer("kernel", kernel)
 
     def forward(self, x):
-        # Apply blur filter
-        x = torch.nn.functional.conv2d(
-            x, self.kernel, stride=1, padding=1, groups=x.shape[1]
-        )
-        # Perform downsampling
-        return x[:, :, :: self.stride, :: self.stride]
+        """
+        Args:
+            x (Tensor): Input tensor of shape (N, C, H, W) for 2D or (N, C, D, H, W) for 3D.
+        Returns:
+            Tensor: Downsampled tensor of shape (N, C, H/stride, W/stride) for 2D or (N, C, D/stride, H/stride, W/stride) for 3D.
+
+        """
+         
+        if self.dim == 2:
+            x = F.conv2d(x, self.kernel, stride=1, padding=1, groups=x.shape[1])
+            # Downsample
+            return x[:, :, ::self.stride, ::self.stride]
+        else:
+            x = F.conv3d(x, self.kernel, stride=1, padding=1, groups=x.shape[1])
+            # Downsample all spatial dimensions
+            return x[:, :, ::self.stride, ::self.stride, ::self.stride]
+    
 
 
 class BaseStochasticConvBlock(nn.Module):
@@ -842,12 +857,59 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
 
 class MixtureStochasticConvBlock(BaseStochasticConvBlock):
     """
-    Top layer stochastic block with Gaussian Mixture Model and conditioning.
-    Uses q(y|x) and q(z|x,y) with FiLM modulation.
-    Always conditional, always mixture prior.
+        Stochastic convolutional block with a Gaussian mixture prior and FiLM conditioning.
 
+        This module models a conditional variational distribution with a discrete latent
+        mixture variable y and continuous latent variable z. It predicts q(y|x) and q(z|x,y),
+        samples z, applies FiLM modulation from y, and computes KL divergence to a mixture prior.
 
+        Args
+        ----
+        c_in : int
+            Number of input channels.
+        c_vars : int
+            Number of latent variable channels.
+        c_out : int
+            Number of output channels.
+        conv_mult : int
+            Dimensions for convolutional layers (2D or 3D).
+        kernel : int, optional
+            Convolution kernel size. Default: 3.
+        training_mode : str, optional
+            One of {"supervised", "semisupervised"}. Default: "supervised".
+        n_components : int, optional
+            Number of Gaussian mixture components. Default: 4.
+        seg_head_dim : int, optional
+            Spatial dimension of feature map for q(y|x) head. Default: 2.
 
+        Forward Args
+        ------------
+        p_params : torch.Tensor
+            Prior parameters (mean and logvar) for p(z|y),
+            shape (B, 2 * c_vars * n_components, H, W).
+        q_params : torch.Tensor
+            Input features for inferring q(y|x) and q(z|x,y),
+            shape (B, c_in, H, W).
+        label : torch.Tensor or None
+            Ground-truth class labels, shape (B,).
+        confidence_threshold : float, optional
+            Confidence threshold for pseudo-labeling.
+
+        Returns
+        -------
+        out : torch.Tensor
+            Output feature map after sampling z and convolution,
+            shape (B, c_out, H, W).
+        data : dict
+                {
+                    'z': sampled latent tensor (B, c_vars, H, W),
+                    'mu': mean of q(z|x,y) (B, c_vars, H, W),
+                    'lv': log-variance (B, c_vars, H, W),
+                    'class_probabilities': q(y|x) (B, n_components),
+                    'kl': KL divergence (scalar),
+                    'cross_entropy': cross-entropy loss (scalar),
+                    'pseudo_labels': pseudo-labels (B,)
+                }
     """
 
     def __init__(
@@ -868,13 +930,14 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         self.constant = 200  # Scaling constant for distances
         self.group_size = 8
         self.prior_probs = torch.ones(n_components, device=self.device) / n_components
+        self.conv_mult = conv_mult
 
         # q(y|x) network -> segmentation head
         self.qy_x = nn.Sequential(
             self.conv_type(c_in, c_vars, kernel, padding=self.pad),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(c_vars * (seg_head_dim**2), n_components),
+            nn.Linear(c_vars * (seg_head_dim**self.conv_mult), n_components),
         )
 
         # q(z|x,y) network
@@ -914,6 +977,10 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         # FiLM modulation: condition z on y
         gamma = self.gamma_layer(qy_logits).unsqueeze(-1).unsqueeze(-1)
         beta = self.beta_layer(qy_logits).unsqueeze(-1).unsqueeze(-1)
+        if self.conv_type == nn.Conv3d:
+            gamma = gamma.unsqueeze(-1)
+            beta = beta.unsqueeze(-1)
+        
         q_modulated = gamma * q_params + beta
 
         # Get q(z|x,y)
@@ -1004,7 +1071,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
 
         # Compute distances and logits for pseudo-labeling
         diff = q_mu.unsqueeze(1) - means.unsqueeze(0)
-        dists = (diff * diff).sum(dim=(2, 3, 4))
+        dists = (diff * diff).sum(dim=(2, 3, 4) if self.conv_mult == 2 else (2, 3, 4, 5))
         logits = -dists / self.constant
         logits = logits - logits.max(dim=1, keepdim=True).values
 
@@ -1024,7 +1091,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
     def _compute_kl_mixture(self, q, p_components, label=None, y_pred=None):
         """Compute KL divergence for mixture model."""
         kl_divergences = [
-            kl_divergence(q, p_i).mean(dim=(1, 2, 3)) for p_i in p_components
+            kl_divergence(q, p_i).mean(dim=(1, 2, 3) if self.conv_mult == 2 else (1, 2, 3, 4)) for p_i in p_components
         ]
         kl_divergences = torch.stack(kl_divergences, dim=-1)
 
