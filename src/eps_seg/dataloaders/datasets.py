@@ -19,7 +19,6 @@ class SemisupervisedDataset(Dataset):
         mode="semisupervised",
         n_classes=4,
         ignore_lbl=-1,
-        ratio=0.75,
         indices_dict=None,
         radius=5,
         dim=2,
@@ -35,7 +34,6 @@ class SemisupervisedDataset(Dataset):
         self.n_classes = n_classes
         # Convert back to sorted numpy array if needed
         self.unique_vals = np.array(range(n_classes))
-        self.ratio = ratio
         self.mode = mode
         self.indices_dict = indices_dict or {}
         self.radius = radius
@@ -66,10 +64,14 @@ class SemisupervisedDataset(Dataset):
         self.radius += 1
         self.groups = self._modify_metadata()
 
-    def _is_valid_coord(self, name, z, y, x, H, W):
+    def _is_valid_coord(self, name, z, y, x, Z, H, W):
         valid = (
             self.half <= y < H - self.half - 1 and self.half <= x < W - self.half - 1
         )
+        if self.dim == 3:
+            if self.half <= z < Z - self.half - 1:
+                valid = valid and True
+
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
         return valid and in_cell
 
@@ -82,35 +84,49 @@ class SemisupervisedDataset(Dataset):
         img_vol = self.images[name]
         lbl_vol = self.labels[name]
 
-        def patch_at(y, x):
-            p = img_vol[
-                z,
-                y - self.half : y + self.half + 2,
-                x - self.half : x + self.half + 2,
-            ]
-            return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
+        def patch_at(z, y, x):
+            if self.dim == 2:
+                p = img_vol[
+                    z,
+                    y - self.half : y + self.half + 2,
+                    x - self.half : x + self.half + 2,
+                ]
+                return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
+            else:  # 3D
+                p = img_vol[
+                    z - self.half : z + self.half + 2,
+                    y - self.half : y + self.half + 2,
+                    x - self.half : x + self.half + 2,
+                ]
+                return torch.from_numpy(p)  # [Z, H, W]
 
-        def lbl_at(y, x):
-            p = lbl_vol[
-                z,
-                y - self.half : y + self.half + 2,
-                x - self.half : x + self.half + 2,
-            ]
-            return torch.from_numpy(p).unsqueeze(0)
+        def lbl_at(z, y, x):
+            if self.dim == 2:
+                p = lbl_vol[
+                    z,
+                    y - self.half : y + self.half + 2,
+                    x - self.half : x + self.half + 2,
+                ]
+                return torch.from_numpy(p).unsqueeze(0)
+            else:  # 3D
+                p = lbl_vol[
+                    z - self.half : z + self.half + 2,
+                    y - self.half : y + self.half + 2,
+                    x - self.half : x + self.half + 2,
+                ]
+                return torch.from_numpy(p)
 
         if self.mode == "supervised":
             cy, cx = map(int, g["coords"][0])
-            patch = patch_at(cy, cx).unsqueeze(0)  # [1, 1, H, W]  <-- extra dim
+            patch = patch_at(z, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)  # [1]
-            segment = lbl_at(cy, cx).unsqueeze(0)  # [1, 1, H, W]
+            segment = lbl_at(z, cy, cx).unsqueeze(0)  # [1, Z, H, W]
             return patch, label, segment, torch.tensor(g["coords"][0])
         else:
             coords = torch.tensor([tuple(map(int, xy)) for xy in g["coords"]])
-            patches = torch.stack([patch_at(y, x) for (y, x) in coords])  # [4, 1, H, W]
+            patches = torch.stack([patch_at(z, y, x) for (y, x) in coords])  # [4, Z, H, W]
             labels = torch.tensor([g["labels"][0]] + [-1]*7, dtype=torch.long)  # [4]
-            # labels = torch.tensor([g["labels"][i] for i in range(8)], dtype=torch.long)
-            # labels = torch.tensor(g["labels"], dtype=torch.long)
-            segments = torch.stack([lbl_at(y, x) for (y, x) in coords])  # [4, 1, H, W]
+            segments = torch.stack([lbl_at(z, y, x) for (y, x) in coords])  # [4, Z, H, W]
             return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
@@ -119,25 +135,26 @@ class SemisupervisedDataset(Dataset):
         for name, z_list in self.indices_dict.items():
             img = self.images[name]
             lbl = self.labels[name]
-            _, H, W = img.shape
+            Z, H, W = img.shape
 
-            for z in z_list:
+            for cz in z_list:
                 used_coords = set()
-                stack = lbl[z]
+                stack = lbl[cz]
 
                 for c in range(self.n_classes):
                     for cy, cx in self._sample_coords_for_class(stack, c):
-                        if not self._is_valid_coord(name, z, cy, cx, H, W):
+                        if not self._is_valid_coord(name, cz, cy, cx, Z, H, W):
                             continue
                         if (cy, cx) in used_coords:
                             continue
-
+                        
                         used_coords.add((cy, cx))
                         neighbors = self._sample_neighbors(
                             name=name,
-                            z=z,
+                            cz=cz,
                             cy=cy,
                             cx=cx,
+                            Z=Z,
                             H=H,
                             W=W,
                             used_coords=used_coords,
@@ -150,7 +167,7 @@ class SemisupervisedDataset(Dataset):
                             groups.append(
                                 self._make_group_record(
                                     name=name,
-                                    z=z,
+                                    cz=cz,
                                     cy=cy,
                                     cx=cx,
                                     c=c,
@@ -168,7 +185,7 @@ class SemisupervisedDataset(Dataset):
             name, z = g["name"], int(g["z"])
             img = self.images[name]
             lbl = self.labels[name]
-            _, H, W = img.shape
+            Z, H, W = img.shape
 
             used_coords = set()
             cy, cx = g["coords"][0]
@@ -176,9 +193,10 @@ class SemisupervisedDataset(Dataset):
             used_coords.add((cy, cx))
             neighbors = self._sample_neighbors(
                 name=name,
-                z=z,
+                cz=z,
                 cy=cy,
                 cx=cx,
+                Z=Z,
                 H=H,
                 W=W,
                 used_coords=used_coords,
@@ -227,9 +245,10 @@ class SemisupervisedDataset(Dataset):
     def _sample_neighbors(
         self,
         name: str,
-        z: int,
+        cz: int,
         cy: int,
         cx: int,
+        Z:int,
         H: int,
         W: int,
         used_coords: set,
@@ -257,13 +276,13 @@ class SemisupervisedDataset(Dataset):
                 tries += 1
                 continue
 
-            if self._is_valid_coord(name, z, ny, nx, H, W):
+            if self._is_valid_coord(name, cz, ny, nx, Z, H, W):
                 used_coords.add(coord)
                 neighbors.append(
                     {
                         "y": int(ny),
                         "x": int(nx),
-                        "label": int(lbl[z, ny, nx].item()),
+                        "label": int(lbl[cz, ny, nx].item()),
                     }
                 )
 
@@ -274,7 +293,7 @@ class SemisupervisedDataset(Dataset):
     def _make_group_record(
         self,
         name: str,
-        z: int,
+        cz: int,
         cy: int,
         cx: int,
         c: int,
@@ -283,7 +302,7 @@ class SemisupervisedDataset(Dataset):
         """Create the output dict for one (center + neighbors) group."""
         return {
             "name": name,
-            "z": int(z),
+            "z": int(cz),
             "coords": [(int(cy), int(cx))] + [(n["y"], n["x"]) for n in neighbors],
             "labels": [int(c)] + [n["label"] for n in neighbors],
         }
