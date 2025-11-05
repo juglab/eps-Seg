@@ -42,6 +42,7 @@ class SemisupervisedDataset(Dataset):
         self.rng = random.Random(self.seed)
         self.samples_per_class: Dict[int, int] = {1: 2}
         self.default_samples_per_class: int = 1  # TODO
+        self.dim = dim
         self.groups = self._prepare_metadata()
         self.n_label_per_class = {
             c: len([g for g in self.groups if g["labels"][0] == c])
@@ -51,7 +52,6 @@ class SemisupervisedDataset(Dataset):
             c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c]
             for c in range(self.n_classes)
         }
-        self.dim = dim
 
     def set_mode(self, mode: str):
         """Switch between supervised and semisupervised modes."""
@@ -78,55 +78,39 @@ class SemisupervisedDataset(Dataset):
     def __len__(self):
         return len(self.groups)
 
+    def patch_at(self, img_stack, z, y, x):
+        if self.dim == 2:
+            p = img_stack[
+                z,
+                y - self.half : y + self.half + 2,
+                x - self.half : x + self.half + 2,
+            ]
+            return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
+        else:  # 3D
+            p = img_stack[
+                z - self.half : z + self.half + 2,
+                y - self.half : y + self.half + 2,
+                x - self.half : x + self.half + 2,
+            ]
+            return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
+
     def __getitem__(self, idx):
         g = self.groups[idx]
         name, z = g["name"], int(g["z"])
         img_vol = self.images[name]
         lbl_vol = self.labels[name]
 
-        def patch_at(z, y, x):
-            if self.dim == 2:
-                p = img_vol[
-                    z,
-                    y - self.half : y + self.half + 2,
-                    x - self.half : x + self.half + 2,
-                ]
-                return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
-            else:  # 3D
-                p = img_vol[
-                    z - self.half : z + self.half + 2,
-                    y - self.half : y + self.half + 2,
-                    x - self.half : x + self.half + 2,
-                ]
-                return torch.from_numpy(p)  # [Z, H, W]
-
-        def lbl_at(z, y, x):
-            if self.dim == 2:
-                p = lbl_vol[
-                    z,
-                    y - self.half : y + self.half + 2,
-                    x - self.half : x + self.half + 2,
-                ]
-                return torch.from_numpy(p).unsqueeze(0)
-            else:  # 3D
-                p = lbl_vol[
-                    z - self.half : z + self.half + 2,
-                    y - self.half : y + self.half + 2,
-                    x - self.half : x + self.half + 2,
-                ]
-                return torch.from_numpy(p)
-
         if self.mode == "supervised":
             cy, cx = map(int, g["coords"][0])
-            patch = patch_at(z, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
+            patch = self.patch_at(img_vol, z, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)  # [1]
-            segment = lbl_at(z, cy, cx).unsqueeze(0)  # [1, Z, H, W]
+            segment = self.patch_at(lbl_vol, z, cy, cx).unsqueeze(0)  # [1, Z, H, W]
             return patch, label, segment, torch.tensor(g["coords"][0])
         else:
             coords = torch.tensor([tuple(map(int, xy)) for xy in g["coords"]])
-            patches = torch.stack([patch_at(z, y, x) for (y, x) in coords])  # [4, Z, H, W]
+            patches = torch.stack([self.patch_at(img_vol, z, y, x) for (y, x) in coords])  # [4, 1, Z, H, W]
             labels = torch.tensor([g["labels"][0]] + [-1]*7, dtype=torch.long)  # [4]
-            segments = torch.stack([lbl_at(z, y, x) for (y, x) in coords])  # [4, Z, H, W]
+            segments = torch.stack([self.patch_at(lbl_vol, z, y, x) for (y, x) in coords])  # [4, 1, Z, H, W]
             return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
