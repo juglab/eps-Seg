@@ -268,7 +268,7 @@ class LadderVAE(nn.Module):
                     cl = compute_cl_loss(
                         mus=td_data["mu"],
                         labels=td_data["pseudo_labels"],
-                        nips=True,
+                        nips=self.training_mode == "supervised",
                     )
 
         output = {

@@ -376,14 +376,12 @@ def compute_cl_loss(
     mus,
     labels,
     nips=True,
-    margin_norm=1.2,  # for normalized space (≤ √2)
+    margin_norm=1.4,  # for normalized space 
     margin_raw=5.0,  # for raw per-level features
     w_ms_sup=0.25,  # add a bit of multiscale in supervised
     w_nips_semi=0.2,  # add a bit of reweighted negs in semi
     learnable_thetas=True,
 ):
-    import pdb;
-    pdb.set_trace()
     if nips:
         pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin_raw)
         thetas = get_thetas(neg_terms, learnable=learnable_thetas)
@@ -447,8 +445,8 @@ def adaptive_neg_in_normalized_space(mus, labels, margin=1.2, learnable_thetas=T
         return torch.zeros((), device=device)
 
     y = labels[idxs]
-    D = torch.cat([F.adaptive_avg_pool2d(m, (1,1)).squeeze(-1).squeeze(-1) for m in mus], dim=1)
-    D = F.normalize(D, dim=1)[-1]
+    D = torch.cat([F.adaptive_avg_pool2d(m[idxs], (1,1)).squeeze(-1).squeeze(-1) for m in mus], dim=1)
+    D = F.normalize(D, dim=1)
     dist = torch.cdist(D.unsqueeze(0), D.unsqueeze(0), p=2).squeeze(0)
 
     classes = torch.unique(y).tolist()
