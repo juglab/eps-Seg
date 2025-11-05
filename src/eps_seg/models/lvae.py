@@ -87,9 +87,9 @@ class LVAEModel(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y, z, _ = batch
-        x = x.squeeze(0)
-        y = y.squeeze(0)
-        z = z.squeeze(0)
+        # x = x.squeeze(0)
+        # y = y.squeeze(0)
+        # z = z.squeeze(0)
         # FIXME: What threshold to use during validation?
         outputs = self.forward(x, 
                              y, 
@@ -112,11 +112,11 @@ class LVAEModel(L.LightningModule):
         )
 
         self.log("val/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/CL", contrastive_loss.item() * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
