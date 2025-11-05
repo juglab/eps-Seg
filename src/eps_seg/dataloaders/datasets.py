@@ -27,7 +27,7 @@ class SemisupervisedDataset(Dataset):
     ):
         self.patch_size = patch_size
         self.label_size = label_size
-        self.half = patch_size // 2 - self.label_size
+        self.half = self.patch_size // 2 - self.label_size
         self.images = images
         self.labels = labels
         self.ignore_lbl = ignore_lbl

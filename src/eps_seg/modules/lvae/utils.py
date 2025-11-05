@@ -376,25 +376,34 @@ def compute_cl_loss(
     mus,
     labels,
     nips=True,
+    margin_norm=1.2,  # for normalized space (≤ √2)
+    margin_raw=5.0,  # for raw per-level features
+    w_ms_sup=0.25,  # add a bit of multiscale in supervised
+    w_nips_semi=0.2,  # add a bit of reweighted negs in semi
+    learnable_thetas=True,
 ):
-    if not nips:
-        return multiscale_cl(mus, labels)
+    import pdb;
+    pdb.set_trace()
+    if nips:
+        pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin_raw)
+        thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+        weighted_neg = compute_weighted_neg(neg_terms, thetas)
+        nips_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
+        ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
+        return nips_loss + w_ms_sup * ms_loss
     else:
-        lambda_contrastive = 0.5
-        pos_pair_loss, neg_pair_loss_terms = pos_neg_loss(mus, labels, margin=5.0)
-        neg_thetas = get_thetas(neg_pair_loss_terms)
-        weighted_neg = compute_weighted_neg(neg_pair_loss_terms, neg_thetas)
-        contrastive_loss = (
-            lambda_contrastive * pos_pair_loss + (1 - lambda_contrastive) * weighted_neg
+        ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
+        hard_neg = adaptive_neg_in_normalized_space(
+            mus, labels, margin=margin_norm, learnable_thetas=learnable_thetas
         )
-        return contrastive_loss
+        return ms_loss + w_nips_semi * hard_neg
 
 
 def multiscale_cl(mus, labels, margin=1.5):
     B = len(mus[0])
     device = mus[0].device
     if labels is not None:
-        labels = labels[2].view(-1)
+        labels = labels[-1].view(-1)
     same = labels.unsqueeze(0).eq(labels.unsqueeze(1))  # [B,B]
     eye = torch.eye(B, dtype=torch.bool, device=device)
     pos_mask = same & ~eye  # same class, not self
@@ -429,6 +438,42 @@ def multiscale_cl(mus, labels, margin=1.5):
     return pos_loss + neg_loss
 
 
+def adaptive_neg_in_normalized_space(mus, labels, margin=1.2, learnable_thetas=True):
+    device = mus[0].device
+    labels = labels[-1].view(-1)
+    valid = (labels != -1)
+    idxs = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    if idxs.numel() < 2:
+        return torch.zeros((), device=device)
+
+    y = labels[idxs]
+    D = torch.cat([F.adaptive_avg_pool2d(m, (1,1)).squeeze(-1).squeeze(-1) for m in mus], dim=1)
+    D = F.normalize(D, dim=1)[-1]
+    dist = torch.cdist(D.unsqueeze(0), D.unsqueeze(0), p=2).squeeze(0)
+
+    classes = torch.unique(y).tolist()
+    classes.sort()
+    tri = torch.triu(torch.ones_like(dist, dtype=torch.bool), 1)
+
+    neg_terms = {}
+    for a in range(len(classes)-1):
+        for b in range(a+1, len(classes)):
+            ca, cb = classes[a], classes[b]
+            mi = (y == ca).unsqueeze(1)
+            mj = (y == cb).unsqueeze(0)
+            mask = ((mi & mj) | (mj & mi)) & tri
+            if mask.any():
+                d = dist[mask]
+                neg_terms[f"{ca}-{cb}"] = F.relu(margin - d).pow(2).mean()
+            else:
+                neg_terms[f"{ca}-{cb}"] = torch.zeros((), device=device)
+
+    if not neg_terms:
+        return torch.zeros((), device=device)
+
+    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+    return compute_weighted_neg(neg_terms, thetas)
+
 def pos_neg_loss(mus, labels, margin=5.0):
     device = mus[0].device
     labeled_mask = labels[-1] != -1
@@ -448,7 +493,6 @@ def pos_neg_loss(mus, labels, margin=5.0):
     pos_mask.fill_diagonal_(False)
     pos_count = pos_mask.sum().clamp(min=1)  # avoid div-by-zero later
 
-    # Helper to compute pairwise distances for a given level on the labeled subset
     def pairwise_dist(x):
         # x: [n, ...] -> flatten features per sample
         x = x.view(n, -1).unsqueeze(0)  # [1, n, d]
@@ -485,7 +529,6 @@ def pos_neg_loss(mus, labels, margin=5.0):
 
             neg_pair_loss_terms[f"{ca}-{cb}"] = neg_loss
 
-    # 5) Other levels: accumulate with your original weights
     for level_idx, mu in enumerate(mus[:-1]):
         x = mu[labeled_indices]
         dist = pairwise_dist(x)
@@ -550,25 +593,32 @@ def custom_distance_loss_masked(distances, mask, margin=5.0, epsilon=1e-6, alpha
     return loss.sum()
 
 
-def get_thetas(neg_pair_loss_terms):
-    losses = torch.tensor(list(neg_pair_loss_terms.values()))
-    if torch.all(losses == 0):
-        normalized_losses = torch.ones_like(losses) / len(losses)  # Distribute uniformly
+def get_thetas(neg_pair_loss_terms, learnable=True):
+    keys = list(neg_pair_loss_terms.keys())
+    vals = torch.stack([neg_pair_loss_terms[k] for k in keys])
+    if not learnable:
+        vals = vals.detach()
+    if (vals != 0).any():
+        w = F.softmax(vals, dim=0)
     else:
-        normalized_losses = F.softmax(losses, dim=0)
-    thetas = {
-        key: normalized_losses[i].item()
-        for i, key in enumerate(neg_pair_loss_terms.keys())
-    }
-    return thetas
+        w = torch.full_like(vals, 1.0 / max(len(vals), 1))
+    return {k: w[i].item() if not learnable else w[i] for i, k in enumerate(keys)}
 
 
 def compute_weighted_neg(neg_pair_loss_terms, neg_thetas):
-    weighted_neg = 0
+    device = (
+        next(iter(neg_pair_loss_terms.values())).device
+        if len(neg_pair_loss_terms)
+        else "cpu"
+    )
+    weighted_neg = torch.zeros((), device=device)
     for pair, loss in neg_pair_loss_terms.items():
-        weight = neg_thetas.get(pair, 1.0)
-        if math.isnan(weight) or weight == 0:
-            weight = 1e-6
-        weighted_neg += weight * loss
+        weight = neg_thetas[pair]
+        if isinstance(weight, float):
+            if math.isnan(weight) or weight == 0:
+                weight = 1e-6
+            weighted_neg = weighted_neg + weight * loss
+        else:
+            weighted_neg = weighted_neg + weight * loss
 
     return weighted_neg

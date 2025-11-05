@@ -50,7 +50,6 @@ class BetaSegTrainDataModule(L.LightningDataModule):
             mode=self.cfg.mode,
             n_classes=self.cfg.n_classes,
             ignore_lbl=-1,
-            ratio=self.cfg.initial_labeled_ratio,
             indices_dict=self.train_idx,
             radius=self.train_cfg.initial_radius,
             dim=self.cfg.dim,

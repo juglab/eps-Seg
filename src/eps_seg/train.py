@@ -142,7 +142,8 @@ def train(exp_config: ExperimentConfig):
 def main():
     # Allows to be run as: python -m eps_seg.train --exp_config path/to/exp_config.yaml --env_file path/to/.env
     parser = argparse.ArgumentParser(description="Train EPS-Seg Model")
-    parser.add_argument("--exp_config", type=str, required=True, help="Path to experiment configuration YAML file")
+    # parser.add_argument("--exp_config", type=str, required=True, help="Path to experiment configuration YAML file")
+    parser.add_argument("--exp_config", type=str, default="/group/jug/edoardo/projects/eps-Seg/experiments/dev_experiment/dev_experiment.yaml", help="Path to experiment configuration YAML file")
     parser.add_argument("--env_file", type=str, default=".env", help="Path to .env file with environment variables")
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
