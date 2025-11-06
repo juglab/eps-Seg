@@ -376,25 +376,18 @@ def compute_cl_loss(
     mus,
     labels,
     nips=True,
-    margin_norm=1.4,  # for normalized space 
-    margin_raw=5.0,  # for raw per-level features
+    margin_norm=1.5,  # for normalized space 
+    margin_raw=20.0,  # for raw per-level features
     w_ms_sup=0.25,  # add a bit of multiscale in supervised
-    w_nips_semi=0.2,  # add a bit of reweighted negs in semi
-    learnable_thetas=True,
+    learnable_thetas=False,
 ):
-    if nips:
-        pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin_raw)
-        thetas = get_thetas(neg_terms, learnable=learnable_thetas)
-        weighted_neg = compute_weighted_neg(neg_terms, thetas)
-        nips_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
-        ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
-        return nips_loss + w_ms_sup * ms_loss
-    else:
-        ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
-        hard_neg = adaptive_neg_in_normalized_space(
-            mus, labels, margin=margin_norm, learnable_thetas=learnable_thetas
-        )
-        return ms_loss + w_nips_semi * hard_neg
+    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin_raw)
+    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+    weighted_neg = compute_weighted_neg(neg_terms, thetas)
+    nips_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
+    ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
+    return nips_loss + w_ms_sup * ms_loss
+
 
 
 def multiscale_cl(mus, labels, margin=1.5):

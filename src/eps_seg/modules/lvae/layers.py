@@ -990,34 +990,34 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         z = q.rsample()
 
         # Initialize outputs
-        y = None
+        q_probs = None
         cross_entropy = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         pseudo_label = label
 
         # Handle different training scenarios
         if label is None:
             # Inference mode: use softmax for y
-            y = F.softmax(qy_logits, dim=1)
+            q_probs = F.softmax(qy_logits, dim=1)
             # TODO: check if this is the right way to handle KL in inference
             # Class is computed outside
             kl = 0.0
         elif self.training_mode == "semisupervised":
             # Semi-supervised learning: use pseudo-labeling for unlabeled data
-            y, pseudo_label, cross_entropy = self._semisupervised_forward(
+            q_probs, pseudo_label, cross_entropy = self._semisupervised_forward(
                 label, q_mu, confidence_threshold
             )
             kl = self._compute_kl_mixture(q, p_components, label=pseudo_label)
         elif self.training_mode == "supervised":
             # Supervised learning: use Gumbel-Softmax
-            y = F.gumbel_softmax(qy_logits, tau=self.temperature, hard=False)
+            q_probs = F.softmax(qy_logits, dim=-1)
             self._update_temperature()
             kl = self._compute_kl_mixture(q, p_components, label=label)
-            cross_entropy = F.cross_entropy(qy_logits, label.long(), ignore_index=-1)
+            cross_entropy = F.cross_entropy(qy_logits, label.long())
         else:
             raise ValueError(f"Unknown training mode: {self.training_mode}")
 
         # Add regularization terms
-        js_div = self._compute_js_div(y) if y is not None else 0
+        js_div = self._compute_js_div(q_probs) if q_probs is not None else 0
         kl = kl + js_div
 
         out = self.conv_out(z)
@@ -1033,7 +1033,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
             "kl": kl,
             "mu": q_mu,
             "lv": q_lv,
-            "class_probabilities": y,
+            "class_probabilities": q_probs,
             "cross_entropy": cross_entropy,
             "pseudo_labels": pseudo_label,
         }
@@ -1075,20 +1075,18 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         logits = -dists / self.constant
         logits = logits - logits.max(dim=1, keepdim=True).values
 
-        y = F.gumbel_softmax(logits, tau=self.temperature, hard=False)
-        self._update_temperature()
+        y = F.softmax(logits)
 
         # Generate pseudo labels with confidence thresholding
         conf, pseudo = y.max(dim=1)
-        pseudo[anchors] = label[anchors].long()
         accept = conf > confidence_threshold
         pseudo[~accept] = -1
-
+        pseudo[anchors] = label[anchors].long()
         cross_entropy = F.cross_entropy(logits, pseudo, ignore_index=-1)
 
         return y, pseudo, cross_entropy
 
-    def _compute_kl_mixture(self, q, p_components, label=None, y_pred=None):
+    def _compute_kl_mixture(self, q, p_components, label=None):
         """Compute KL divergence for mixture model."""
         kl_divergences = [
             kl_divergence(q, p_i).mean(dim=(1, 2, 3) if self.conv_mult == 2 else (1, 2, 3, 4)) for p_i in p_components
@@ -1101,10 +1099,8 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
                 kl = kl_divergences[valid_mask, label[valid_mask].long()].mean()
             else:
                 kl = torch.tensor(0.0, device=self.device)
-        elif y_pred is not None:
-            kl = kl_divergences[range(self.batch_size), y_pred].mean()
         else:
-            kl = kl_divergences.mean()
+            kl = torch.tensor(0.0, device=self.device)
 
         return kl
 
