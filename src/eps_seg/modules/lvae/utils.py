@@ -377,7 +377,7 @@ def compute_cl_loss(
     labels,
     nips=True,
     margin_norm=1.5,  # for normalized space 
-    margin_raw=20.0,  # for raw per-level features
+    margin_raw=50.0,  # for raw per-level features
     w_ms_sup=0.25,  # add a bit of multiscale in supervised
     learnable_thetas=False,
 ):
