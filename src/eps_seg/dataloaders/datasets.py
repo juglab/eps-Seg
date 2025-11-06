@@ -40,8 +40,8 @@ class SemisupervisedDataset(Dataset):
         self.n_neighbors = n_neighbors
         self.seed = seed
         self.rng = random.Random(self.seed)
-        self.samples_per_class: Dict[int, int] = {1: 2}
-        self.default_samples_per_class: int = 1  # TODO
+        self.samples_per_class: Dict[int, int] = {1: 2} # for class 1 (nucleus), we take 2 to compensate for rarity along z
+        self.default_samples_per_class: int = 1  # We take 1 sample per class per slice
         self.dim = dim
         self.groups = self._prepare_metadata()
         self.n_label_per_class = {
