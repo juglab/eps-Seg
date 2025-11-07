@@ -4,7 +4,7 @@ from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
 from typing import Literal
 import torch 
-from torchmetrics.segmentation import DiceScore
+from torchmetrics.classification import F1Score
 
 
 class LVAEModel(L.LightningModule):
@@ -17,17 +17,7 @@ class LVAEModel(L.LightningModule):
 
         # Placeholders for data statistics
         self.model.register_buffer("data_mean", torch.tensor(0.0))
-        self.model.register_buffer("data_std", torch.tensor(0.0))
-
-        # Metrics Accumulators
-        self.train_dice_score = DiceScore(num_classes=model_cfg.n_components,
-                                            average=None, 
-                                            aggregation_level="global",
-                                            input_format="index")
-        self.validation_dice_score = DiceScore(num_classes=model_cfg.n_components, 
-                                               average=None, 
-                                               aggregation_level="global",
-                                               input_format="index")
+        self.model.register_buffer("data_std", torch.tensor(0.0))        
 
         self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.5
         self.current_radius = self.train_cfg.initial_radius if self.train_cfg else 5
@@ -35,6 +25,11 @@ class LVAEModel(L.LightningModule):
         self.current_radius_patience = 0
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
                                    "train_config": train_cfg.model_dump() if train_cfg else None})
+        
+        # DiceScore implemented as F1Score
+        # Index -1 is passed during selfsupervised mode for inpatinting loss on unlabeled regions
+        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1) 
+        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1)
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
@@ -83,11 +78,6 @@ class LVAEModel(L.LightningModule):
             cross_entropy_loss
         )
 
-        # Compute predictions for dice loss
-        preds = torch.argmax(outputs["class_probabilities"], dim=-1).long()
-        gts = y.to(torch.int16).long()
-        self.train_dice_score.update(preds.unsqueeze(1), gts.unsqueeze(1))
-
         self.log("train/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("train/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
@@ -98,6 +88,10 @@ class LVAEModel(L.LightningModule):
         self.log("train/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
         
+        # Accumulate metrics for dice loss (it is logged on epoch end)
+        preds = torch.argmax(outputs["class_probabilities"], dim=-1)
+        self.train_dice_score.update(preds, y)
+
         return outputs
 
     def validation_step(self, batch, batch_idx):
@@ -123,11 +117,6 @@ class LVAEModel(L.LightningModule):
             cross_entropy_loss
         )
 
-        # Compute predictions for dice loss
-        preds = torch.argmax(outputs["class_probabilities"], dim=-1).long()
-        gts = y.to(torch.int16).long()
-        self.validation_dice_score.update(preds.unsqueeze(1), gts.unsqueeze(1))
-
         # Log losses
         self.log("val/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
@@ -138,6 +127,11 @@ class LVAEModel(L.LightningModule):
         self.log("val/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         self.log("val/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
+
+        # Accumulate metrics for dice loss (it is logged on epoch end)
+        preds = torch.argmax(outputs["class_probabilities"], dim=-1)
+        self.validation_dice_score.update(preds, y)
+
         return outputs
 
     def on_train_epoch_end(self):
