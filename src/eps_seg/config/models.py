@@ -44,6 +44,6 @@ class LVAEConfig(BaseEPSModelConfig):
     mask_size: int = Field(default=1, description="Size of the mask used in the model")
     # Should be part of training config
     use_contrastive_learning: bool = Field(default=True, description="Whether to use contrastive loss during training.")
-    margin: float = Field(default=1.5, description="Margin value for contrastive loss.")
-    nips: bool = Field(default=False, description="Whether to use NeurIPS-paper contrastive learning.")
+    margin: float = Field(default=20.0, description="Margin value for contrastive loss.")
+    learnable_thetas: bool = Field(default=True, description="Whether to use NeurIPS-paper contrastive learning.")
     

@@ -375,95 +375,14 @@ def get_normalized_tensor(img, model, device):
 def compute_cl_loss(
     mus,
     labels,
-    nips=True,
-    margin_norm=1.5,  # for normalized space 
-    margin_raw=50.0,  # for raw per-level features
-    w_ms_sup=0.25,  # add a bit of multiscale in supervised
-    learnable_thetas=False,
+    margin=50.0,  # for raw per-level features
+    learnable_thetas=True,
 ):
-    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin_raw)
+    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin)
     thetas = get_thetas(neg_terms, learnable=learnable_thetas)
     weighted_neg = compute_weighted_neg(neg_terms, thetas)
-    nips_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
-    ms_loss = multiscale_cl(mus, labels, margin=margin_norm)
-    return nips_loss + w_ms_sup * ms_loss
-
-
-
-def multiscale_cl(mus, labels, margin=1.5):
-    B = len(mus[0])
-    device = mus[0].device
-    if labels is not None:
-        labels = labels[-1].view(-1)
-    same = labels.unsqueeze(0).eq(labels.unsqueeze(1))  # [B,B]
-    eye = torch.eye(B, dtype=torch.bool, device=device)
-    pos_mask = same & ~eye  # same class, not self
-    neg_mask = ~same
-    tri = torch.triu(torch.ones(B, B, dtype=torch.bool, device=device), diagonal=1)
-    pos_mask = pos_mask & tri
-    neg_mask = neg_mask & tri
-
-    valid = labels != -1
-    valid_mask = valid.unsqueeze(0) & valid.unsqueeze(1)  # both labels must be valid
-    pos_mask = pos_mask & valid_mask
-    neg_mask = neg_mask & valid_mask
-
-    descriptors = torch.cat(
-        [
-            F.adaptive_avg_pool2d(mus[i], (1, 1)).squeeze(-1).squeeze(-1)
-            for i in range(len(mus))
-        ],
-        dim=1,
-    )
-    descriptors = F.normalize(descriptors, dim=1)
-    dist = torch.cdist(descriptors, descriptors, p=2)
-    dist = torch.clamp(dist, min=0, max=1e6)
-    pos_d = dist[pos_mask]
-    neg_d = dist[neg_mask]
-    pos_loss = (pos_d**2).mean() if pos_d.numel() > 0 else dist.new_tensor(0.0)
-    neg_loss = (
-        (F.relu(margin - neg_d) ** 2).mean()
-        if neg_d.numel() > 0
-        else dist.new_tensor(0.0)
-    )
-    return pos_loss + neg_loss
-
-
-def adaptive_neg_in_normalized_space(mus, labels, margin=1.2, learnable_thetas=True):
-    device = mus[0].device
-    labels = labels[-1].view(-1)
-    valid = (labels != -1)
-    idxs = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    if idxs.numel() < 2:
-        return torch.zeros((), device=device)
-
-    y = labels[idxs]
-    D = torch.cat([F.adaptive_avg_pool2d(m[idxs], (1,1)).squeeze(-1).squeeze(-1) for m in mus], dim=1)
-    D = F.normalize(D, dim=1)
-    dist = torch.cdist(D.unsqueeze(0), D.unsqueeze(0), p=2).squeeze(0)
-
-    classes = torch.unique(y).tolist()
-    classes.sort()
-    tri = torch.triu(torch.ones_like(dist, dtype=torch.bool), 1)
-
-    neg_terms = {}
-    for a in range(len(classes)-1):
-        for b in range(a+1, len(classes)):
-            ca, cb = classes[a], classes[b]
-            mi = (y == ca).unsqueeze(1)
-            mj = (y == cb).unsqueeze(0)
-            mask = ((mi & mj) | (mj & mi)) & tri
-            if mask.any():
-                d = dist[mask]
-                neg_terms[f"{ca}-{cb}"] = F.relu(margin - d).pow(2).mean()
-            else:
-                neg_terms[f"{ca}-{cb}"] = torch.zeros((), device=device)
-
-    if not neg_terms:
-        return torch.zeros((), device=device)
-
-    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
-    return compute_weighted_neg(neg_terms, thetas)
+    cl_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
+    return cl_loss
 
 def pos_neg_loss(mus, labels, margin=5.0):
     device = mus[0].device
