@@ -69,8 +69,7 @@ class SemisupervisedDataset(Dataset):
             self.half <= y < H - self.half - 1 and self.half <= x < W - self.half - 1
         )
         if self.dim == 3:
-            if self.half <= z < Z - self.half - 1:
-                valid = valid and True
+            valid = valid and (self.half <= z < Z - self.half - 1)
 
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
         return valid and in_cell
