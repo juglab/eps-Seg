@@ -192,7 +192,7 @@ class SemisupervisedDataset(Dataset):
 
                 modified_group = self._make_group_record(
                     name=name,
-                    z=z,
+                    cz=z,
                     cy=cy,
                     cx=cx,
                     c=g["labels"][0],
