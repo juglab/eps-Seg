@@ -53,6 +53,7 @@ class BetaSegTrainDataModule(L.LightningDataModule):
             indices_dict=self.train_idx,
             radius=self.train_cfg.initial_radius,
             dim=self.cfg.dim,
+            samples_per_class=self.cfg.samples_per_class_training,
         )
 
         self.val_dataset = SemisupervisedDataset(
@@ -65,6 +66,7 @@ class BetaSegTrainDataModule(L.LightningDataModule):
             ignore_lbl=-1,
             indices_dict=self.val_idx,
             dim=self.cfg.dim,
+            samples_per_class=self.cfg.samples_per_class_validation,
         )
 
     def get_data_statistics(self) -> Tuple[float, float]:

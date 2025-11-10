@@ -24,6 +24,7 @@ class SemisupervisedDataset(Dataset):
         dim=2,
         seed = 42,
         n_neighbors=7,
+        samples_per_class: Dict[int, int] = {1: 2},
     ):
         self.patch_size = patch_size
         self.label_size = label_size
@@ -40,7 +41,7 @@ class SemisupervisedDataset(Dataset):
         self.n_neighbors = n_neighbors
         self.seed = seed
         self.rng = random.Random(self.seed)
-        self.samples_per_class: Dict[int, int] = {1: 2} # for class 1 (nucleus), we take 2 to compensate for rarity along z
+        self.samples_per_class = samples_per_class # for class 1 (nucleus), we take 2 to compensate for rarity along z
         self.default_samples_per_class: int = 1  # We take 1 sample per class per slice
         self.dim = dim
         self.groups = self._prepare_metadata()
@@ -308,7 +309,8 @@ class PredictionDataset(Dataset):
     image: (Z,H,W)  (or (C,H,W) if you adapt for multichannel)
     label: (Z,H,W)
     """
-    def __init__(self, image, label, z, patch_size=64):
+    def __init__(self, image, label, z, patch_size=64, dim=2):
+        self.dim = dim
         self.image = image
         self.label = label
         self.z = int(z)
@@ -336,9 +338,15 @@ class PredictionDataset(Dataset):
 
     def __getitem__(self, idx):
         y, x = self.centers[idx]
+        if self.dim == 3:
+            z0, z1 = self.z - self.half, self.z + self.half
+        else:
+            z0, z1 = self.z, self.z + 1
         y0, y1 = y - self.half, y + self.half
         x0, x1 = x - self.half, x + self.half
-        patch = self.image[self.z, y0:y1, x0:x1]              # (64,64)
-        patch = torch.from_numpy(patch).float().unsqueeze(0)  # (1,64,64)
+        patch = self.image[z0:z1, y0:y1, x0:x1]             
+        patch = torch.from_numpy(patch).float()
+        if self.dim == 3:
+            patch = patch.unsqueeze(0) 
         center_label = int(self.label[self.z, y, x])
         return {"patch": patch, "z": self.z, "y": int(y), "x": int(x), "center_label": center_label}

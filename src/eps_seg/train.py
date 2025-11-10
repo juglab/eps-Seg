@@ -69,6 +69,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             gradient_clip_val=train_config.max_grad_norm, 
             log_every_n_steps=train_config.log_every_n_steps,
             deterministic=train_config.deterministic,
+            # fast_dev_run=True,
             )
 
         model.update_mode("supervised")
@@ -124,13 +125,13 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
                     ),
                 LearningRateMonitor(logging_interval='step'),
                 ThresholdSchedulerCallback(),
-                RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience,
-                                        best_ckpt_path=semisupervised_best_ckpt_path),
+                # RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
                 ],
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
         deterministic=train_config.deterministic,
+        # fast_dev_run=True,
         )
 
     # Initialize model from best supervised checkpoint

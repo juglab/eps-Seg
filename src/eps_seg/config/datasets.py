@@ -31,8 +31,8 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     patch_size: int = Field(64, description="Size of the patches to extract from the images")
     n_classes: int = Field(4, description="Number of segmentation classes in the dataset")
     mode: Literal["supervised", "semisupervised"] = Field("supervised", description="Dataset mode: supervised or semisupervised")    
-
-
+    samples_per_class_validation: Optional[Dict[int, int]] = Field({1: 2}, description="Number of samples per class for validation dataset. If None, defaults to 1 per class.")
+    samples_per_class_training: Optional[Dict[int, int]] = Field({1: 2}, description="Number of samples per class for training dataset. If None, defaults to unlimited.")
     @model_validator(mode="after")
     def check_dirs_not_equal(self) -> "BetaSegDatasetConfig":
         """Ensure data_dir and cache_dir are not the same resolved path."""
