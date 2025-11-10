@@ -1052,14 +1052,24 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         labels_anchors = label[anchors]
 
         # Compute class means from labeled anchor samples
-        sums = torch.zeros(
-            self.n_components,
-            q_mu.size(1),
-            q_mu.size(2),
-            q_mu.size(3),
-            device=self.device,
-        )
-        counts = torch.zeros(self.n_components, 1, 1, 1, device=self.device)
+        if self.conv_mult == 2:
+            sums = torch.zeros(
+                self.n_components,
+                q_mu.size(-3),
+                q_mu.size(-2),
+                q_mu.size(-1),
+                device=self.device,
+            )
+        else:
+            sums = torch.zeros(
+                self.n_components,
+                q_mu.size(-4),
+                q_mu.size(-3),
+                q_mu.size(-2),
+                q_mu.size(-1),
+                device=self.device,
+            )
+        counts = torch.zeros(self.n_components, 1, 1, 1, device=self.device) if self.conv_mult == 2 else torch.zeros(self.n_components, 1, 1, 1, 1, device=self.device)
 
         for c in range(self.n_components):
             mask = labels_anchors == c
