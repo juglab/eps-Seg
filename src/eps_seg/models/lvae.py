@@ -148,11 +148,11 @@ class LVAEModel(L.LightningModule):
         self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True)
         self.validation_dice_score.reset()
 
-    def predict_step(self, batch, batch_idx, dataloader_idx, normalize=True):
-        x, y = batch
+    def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=False):
+        x = batch["patch"]
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
-        return self.forward(x, y=None, validation_mode=False)
+        return self.forward(x, y=None, validation_mode=False), batch
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),

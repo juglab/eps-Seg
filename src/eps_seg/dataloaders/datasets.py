@@ -313,10 +313,16 @@ class PredictionDataset(Dataset):
         image: (C,Z,H,W) or (Z,1,H,W)
 
     """
-    def __init__(self, image, label, z=None, patch_size=64, dim=2):
+    def __init__(self, image, label, z=None, patch_size=64, dim=2, normalize_stats=None):
         self.dim = dim
         self.image = image
         self.label = label
+        
+        if normalize_stats is not None:
+            mu, std = normalize_stats
+            print(f"Normalizing data using mean {mu} and std {std}...")
+            self.image = (self.image - mu) / std
+        
         self.z = int(z) if z is not None else None
         self.ps = int(patch_size)
         assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
