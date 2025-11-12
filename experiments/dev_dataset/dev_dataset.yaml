@@ -1,3 +1,0 @@
-project_name: "eps-seg-plus"
-dataset_cfg_path: "/group/jug/edoardo/projects/eps-Seg/experiments/common_configs/betaseg3d.yaml"
-train_cfg_path: "/group/jug/edoardo/projects/eps-Seg/experiments/common_configs/train_testrun.yaml"

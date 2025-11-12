@@ -19,7 +19,7 @@ class TrainConfig(BaseEPSConfig):
     weight_decay: float = Field(default=0.0, description="Weight decay for optimizer")
     max_epochs: int = Field(default=1000, description="Maximum number of training epochs")
     early_stopping_patience: int = Field(default=50, description="Patience for early stopping")
-    batch_size: int = Field(default=1024, description="Batch size for training")
+    batch_size: int = Field(default=128, description="Batch size for training")
     amp: bool = Field(default=True, description="Use mixed precision training")
     gradient_scale: int = Field(default=256, description="Gradient scaling factor")
     max_grad_norm: Optional[float] = Field(default=1.0, description="Maximum gradient norm")
@@ -33,7 +33,7 @@ class TrainConfig(BaseEPSConfig):
     threshold_increment: float = Field(default=0.005, description="Step size for confidence threshold increase")
     initial_radius: int = Field(default=5, description="Initial radius for training in semisupervised mode")
     max_radius: int = Field(default=10, description="Maximum radius for training in semisupervised mode")
-    radius_increment_patience: int = Field(default=10, description="Number of epochs without improvement before increasing radius in semisupervised mode")
+    radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
 
 
 class ExperimentConfig(BaseEPSConfig):

@@ -28,7 +28,7 @@ class SemisupervisedDataset(Dataset):
     ):
         self.patch_size = patch_size
         self.label_size = label_size
-        self.half = self.patch_size // 2 - self.label_size
+        self.offset = self.patch_size // 2 - self.label_size
         self.images = images
         self.labels = labels
         self.ignore_lbl = ignore_lbl
@@ -67,10 +67,10 @@ class SemisupervisedDataset(Dataset):
 
     def _is_valid_coord(self, name, z, y, x, Z, H, W):
         valid = (
-            self.half <= y < H - self.half - 1 and self.half <= x < W - self.half - 1
+            self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         )
         if self.dim == 3:
-            valid = valid and (self.half <= z < Z - self.half - 1)
+            valid = valid and (self.offset <= z < Z - self.offset - 1)
 
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
         return valid and in_cell
@@ -82,15 +82,15 @@ class SemisupervisedDataset(Dataset):
         if self.dim == 2:
             p = img_stack[
                 z,
-                y - self.half : y + self.half + 2,
-                x - self.half : x + self.half + 2,
+                y - self.offset : y + self.offset + 2,
+                x - self.offset : x + self.offset + 2,
             ]
             return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
         else:  # 3D
             p = img_stack[
-                z - self.half : z + self.half + 2,
-                y - self.half : y + self.half + 2,
-                x - self.half : x + self.half + 2,
+                z - self.offset : z + self.offset + 2,
+                y - self.offset : y + self.offset + 2,
+                x - self.offset : x + self.offset + 2,
             ]
             return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
 
@@ -121,18 +121,18 @@ class SemisupervisedDataset(Dataset):
             lbl = self.labels[name]
             Z, H, W = img.shape
 
-            for cz in z_list:
-                used_coords = set()
+            used_coords = set()
+            for cz in z_list:   
                 stack = lbl[cz]
 
                 for c in range(self.n_classes):
                     for cy, cx in self._sample_coords_for_class(stack, c):
                         if not self._is_valid_coord(name, cz, cy, cx, Z, H, W):
                             continue
-                        if (cy, cx) in used_coords:
+                        if (cz, cy, cx) in used_coords:
                             continue
                         
-                        used_coords.add((cy, cx))
+                        used_coords.add((int(cz), cy, cx))
                         neighbors = self._sample_neighbors(
                             name=name,
                             cz=cz,
@@ -172,9 +172,9 @@ class SemisupervisedDataset(Dataset):
             Z, H, W = img.shape
 
             used_coords = set()
-            cy, cx = g["coords"][0]
+            _, cy, cx = g["coords"][0]
 
-            used_coords.add((cy, cx))
+            used_coords.add((int(z), cy, cx))
             neighbors = self._sample_neighbors(
                 name=name,
                 cz=z,
@@ -245,28 +245,30 @@ class SemisupervisedDataset(Dataset):
         tries = 0
 
         while len(neighbors) < k and tries < max_tries:
+            dz = self.rng.randint(-self.radius, self.radius) if self.dim ==3 else 0
             dy = self.rng.randint(-self.radius, self.radius)
             dx = self.rng.randint(-self.radius, self.radius)
 
             # reject outside disk or center itself
-            if dx * dx + dy * dy > self.radius * self.radius or (dx == 0 and dy == 0):
+            if dx * dx + dy * dy + dz * dz > self.radius * self.radius or (dx == 0 and dy == 0 and (dz == 0 if self.dim==3 else False)):
                 tries += 1
                 continue
 
-            ny, nx = cy + dy, cx + dx
-            coord = (ny, nx)
-
+            nz, ny, nx = cz + dz, cy + dy, cx + dx
+            coord = (nz, ny, nx)
+            
             if coord in used_coords:
                 tries += 1
                 continue
 
-            if self._is_valid_coord(name, cz, ny, nx, Z, H, W):
+            if self._is_valid_coord(name, nz, ny, nx, Z, H, W):
                 used_coords.add(coord)
                 neighbors.append(
                     {
+                        "z": int(nz),
                         "y": int(ny),
                         "x": int(nx),
-                        "label": int(lbl[cz, ny, nx].item()),
+                        "label": int(lbl[nz, ny, nx].item()),
                     }
                 )
 
@@ -287,7 +289,7 @@ class SemisupervisedDataset(Dataset):
         return {
             "name": name,
             "z": int(cz),
-            "coords": [(int(cy), int(cx))] + [(n["y"], n["x"]) for n in neighbors],
+            "coords": [(int(cz), int(cy), int(cx))] + [(n["z"], n["y"], n["x"]) for n in neighbors],
             "labels": [int(c)] + [n["label"] for n in neighbors],
         }
 
