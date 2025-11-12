@@ -96,6 +96,16 @@ class ExperimentConfig(BaseEPSConfig):
         return self.experiment_root / "checkpoints"
     
     @property
+    def outputs_dir(self) -> Path:
+        """Return the directory path for saving outputs."""
+        return self.experiment_root / "outputs"
+    
+    @property
+    def results_dir(self) -> Path:
+        """Return the directory path for saving results."""
+        return self.experiment_root / "results"
+
+    @property
     def logs_dir(self) -> Path:
         """Return the directory path for saving logs."""
         return self.experiment_root / "logs"

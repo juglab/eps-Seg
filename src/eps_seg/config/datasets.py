@@ -1,6 +1,6 @@
 from eps_seg.config.base import BaseEPSConfig
 from pydantic import Field
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal, Dict, Tuple
 from pathlib import Path
 from pydantic import model_validator
 import yaml
@@ -20,6 +20,10 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 
+    def get_test_paths(self) -> Tuple[List[str], List[str]]:
+        """Return the list of test image and label paths."""
+        raise NotImplementedError("This method should be implemented in subclasses.")
+
 class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     dim: int = Field(2, description="Dimensionality of the data (2D or 3D)")
     data_dir: str = Field(..., description="Path to the dataset directory")
@@ -29,10 +33,12 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     test_keys: List[str] = Field(..., description="List of dataset keys to load for testing")
     seed: int = Field(42, description="Random seed for shuffling the dataset")
     patch_size: int = Field(64, description="Size of the patches to extract from the images")
+    n_channels: int = Field(1, description="Number of image channels in the dataset")
     n_classes: int = Field(4, description="Number of segmentation classes in the dataset")
     mode: Literal["supervised", "semisupervised"] = Field("supervised", description="Dataset mode: supervised or semisupervised")    
     samples_per_class_validation: Optional[Dict[int, int]] = Field({1: 2}, description="Number of samples per class for validation dataset. If None, defaults to 1 per class.")
     samples_per_class_training: Optional[Dict[int, int]] = Field({1: 2}, description="Number of samples per class for training dataset. If None, defaults to unlimited.")
+
     @model_validator(mode="after")
     def check_dirs_not_equal(self) -> "BetaSegDatasetConfig":
         """Ensure data_dir and cache_dir are not the same resolved path."""
@@ -42,6 +48,12 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
             if d == c:
                 raise ValueError("data_dir and cache_dir must not resolve to the same path")
         return self
+    
+    def get_test_paths(self) -> Tuple[List[str], List[str]]:
+        """Return the list of test keys."""
+        img_paths = [str(Path(self.data_dir) / key / f"{key}_source.tif") for key in self.test_keys]
+        lbl_paths = [str(Path(self.data_dir) / key / f"{key}_gt.tif") for key in self.test_keys]
+        return img_paths, lbl_paths
 
 class LiverFibsemDatasetConfig(BaseEPSDatasetConfig):
     dim: int = Field(2, description="Dimensionality of the data (2D or 3D)")

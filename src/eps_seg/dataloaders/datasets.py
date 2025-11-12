@@ -305,48 +305,71 @@ class SemisupervisedDataset(Dataset):
 
 class PredictionDataset(Dataset):
     """
-    Yields only 64x64 patches whose center (31,31) has label != -1 for a fixed z slice.
-    image: (Z,H,W)  (or (C,H,W) if you adapt for multichannel)
-    label: (Z,H,W)
+        Yields 2D or 3D patches whose center has label != -1 and full patch is inside bounds.
+        Optionally, can produce a single z slice if z is provided.
+
+        image: (C,Z,H,W) or (Z,1,H,W)
+
     """
-    def __init__(self, image, label, z, patch_size=64, dim=2):
+    def __init__(self, image, label, z=None, patch_size=64, dim=2):
         self.dim = dim
         self.image = image
         self.label = label
-        self.z = int(z)
+        self.z = int(z) if z is not None else None
         self.ps = int(patch_size)
         assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
         self.half = self.ps // 2  # 32 for 64x64 -> center at (31,31)
 
-        H, W = image[self.z].shape
-        assert (H, W) == label[self.z].shape
+        if image.ndim == 3:
+            Z, H, W = self.image.shape
+            C = 1
+            self.image = self.image[None, ...]  # add channel dim
+        else:
+            C, Z, H, W = self.image.shape
 
-        # Valid centers: label!= -1 and full patch inside bounds
-        y0, y1 = self.half, H - self.half
-        x0, x1 = self.half, W - self.half
-        mask = (label[self.z] != -1)
-        mask[:y0, :] = False
-        mask[y1:, :] = False
-        mask[:, :x0] = False
-        mask[:, x1:] = False
+        if self.label.ndim == 3:
+            self.label = self.label[None, ...]  # add channel dim
 
-        ys, xs = np.where(mask)
-        self.centers = np.stack([ys, xs], axis=1).astype(np.int32)
+        assert self.image.shape[-dim:] == self.label.shape[-dim:], "Image and label must have same (Z),H,W"
+
+        # Valid centers are:
+        # 1) label != -1
+        mask = (self.label != -1)
+        # 2) full patch inside bounds
+        mask[:, :, :, :self.half] = False
+        mask[:, :, :, W - self.half:] = False
+        mask[:, :, :self.half, :] = False
+        mask[:, :, H - self.half:, :] = False
+        mask[:, :self.half, :, :] = False
+        mask[:, Z - self.half:, :, :] = False
+        # If "fast_testing" on a single z slice:
+        if self.z is not None:
+            # Set all other z slices to False
+            mask[:, :self.z, :, :] = False
+            mask[:, self.z + 1:, :, :] = False
+
+
+        _, zs, ys, xs = np.where(mask)
+        self.centers = np.stack([zs, ys, xs], axis=1).astype(np.int32)
 
     def __len__(self):
         return len(self.centers)
 
     def __getitem__(self, idx):
-        y, x = self.centers[idx]
+        z, y, x = self.centers[idx]
+
         if self.dim == 3:
-            z0, z1 = self.z - self.half, self.z + self.half
+            z0, z1 = z - self.half, z + self.half
         else:
-            z0, z1 = self.z, self.z + 1
+            z0, z1 = z, z + 1
+
         y0, y1 = y - self.half, y + self.half
         x0, x1 = x - self.half, x + self.half
-        patch = self.image[z0:z1, y0:y1, x0:x1]             
+        patch = self.image[:, z0:z1, y0:y1, x0:x1]
         patch = torch.from_numpy(patch).float()
-        if self.dim == 3:
-            patch = patch.unsqueeze(0) 
-        center_label = int(self.label[self.z, y, x])
-        return {"patch": patch, "z": self.z, "y": int(y), "x": int(x), "center_label": center_label}
+        
+        center_label = int(self.label[:, z, y, x].item())
+        # Drop channel dim to get [B, D, H, W] in the DataLoader batches.
+        # TODO: For multichannel this will return different shapes!
+        patch = patch.squeeze(0) 
+        return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
