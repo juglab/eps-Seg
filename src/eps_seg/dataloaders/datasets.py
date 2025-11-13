@@ -101,16 +101,16 @@ class SemisupervisedDataset(Dataset):
         lbl_vol = self.labels[name]
 
         if self.mode == "supervised":
-            cy, cx = map(int, g["coords"][0])
-            patch = self.patch_at(img_vol, z, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
+            cz, cy, cx = map(int, g["coords"][0])
+            patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)  # [1]
-            segment = self.patch_at(lbl_vol, z, cy, cx).unsqueeze(0)  # [1, Z, H, W]
+            segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]
             return patch, label, segment, torch.tensor(g["coords"][0])
         else:
-            coords = torch.tensor([tuple(map(int, xy)) for xy in g["coords"]])
-            patches = torch.stack([self.patch_at(img_vol, z, y, x) for (y, x) in coords])  # [4, 1, Z, H, W]
+            coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
+            patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
             labels = torch.tensor([g["labels"][0]] + [-1]*7, dtype=torch.long)  # [4]
-            segments = torch.stack([self.patch_at(lbl_vol, z, y, x) for (y, x) in coords])  # [4, 1, Z, H, W]
+            segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
             return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
