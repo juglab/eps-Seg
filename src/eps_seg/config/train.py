@@ -98,12 +98,14 @@ class ExperimentConfig(BaseEPSConfig):
     @property
     def outputs_dir(self) -> Path:
         """Return the directory path for saving outputs."""
-        return self.experiment_root / "outputs"
+        train_cfg, dataset_cfg, model_cfg = self.get_configs()
+        return self.experiment_root / "outputs" / self.experiment_name / train_cfg.model_name 
     
     @property
     def results_dir(self) -> Path:
         """Return the directory path for saving results."""
-        return self.experiment_root / "results"
+        train_cfg, dataset_cfg, model_cfg = self.get_configs()
+        return self.experiment_root / "results" / self.experiment_name / train_cfg.model_name / "results.csv"
 
     @property
     def logs_dir(self) -> Path:

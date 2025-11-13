@@ -149,10 +149,11 @@ class LVAEModel(L.LightningModule):
         self.validation_dice_score.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=False):
-        x = batch["patch"]
+        
+        x, labels, coords, _ = batch
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
-        return self.forward(x, y=None, validation_mode=False), batch
+        return self.forward(x, y=None, validation_mode=False), batch # Return batch in predictions to reconstruct image
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),

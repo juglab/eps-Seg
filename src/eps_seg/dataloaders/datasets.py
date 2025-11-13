@@ -364,6 +364,10 @@ class PredictionDataset(Dataset):
         return len(self.centers)
 
     def __getitem__(self, idx):
+        """
+            Returns a tuple:
+            patch, center_label, coordinates of center and segment for compatibility with SemisupervisedDataset.
+        """
         z, y, x = self.centers[idx]
 
         if self.dim == 3:
@@ -375,9 +379,18 @@ class PredictionDataset(Dataset):
         x0, x1 = x - self.half, x + self.half
         patch = self.image[:, z0:z1, y0:y1, x0:x1]
         patch = torch.from_numpy(patch).float()
-        
+
+        segment = self.label[:, z0:z1, y0:y1, x0:x1]
+        segment = torch.from_numpy(segment).long()
+
+
         center_label = int(self.label[:, z, y, x].item())
         # Drop channel dim to get [B, D, H, W] in the DataLoader batches.
         # TODO: For multichannel this will return different shapes!
-        patch = patch.squeeze(0) 
-        return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
+        if self.dim == 2:
+            patch = patch.squeeze(-3)  # Return [H, W] to get [B, 1, H, W] in DataLoader (?)
+            segment = segment.squeeze(-3)
+
+        # return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
+        coords = torch.stack([torch.tensor(z), torch.tensor(y), torch.tensor(x)])
+        return torch.tensor(patch), torch.tensor(center_label), segment, coords

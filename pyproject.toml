@@ -9,6 +9,7 @@ dependencies = [
     "lightning>=2.5.5",
     "matplotlib>=3.10.7",
     "numpy>=2.3.3",
+    "pandas>=2.3.3",
     "pydantic>=2.12.2",
     "python-dotenv>=1.1.1",
     "scikit-image>=0.25.2",
@@ -16,7 +17,7 @@ dependencies = [
     "tensorboard>=2.20.0",
     "tifffile>=2025.10.4",
     "torch>=2.8.0",
-    "torchvision>=0.23.0", 
+    "torchvision>=0.23.0",
     "tqdm>=4.67.1",
     "wandb>=0.22.2",
 ]
