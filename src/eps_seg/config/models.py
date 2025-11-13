@@ -43,6 +43,7 @@ class LVAEConfig(BaseEPSModelConfig):
     no_initial_downscaling: bool = Field(default=True, description="Whether to avoid initial downscaling of the input images.")
     mask_size: int = Field(default=1, description="Size of the mask used in the model")
     # Should be part of training config
+    mask_strategy: Literal['zero', 'average'] = Field(default='zero', description="Masking strategy to use in the model.")
     use_contrastive_learning: bool = Field(default=True, description="Whether to use contrastive loss during training.")
     margin: float = Field(default=20.0, description="Margin value for contrastive loss.")
     learnable_thetas: bool = Field(default=True, description="Whether to use NeurIPS-paper contrastive learning.")

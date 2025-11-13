@@ -411,16 +411,30 @@ class LadderVAE(nn.Module):
         return out, data
 
     def _mask_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Zero out the centre mask according to self.mask_size."""
+        """
+            Applies masking to the input tensor x according to the specified masking strategy.
+        """
+        masking_strategy = self.cfg.mask_strategy
+        
         x_masked = x.clone()
         ps = x.shape[-1]
         ms = self.mask_size
         b = (ps - ms) // 2
         e = b + ms
+
+        mask_binary = torch.zeros_like(x).bool()
         if self.conv_mult == 2:
-            x_masked[:, :, b:e, b:e] = 0
+            mask_binary[:, :, b:e, b:e] = 1
         else:
-            x_masked[:, :, b:e, b:e, b:e] = 0
+            mask_binary[:, :, b:e, b:e, b:e] = 1
+        
+        if masking_strategy == 'zero':
+            mask_value = 0
+        elif masking_strategy == 'average':
+            mask_value = x[~mask_binary].mean()
+        
+        x_masked[mask_binary] = mask_value
+        
         return x_masked
 
     def _centre_crop(self, x: torch.Tensor) -> torch.Tensor:
