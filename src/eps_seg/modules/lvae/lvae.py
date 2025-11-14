@@ -414,7 +414,7 @@ class LadderVAE(nn.Module):
         """
             Applies masking to the input tensor x according to the specified masking strategy.
         """
-        masking_strategy = self.cfg.mask_strategy
+        ann_width = self.cfg.mask_strategy # Depth of the annulus for average masking
         
         x_masked = x.clone()
         ps = x.shape[-1]
@@ -428,11 +428,23 @@ class LadderVAE(nn.Module):
         else:
             mask_binary[:, :, b:e, b:e, b:e] = 1
         
-        if masking_strategy == 'zero':
-            mask_value = 0
-        elif masking_strategy == 'average':
-            mask_value = x[~mask_binary].mean()
-        
+        mask_value = 0.0
+        average_mask = None
+        if ann_width > 0: # If ann_width == 0, fill mask with zeros
+            average_mask = torch.zeros_like(x).bool()
+            if ann_width <= b:
+                # Take an annulus around the masked region
+                if self.conv_mult == 2:
+                    average_mask[:, :, b - ann_width:e + ann_width, b - ann_width:e + ann_width] = 1
+                    average_mask[mask_binary] = 0  # Exclude the masked region itself
+                else:
+                    average_mask[:, :, b - ann_width:e + ann_width, b - ann_width:e + ann_width, b - ann_width:e + ann_width] = 1
+                    average_mask[mask_binary] = 0  # Exclude the masked region itself
+            else:
+                # If the annulus would go out of bounds, use the entire unmasked area
+                average_mask = ~mask_binary
+            mask_value = x[average_mask].mean().item()
+
         x_masked[mask_binary] = mask_value
         
         return x_masked
