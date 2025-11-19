@@ -95,6 +95,10 @@ class SemisupervisedDataset(Dataset):
             return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
 
     def __getitem__(self, idx):
+        """
+            In supervised mode, returns the anchors 
+
+        """
         g = self.groups[idx]
         name, z = g["name"], int(g["z"])
         img_vol = self.images[name]
@@ -103,17 +107,33 @@ class SemisupervisedDataset(Dataset):
         if self.mode == "supervised":
             cz, cy, cx = map(int, g["coords"][0])
             patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
+            # Return only the anchor
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)  # [1]
             segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]
             return patch, label, segment, torch.tensor(g["coords"][0])
         else:
             coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
             patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
+            # Returns the ancor with label, neighbors with -1
             labels = torch.tensor([g["labels"][0]] + [-1]*7, dtype=torch.long)  # [4]
             segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
             return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
+        """
+            Returns a list of "groups", that correspond to an anchor and its sampled neighbors.
+            Only groups with exactly n_neighbors are returned.
+
+            Returns:
+                A list of dicts ("groups").
+
+                Each group is a dict with keys:
+                    name: str (image name)
+                    z: int (anchor z)
+                    coords: List of (z,y,x) tuples for anchor + neighbors
+                    labels: List of int class labels for anchor + neighbors
+
+        """
         groups: List[dict] = []
 
         for name, z_list in self.indices_dict.items():
