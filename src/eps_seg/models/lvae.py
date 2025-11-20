@@ -28,8 +28,8 @@ class LVAEModel(L.LightningModule):
         
         # DiceScore implemented as F1Score
         # Index -1 is passed during selfsupervised mode for inpatinting loss on unlabeled regions
-        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1) 
-        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1)
+        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=True) 
+        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=True)
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """

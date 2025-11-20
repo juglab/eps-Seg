@@ -1,8 +1,11 @@
 import random
 import itertools
-from torch.utils.data import Sampler
+from torch.utils.data import BatchSampler, DistributedSampler
+from eps_seg.dataloaders.datasets import SemisupervisedDataset
+from typing import Optional
+from typing import Iterator
 
-class ModeAwareBalancedAnchorBatchSampler(Sampler):
+class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
     """
         Yields balanced batches of anchor indices.
         Adapts to dataset.mode at the start of every epoch.
@@ -41,9 +44,10 @@ class ModeAwareBalancedAnchorBatchSampler(Sampler):
     def _compute_epoch_plan(self):
         # anchors-per-batch depends on current mode
         if self.dataset.mode == "semisupervised":
+            # in semisupervised mode, dataset returns [anchor + 7 neighbors, ancor + 7 neighbors, ...]
             assert (
                 self.total_patches_per_batch % 8 == 0  # TODO
-            ), "total_patches_per_batch must be divisible by 4 in semisupervised mode."
+            ), "total_patches_per_batch must be divisible by 8 in semisupervised mode."
             anchors_per_batch = self.total_patches_per_batch // 8  # TODO
         else:
             anchors_per_batch = self.total_patches_per_batch
@@ -83,3 +87,68 @@ class ModeAwareBalancedAnchorBatchSampler(Sampler):
         # compute against current mode so progress bars don't go crazy after mode flip
         anchors_per_batch, _, num_batches = self._compute_epoch_plan()
         return num_batches
+    
+
+class DistributedParallelSampler(DistributedSampler):
+    """
+        Wraps a ModeAwareBalancedAnchorBatchSampler to provide distributed sampling capabilities.
+        Each replica will only return batches with indices batch_idx % num_replicas == rank to achieve distributed training.
+
+        Args:
+            dataset (SemisupervisedDataset): The dataset to sample from.
+            sampler (ModeAwareBalancedAnchorBatchSampler): The sampler to wrap for distributed sampling.
+            num_replicas (Optional[int]): Number of processes in distributed training.
+            rank (Optional[int]): Rank of the current process.
+            shuffle (bool): Whether to shuffle the dataset at the start of each epoch.
+            seed (int): Random seed for shuffling.
+            drop_last (bool): Whether to drop the last incomplete batch.
+
+    """
+    def __init__(
+        self,
+        dataset: SemisupervisedDataset,
+        sampler: ModeAwareBalancedAnchorBatchSampler,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False,
+    ) -> None:
+        num_replicas, rank = self._fix_rank_replicas(num_replicas, rank)
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self.sampler = sampler
+    
+    def _fix_rank_replicas(self, num_replicas: int, rank: int) -> tuple[int, int]:
+        """
+            Helper function to determine num_replicas and rank if they are not provided.
+            Used mainly for debugging and non-distributed scenarios.
+        """
+        if num_replicas is None:
+            if dist.is_available() and dist.is_initialized():
+                num_replicas = dist.get_world_size()
+            else:
+                # fallback to single-process behavior for local debugging / unit tests
+                num_replicas = 1
+
+        if rank is None:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                rank = 0
+        return num_replicas, rank
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+           This is called at the beginning of each epoch to set the epoch number for shuffling.
+        """
+        super().set_epoch(epoch)
+        print(f"Set epoch called on DistributedParallelSampler with epoch {epoch}")
+        self.sampler.set_epoch(epoch)
+    
+    def __iter__(self) -> Iterator[int]:
+        """
+            Yield indices for the current replica by filtering the underlying sampler's indices.
+        """
+        for batch_idx, batch in enumerate(self.sampler):
+            if batch_idx % self.num_replicas == self.rank:
+                yield batch

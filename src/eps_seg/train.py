@@ -54,7 +54,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
 
         #### SUPERVISED MODE ####
         supervised_trainer = L.Trainer(
-            devices=1,
+            devices="auto",
+            strategy="ddp",
             logger=supervised_logger,
             max_epochs=train_config.max_epochs,
             callbacks=[
@@ -112,7 +113,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         )
 
     semisupervised_trainer = L.Trainer(
-        devices=1,
+        devices="auto",
+        strategy="ddp",
         logger=semisupervised_logger,
         max_epochs=train_config.max_epochs,
         callbacks=[
