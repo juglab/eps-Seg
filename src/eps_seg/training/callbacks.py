@@ -15,7 +15,7 @@ class EarlyStoppingWithPatiencePropagation(EarlyStopping):
             pl_module.current_radius_patience = 0
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx = 0):
-        pl_module.log("val/radius_increase_patience", pl_module.current_radius_patience, prog_bar=True, on_epoch=True)
+        pl_module.log("val/radius_increase_patience", pl_module.current_radius_patience, prog_bar=True, on_epoch=True, sync_dist=True)
         return super().on_validation_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
 
 

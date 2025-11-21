@@ -26,10 +26,7 @@ class LadderVAE(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.training_mode = cfg.training_mode
-        
-        #self.data_mean = torch.Tensor([data_mean]).to(self.device)
-        #self.data_std = torch.Tensor([data_std]).to(self.device)
-
+    
         self.n_layers = cfg.n_layers
         self.z_dims = cfg.z_dims
         self.blocks_per_layer = cfg.blocks_per_layer

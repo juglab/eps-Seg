@@ -453,7 +453,6 @@ class BottomUpLayer(nn.Module):
         res_block_type=None,
         gated=None,
         grad_checkpoint=False,
-        device=None,
     ):
         super().__init__()
 
@@ -478,9 +477,7 @@ class BottomUpLayer(nn.Module):
                     grad_checkpoint=grad_checkpoint,
                 )
             )
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.net = nn.Sequential(*bu_blocks).to(self.device)
+        self.net = nn.Sequential(*bu_blocks)
 
     def forward(self, x):
         return self.net(x)
@@ -773,7 +770,6 @@ class BaseStochasticConvBlock(nn.Module):
         self.c_out = c_out
         self.c_vars = c_vars
         self.batch_size = 0
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
             nn, f"Conv{conv_mult}d"
         )
@@ -929,7 +925,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         self.temperature = 1.0  # Initial temperature for Gumbel-Softmax
         self.constant = 200  # Scaling constant for distances
         self.group_size = 8
-        self.prior_probs = torch.ones(n_components, device=self.device) / n_components
+        self.register_buffer("prior_probs", torch.ones(n_components) / n_components, persistent=False)
         self.conv_mult = conv_mult
 
         # q(y|x) network -> segmentation head
@@ -991,7 +987,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
 
         # Initialize outputs
         q_probs = None
-        cross_entropy = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        cross_entropy = torch.tensor(0.0, dtype=torch.float32, device=p_params.device)
         pseudo_label = label
 
         # Handle different training scenarios
@@ -1045,7 +1041,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
 
         num_groups = self.batch_size // self.group_size
         anchors = torch.arange(
-            0, num_groups * self.group_size, self.group_size, device=self.device
+            0, num_groups * self.group_size, self.group_size, device=label.device
         )
 
         q_mu_anchors = q_mu[anchors]
@@ -1058,7 +1054,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
                 q_mu.size(-3),
                 q_mu.size(-2),
                 q_mu.size(-1),
-                device=self.device,
+                device=label.device,
             )
         else:
             sums = torch.zeros(
@@ -1067,9 +1063,9 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
                 q_mu.size(-3),
                 q_mu.size(-2),
                 q_mu.size(-1),
-                device=self.device,
+                device=label.device,
             )
-        counts = torch.zeros(self.n_components, 1, 1, 1, device=self.device) if self.conv_mult == 2 else torch.zeros(self.n_components, 1, 1, 1, 1, device=self.device)
+        counts = torch.zeros(self.n_components, 1, 1, 1, device=label.device) if self.conv_mult == 2 else torch.zeros(self.n_components, 1, 1, 1, 1, device=label.device)
 
         for c in range(self.n_components):
             mask = labels_anchors == c
@@ -1108,9 +1104,9 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
             if valid_mask.any():
                 kl = kl_divergences[valid_mask, label[valid_mask].long()].mean()
             else:
-                kl = torch.tensor(0.0, device=self.device)
+                kl = torch.tensor(0.0, device=q.device)
         else:
-            kl = torch.tensor(0.0, device=self.device)
+            kl = torch.tensor(0.0, device=q.device)
 
         return kl
 

@@ -78,14 +78,14 @@ class LVAEModel(L.LightningModule):
             cross_entropy_loss
         )
 
-        self.log("train/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/CL", contrastive_loss.item() * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/IP", inpainting_loss * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/IP_unweighted", inpainting_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/KL", kld_loss * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/KL_unweighted", kld_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/CL", contrastive_loss * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
         
         # Accumulate metrics for dice loss (it is logged on epoch end)
@@ -118,14 +118,14 @@ class LVAEModel(L.LightningModule):
         )
 
         # Log losses
-        self.log("val/IP", inpainting_loss.item() * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/IP_unweighted", inpainting_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/KL", kld_loss.item() * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/KL_unweighted", kld_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/CL", contrastive_loss.item() * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/CL_unweighted", contrastive_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/CE", cross_entropy_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
-        self.log("val/total_loss", total_loss.item(), prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val/IP", inpainting_loss * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/IP_unweighted", inpainting_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/KL", kld_loss * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/KL_unweighted", kld_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/CL", contrastive_loss * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
@@ -137,15 +137,15 @@ class LVAEModel(L.LightningModule):
     def on_train_epoch_end(self):
         dice_loss_per_class = self.train_dice_score.compute()
         for class_idx, dice_score in enumerate(dice_loss_per_class):
-            self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True)
-        self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True)
+            self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=True)
+        self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=True)
         self.train_dice_score.reset()
 
     def on_validation_epoch_end(self):
         dice_loss_per_class = self.validation_dice_score.compute()
         for class_idx, dice_score in enumerate(dice_loss_per_class):
-            self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True)
-        self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True)
+            self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=True)
+        self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=True)
         self.validation_dice_score.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=False):
