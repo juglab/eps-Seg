@@ -4,6 +4,7 @@ from torch.utils.data import BatchSampler, DistributedSampler
 from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from typing import Optional
 from typing import Iterator
+import torch.distributed as dist
 
 class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
     """
@@ -89,7 +90,7 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         return num_batches
     
 
-class DistributedParallelSampler(DistributedSampler):
+class DistributedParallelBatchSampler(DistributedSampler):
     """
         Wraps a ModeAwareBalancedAnchorBatchSampler to provide distributed sampling capabilities.
         Each replica will only return batches with indices batch_idx % num_replicas == rank to achieve distributed training.
@@ -99,7 +100,7 @@ class DistributedParallelSampler(DistributedSampler):
             sampler (ModeAwareBalancedAnchorBatchSampler): The sampler to wrap for distributed sampling.
             num_replicas (Optional[int]): Number of processes in distributed training.
             rank (Optional[int]): Rank of the current process.
-            shuffle (bool): Whether to shuffle the dataset at the start of each epoch.
+            shuffle (bool): Has no effect here, kept for compatibility.
             seed (int): Random seed for shuffling.
             drop_last (bool): Whether to drop the last incomplete batch.
 
@@ -110,11 +111,12 @@ class DistributedParallelSampler(DistributedSampler):
         sampler: ModeAwareBalancedAnchorBatchSampler,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
-        shuffle: bool = True,
+        shuffle: bool = False,
         seed: int = 42,
         drop_last: bool = False,
     ) -> None:
         num_replicas, rank = self._fix_rank_replicas(num_replicas, rank)
+        assert not shuffle, "DistributedParallelBatchSampler does not support shuffling directly, please shuffle the underlying sampler."
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
         self.sampler = sampler
     
@@ -143,8 +145,9 @@ class DistributedParallelSampler(DistributedSampler):
         """
         super().set_epoch(epoch)
         print(f"Set epoch called on DistributedParallelSampler with epoch {epoch}")
-        self.sampler.set_epoch(epoch)
-    
+        #self.sampler.set_epoch(epoch)
+        # TODO: Should we do something here?
+        
     def __iter__(self) -> Iterator[int]:
         """
             Yield indices for the current replica by filtering the underlying sampler's indices.

@@ -5,10 +5,10 @@ from pathlib import Path
 import tifffile as tiff
 import numpy as np
 from typing import Dict, Tuple
-from eps_seg.dataloaders.datasets import SemisupervisedDataset, PredictionDataset
+from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
-from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
+from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler, DistributedParallelBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
 import yaml
 
@@ -217,24 +217,40 @@ class BetaSegTrainDataModule(L.LightningDataModule):
         return images
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_sampler=ModeAwareBalancedAnchorBatchSampler(
+
+        train_sampler = ModeAwareBalancedAnchorBatchSampler(
                 self.train_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
                 shuffle=True,
-            ),
+            )
+        
+        train_sampler = DistributedParallelBatchSampler(
+            self.train_dataset,
+            sampler=train_sampler,
+            shuffle=False, # The underlying sampler is already shuffled
+        )
+
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=train_sampler,
             collate_fn=flex_collate,
         )
 
     def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_sampler=ModeAwareBalancedAnchorBatchSampler(
+        val_sampler = ModeAwareBalancedAnchorBatchSampler(
                 self.val_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
                 shuffle=False,
-            ),
+            )
+        val_sampler = DistributedParallelBatchSampler(
+            self.val_dataset,
+            sampler=val_sampler,
+            shuffle=False,
+        )
+
+        return DataLoader(
+            self.val_dataset,
+            batch_sampler=val_sampler,
             collate_fn=flex_collate,
         )
 

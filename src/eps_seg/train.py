@@ -70,6 +70,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             gradient_clip_val=train_config.max_grad_norm, 
             log_every_n_steps=train_config.log_every_n_steps,
             deterministic=train_config.deterministic,
+            use_distributed_sampler=False, # We have our own distributed sampler
             # fast_dev_run=True,
             )
 
@@ -133,6 +134,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
         deterministic=train_config.deterministic,
+        use_distributed_sampler=False, # We have our own distributed sampler
         # fast_dev_run=True,
         )
 
