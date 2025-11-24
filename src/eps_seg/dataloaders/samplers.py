@@ -143,15 +143,27 @@ class DistributedParallelBatchSampler(DistributedSampler):
         """
            This is called at the beginning of each epoch to set the epoch number for shuffling.
         """
-        super().set_epoch(epoch)
         print(f"Set epoch called on DistributedParallelSampler with epoch {epoch}")
+        super().set_epoch(epoch)
         #self.sampler.set_epoch(epoch)
         # TODO: Should we do something here?
-        
+    
+    def __len__(self) -> int:
+        """
+            Returns the number of batches for this replica.
+        """
+        sampler_len = len(self.sampler)
+        # Sampler can have sampler_len % num_replicas != 0, so we take the floor
+
+        return sampler_len // self.num_replicas
+
     def __iter__(self) -> Iterator[int]:
         """
             Yield indices for the current replica by filtering the underlying sampler's indices.
         """
+        n_batches_this_replica = len(self) # e.g., 101 for 4 replicas with 404 total batches
+
         for batch_idx, batch in enumerate(self.sampler):
-            if batch_idx % self.num_replicas == self.rank:
+            # batch_idx goes from 0 to len(sampler)-1. We need to stop at n_batches * num_replicas
+            if batch_idx % self.num_replicas == self.rank and batch_idx < n_batches_this_replica * self.num_replicas:
                 yield batch

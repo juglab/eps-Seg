@@ -28,8 +28,10 @@ class LVAEModel(L.LightningModule):
         
         # DiceScore implemented as F1Score
         # Index -1 is passed during selfsupervised mode for inpatinting loss on unlabeled regions
-        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=True) 
-        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=True)
+        # sync_on_compute=False because we want to accumulate stats across devices manually and then compute at epoch end only on rank 0
+        # otherwise it will go deadlock because we end up with different class amounts on different devices
+        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True) 
+        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
@@ -135,17 +137,21 @@ class LVAEModel(L.LightningModule):
         return outputs
 
     def on_train_epoch_end(self):
-        dice_loss_per_class = self.train_dice_score.compute()
-        for class_idx, dice_score in enumerate(dice_loss_per_class):
-            self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=True)
-        self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=True)
+        if self.trainer.is_global_zero:
+            # We are node 0 device 0
+            dice_loss_per_class = self.train_dice_score.compute()
+            for class_idx, dice_score in enumerate(dice_loss_per_class):
+                self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
+            self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
         self.train_dice_score.reset()
 
     def on_validation_epoch_end(self):
-        dice_loss_per_class = self.validation_dice_score.compute()
-        for class_idx, dice_score in enumerate(dice_loss_per_class):
-            self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=True)
-        self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=True)
+        if self.trainer.is_global_zero:
+            # We are node 0 device 0
+            dice_loss_per_class = self.validation_dice_score.compute()
+            for class_idx, dice_score in enumerate(dice_loss_per_class):
+                self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
+            self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
         self.validation_dice_score.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=False):
