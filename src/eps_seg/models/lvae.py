@@ -18,6 +18,7 @@ class LVAEModel(L.LightningModule):
         # Placeholders for data statistics
         self.model.register_buffer("data_mean", torch.tensor(0.0))
         self.model.register_buffer("data_std", torch.tensor(0.0))        
+        self.register_buffer("seen_samples", torch.zeros(1, dtype=torch.long))
 
         self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.5
         self.current_radius = self.train_cfg.initial_radius if self.train_cfg else 5
@@ -62,9 +63,11 @@ class LVAEModel(L.LightningModule):
             self.model.data_std = torch.as_tensor(std, device=self.device)
         else:
             print("Using existing data statistics from checkpoint.")
+        print("Seen samples:", self.seen_samples.item())
 
     def training_step(self, batch, batch_idx):
         x, y, z, _ = batch
+        batch_size = x.shape[0]
 
         outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold)
 
@@ -80,16 +83,21 @@ class LVAEModel(L.LightningModule):
             cross_entropy_loss
         )
 
-        self.log("train/IP", inpainting_loss * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/IP_unweighted", inpainting_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/KL", kld_loss * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/KL_unweighted", kld_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/CL", contrastive_loss * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        if self.trainer.is_global_zero:
+            self.seen_samples += batch_size * self.trainer.world_size
+
+        self.log("train/IP", inpainting_loss * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/IP_unweighted", inpainting_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/KL", kld_loss * self.train_cfg.beta, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/KL_unweighted", kld_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/CL", contrastive_loss * self.train_cfg.gamma, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        if self.trainer.is_global_zero:
+            self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=False, sync_dist=False)
+
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
-        
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
         self.train_dice_score.update(preds, y)

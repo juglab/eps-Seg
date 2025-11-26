@@ -28,7 +28,7 @@ class TrainConfig(BaseEPSConfig):
     beta: float = Field(default=1e-2, description="Weight for the KLD loss")
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
-    log_every_n_steps: int = Field(default=5, description="Logging frequency in steps")
+    log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
     initial_threshold: float = Field(default=0.50, description="Initial confidence threshold for training in semisupervised mode")
     max_threshold: float = Field(default=0.99, description="Maximum confidence threshold for training in semisupervised mode")
     threshold_increment: float = Field(default=0.005, description="Step size for confidence threshold increase")
