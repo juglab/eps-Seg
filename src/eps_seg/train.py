@@ -71,6 +71,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             log_every_n_steps=train_config.log_every_n_steps,
             deterministic=train_config.deterministic,
             use_distributed_sampler=False, # We have our own distributed sampler
+            accumulate_grad_batches=train_config.accumulate_grad_batches,
             # fast_dev_run=True,
             )
 
@@ -135,6 +136,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         log_every_n_steps=train_config.log_every_n_steps,
         deterministic=train_config.deterministic,
         use_distributed_sampler=False, # We have our own distributed sampler
+        accumulate_grad_batches=train_config.accumulate_grad_batches,
         # fast_dev_run=True,
         )
 

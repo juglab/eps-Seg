@@ -83,8 +83,7 @@ class LVAEModel(L.LightningModule):
             cross_entropy_loss
         )
 
-        if self.trainer.is_global_zero:
-            self.seen_samples += batch_size * self.trainer.world_size
+        self.seen_samples += batch_size * self.trainer.world_size
 
         self.log("train/IP", inpainting_loss * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log("train/IP_unweighted", inpainting_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
@@ -94,8 +93,7 @@ class LVAEModel(L.LightningModule):
         self.log("train/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log("train/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        if self.trainer.is_global_zero:
-            self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
 
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
         # Accumulate metrics for dice loss (it is logged on epoch end)
@@ -136,6 +134,8 @@ class LVAEModel(L.LightningModule):
         self.log("val/CL_unweighted", contrastive_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("val/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
+
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
