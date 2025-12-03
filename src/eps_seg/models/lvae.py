@@ -34,6 +34,8 @@ class LVAEModel(L.LightningModule):
         self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True) 
         self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
 
+        self.current_true_epoch = 0
+
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
             Forward pass through the LVAE model.
@@ -94,7 +96,9 @@ class LVAEModel(L.LightningModule):
         self.log("train/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
-
+        
+        self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
+        self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -135,6 +139,7 @@ class LVAEModel(L.LightningModule):
         self.log("val/CE", cross_entropy_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("seen_samples", self.seen_samples, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
+        self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
 
         outputs["loss"] = total_loss # Needed for Lightning to work with optimizers
 

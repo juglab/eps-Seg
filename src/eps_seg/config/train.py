@@ -21,6 +21,7 @@ class TrainConfig(BaseEPSConfig):
     pseudo_epoch_size: int = Field(default=10000, description="Number of steps for each pseudo-epoch")
     early_stopping_patience: int = Field(default=50, description="Patience for early stopping")
     batch_size: int = Field(default=128, description="Batch size for training")
+    batches_per_pseudoepoch: Union[int, None] = Field(default=None, description="Number of batches per pseudo-epoch. If None, it is set to dataset_size / batch_size. Must be divisible by num_gpus.")
     amp: bool = Field(default=True, description="Use mixed precision training")
     gradient_scale: int = Field(default=256, description="Gradient scaling factor")
     max_grad_norm: Optional[float] = Field(default=1.0, description="Maximum gradient norm")

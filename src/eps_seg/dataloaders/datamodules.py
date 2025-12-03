@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
-from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler, DistributedParallelBatchSampler
+from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
 import yaml
 
@@ -224,10 +224,11 @@ class BetaSegTrainDataModule(L.LightningDataModule):
                 shuffle=True,
             )
         
-        train_sampler = DistributedParallelBatchSampler(
+        train_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.train_dataset,
             sampler=train_sampler,
             shuffle=False, # The underlying sampler is already shuffled
+            batches_per_pseudoepoch=self.train_cfg.batches_per_pseudoepoch,
         )
 
         return DataLoader(
@@ -242,7 +243,7 @@ class BetaSegTrainDataModule(L.LightningDataModule):
                 total_patches_per_batch=self.train_cfg.batch_size,
                 shuffle=False,
             )
-        val_sampler = DistributedParallelBatchSampler(
+        val_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.val_dataset,
             sampler=val_sampler,
             shuffle=False,
