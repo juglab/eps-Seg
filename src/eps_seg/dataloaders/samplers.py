@@ -197,11 +197,10 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
                     self.sampler_iter = iter(self.sampler)
                 try:
                     batch = next(self.sampler_iter)
-                    # TODO: It would be better to resample so we don't discard last samples if they don't fit on num_replicas
-                    should_yield = (self.next_te_idx % self.num_replicas == self.rank and self.next_pe_idx < n_batches_this_replica * self.num_replicas)
+                    # TODO: is the second condition ever violated?
+                    should_yield = (self.next_pe_idx % self.num_replicas == self.rank and self.next_pe_idx < n_batches_this_replica * self.num_replicas)
                     self.next_pe_idx += 1
                     self.next_te_idx += 1
-
                     if should_yield:
                         yield batch
 
