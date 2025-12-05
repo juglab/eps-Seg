@@ -22,6 +22,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     # TODO: write a factory also for datamodules
     dm = BetaSegTrainDataModule(cfg=dataset_config, train_cfg=train_config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
 
     if not skip_supervised:
         # Set random seed for reproducibility if provided
@@ -55,7 +56,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         #### SUPERVISED MODE ####
         supervised_trainer = L.Trainer(
             devices="auto",
-            strategy="ddp",
+            strategy=strategy,
             logger=supervised_logger,
             max_epochs=train_config.max_epochs,
             callbacks=[
@@ -116,7 +117,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
 
     semisupervised_trainer = L.Trainer(
         devices="auto",
-        strategy="ddp",
+        strategy=strategy,
         logger=semisupervised_logger,
         max_epochs=train_config.max_epochs,
         callbacks=[

@@ -128,8 +128,8 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
         drop_last: bool = False,
         batches_per_pseudoepoch: Optional[int] = None,
     ) -> None:
-        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
-        num_replicas, rank = self._fix_rank_replicas(num_replicas, rank)
+        self.num_replicas, self.rank = self._fix_rank_replicas(num_replicas, rank)
+        super().__init__(dataset, self.num_replicas, self.rank, False, seed, drop_last)
         assert not shuffle, "DistributedParallelBatchSampler does not support shuffling directly, please shuffle the underlying sampler."
         self.sampler = sampler
         self.current_true_epoch = 0
