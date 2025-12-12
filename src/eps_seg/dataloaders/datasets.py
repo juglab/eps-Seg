@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import random
 from collections import Counter
-from typing import Dict, List, Tuple, Iterable, Any
+from typing import Dict, List, Tuple, Iterable, Any, Union
 
 class SemisupervisedDataset(Dataset):
     def __init__(
@@ -308,22 +308,40 @@ class SemisupervisedDataset(Dataset):
 class PredictionDataset(Dataset):
     """
         Yields 2D or 3D patches whose center has label != -1 and full patch is inside bounds.
-        Optionally, can produce a single z slice if z is provided.
+        It optionally mask the image to a specific z slice for faster testing.
 
         image: (C,Z,H,W) or (Z,1,H,W)
 
+            Args: 
+                image: np.ndarray
+                    Image volume of shape (C,Z,H,W) or (Z,H,W)
+                label: np.ndarray
+                    Label volume of shape (1,Z,H,W) or (Z,H,W)
+                mask: Union[slice, None]
+                    If slice, only consider this z slice for patch extraction (for faster testing).
+                    Constraint on label > -1 still apply.
+                patch_size: int
+                    Size of the extracted patches (assumed cubic or square).
+                dim: int
+                    2 or 3 for 2D or 3D patches.
+                ignore_lbl: int
+                    Label value to ignore when extracting patches.
     """
-    def __init__(self, image, label, z=None, patch_size=64, dim=2, normalize_stats=None):
+
+    def __init__(self,
+                 image, 
+                 label, 
+                 mask=Union[Tuple[slice], None], 
+                 patch_size=64, 
+                 dim=2,
+                 ignore_lbl=-1):
+
         self.dim = dim
+        self.ignore_lbl = ignore_lbl
         self.image = image
-        self.label = label
-        
-        if normalize_stats is not None:
-            mu, std = normalize_stats
-            print(f"Normalizing data using mean {mu} and std {std}...")
-            self.image = (self.image - mu) / std
-        
-        self.z = int(z) if z is not None else None
+        self.label = label        
+        self.mask = mask
+
         self.ps = int(patch_size)
         assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
         self.half = self.ps // 2  # 32 for 64x64 -> center at (31,31)
@@ -338,26 +356,28 @@ class PredictionDataset(Dataset):
         if self.label.ndim == 3:
             self.label = self.label[None, ...]  # add channel dim
 
+        if self.mask is not None and len(self.mask) == 3:
+                self.mask = (slice(None),) + self.mask  # add channel dim to mask
+
         assert self.image.shape[-dim:] == self.label.shape[-dim:], "Image and label must have same (Z),H,W"
 
         # Valid centers are:
         # 1) label != -1
-        mask = (self.label != -1)
+        final_mask = (self.label != -1)
         # 2) full patch inside bounds
-        mask[:, :, :, :self.half] = False
-        mask[:, :, :, W - self.half:] = False
-        mask[:, :, :self.half, :] = False
-        mask[:, :, H - self.half:, :] = False
-        mask[:, :self.half, :, :] = False
-        mask[:, Z - self.half:, :, :] = False
-        # If "fast_testing" on a single z slice:
-        if self.z is not None:
-            # Set all other z slices to False
-            mask[:, :self.z, :, :] = False
-            mask[:, self.z + 1:, :, :] = False
+        final_mask[:, :, :, :self.half] = False
+        final_mask[:, :, :, W - self.half:] = False
+        final_mask[:, :, :self.half, :] = False
+        final_mask[:, :, H - self.half:, :] = False
+        final_mask[:, :self.half, :, :] = False
+        final_mask[:, Z - self.half:, :, :] = False
+        
+        if self.mask is not None:
+            mask_array = np.zeros_like(final_mask, dtype=bool)
+            mask_array[self.mask] = True
+            final_mask = final_mask & mask_array
 
-
-        _, zs, ys, xs = np.where(mask)
+        _, zs, ys, xs = np.where(final_mask)
         self.centers = np.stack([zs, ys, xs], axis=1).astype(np.int32)
 
     def __len__(self):
@@ -384,7 +404,7 @@ class PredictionDataset(Dataset):
         segment = torch.from_numpy(segment).long()
 
 
-        center_label = int(self.label[:, z, y, x].item())
+        center_label = torch.tensor(self.label[:, z, y, x]).long()
         # Drop channel dim to get [B, D, H, W] in the DataLoader batches.
         # TODO: For multichannel this will return different shapes!
         if self.dim == 2:
@@ -393,4 +413,4 @@ class PredictionDataset(Dataset):
 
         # return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
         coords = torch.stack([torch.tensor(z), torch.tensor(y), torch.tensor(x)])
-        return torch.tensor(patch), torch.tensor(center_label), segment, coords
+        return patch, center_label, segment, coords

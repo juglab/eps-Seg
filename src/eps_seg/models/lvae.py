@@ -33,7 +33,7 @@ class LVAEModel(L.LightningModule):
         # otherwise it will go deadlock because we end up with different class amounts on different devices
         self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True) 
         self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
-
+        self.test_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
         self.current_true_epoch = 0
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
@@ -149,6 +149,42 @@ class LVAEModel(L.LightningModule):
 
         return outputs
 
+    def on_test_epoch_start(self):
+        super().on_test_epoch_start()
+        self.current_test_outputs = []
+        self.test_dice_score.reset()
+
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        x, y, s, c = batch
+        x = (x - self.model.data_mean) / self.model.data_std
+        outputs = self.forward(x, 
+                             y=None, 
+                             validation_mode=False, 
+                             confidence_threshold=0.99,
+                             )
+        outputs["preds"] = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
+        outputs["labels"] = y
+        outputs["coords"] = c
+        self.current_test_outputs.append(outputs)
+        self.test_dice_score.update(outputs["preds"].to(y.device), y)
+        return outputs
+
+    def on_test_epoch_end(self):
+        if self.trainer.is_global_zero:
+            # We are node 0 device 0
+            dice_loss_per_class = self.test_dice_score.compute()
+            for class_idx, dice_score in enumerate(dice_loss_per_class):
+                self.log(f'test/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
+            self.log('test/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
+            self.test_dice_score.reset()
+        super().on_test_epoch_end()
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=True):
+        x, labels, coords, _ = batch
+        if normalize:
+            x = (x - self.model.data_mean) / self.model.data_std
+        return self.forward(x, y=None, validation_mode=False), batch # Return batch in predictions to reconstruct image
+
     def on_train_epoch_end(self):
         if self.trainer.is_global_zero:
             # We are node 0 device 0
@@ -167,12 +203,6 @@ class LVAEModel(L.LightningModule):
             self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
         self.validation_dice_score.reset()
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=False):
-        
-        x, labels, coords, _ = batch
-        if normalize:
-            x = (x - self.model.data_mean) / self.model.data_std
-        return self.forward(x, y=None, validation_mode=False), batch # Return batch in predictions to reconstruct image
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),

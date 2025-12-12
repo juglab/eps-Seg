@@ -22,6 +22,7 @@ class TrainConfig(BaseEPSConfig):
     early_stopping_patience: int = Field(default=50, description="Patience for early stopping")
     batch_size: int = Field(default=128, description="Batch size for training")
     batches_per_pseudoepoch: Union[int, None] = Field(default=None, description="Number of batches per pseudo-epoch. If None, it is set to dataset_size / batch_size. Must be divisible by num_gpus.")
+    test_batch_size: int = Field(default=512, description="Batch size for testing/inference")
     amp: bool = Field(default=True, description="Use mixed precision training")
     gradient_scale: int = Field(default=256, description="Gradient scaling factor")
     max_grad_norm: Optional[float] = Field(default=1.0, description="Maximum gradient norm")
@@ -104,7 +105,7 @@ class ExperimentConfig(BaseEPSConfig):
         return self.experiment_root / "outputs" / self.experiment_name / train_cfg.model_name 
     
     @property
-    def results_dir(self) -> Path:
+    def results_csv_path(self) -> Path:
         """Return the directory path for saving results."""
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
         return self.experiment_root / "results" / self.experiment_name / train_cfg.model_name / "results.csv"
