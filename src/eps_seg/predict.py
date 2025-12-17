@@ -12,21 +12,133 @@ from lightning.pytorch.callbacks import BasePredictionWriter
 from pathlib import Path
 import pandas as pd
 import os
+import tifffile as tiff
+import numpy as np
+import zarr
+from eps_seg.utils.outputs import zarr_to_tiff
+
 
 class PredictionWriterCallback(BasePredictionWriter):
     def __init__(self, exp_config: ExperimentConfig, ckpt_path: Path):
-        super().__init__(write_interval="epoch")
+        super().__init__(write_interval="batch")
         self.ckpt_path = ckpt_path
         self.exp_config = exp_config
+        self._writers = {}
+        self.out_dir = self.exp_config.outputs_dir / "predictions" / self.ckpt_path.stem
+        os.makedirs(self.out_dir, exist_ok=True)
+
+        self.chunks = (64, 128, 128)  # Z, Y, X chunk size for zarr arrays
+        
+        self.rank_chunks = {}
+
+        self.final_out_path = self.out_dir / "prediction.zarr"
+
+        self._get_rank_out_path = lambda rank: self.out_dir / f"rank_{rank}.zarr"
+        #self.final_out_path = self.out_dir / "prediction.zarr"
     
-    # TODO: Continue
     def setup(self, trainer, pl_module, stage):
-        super().setup(trainer, pl_module, stage)
-        if stage == "predict":
-            self.out_dir = self.exp_config.outputs_dir / "predictions" / self.ckpt_path.stem
-            os.makedirs(self.out_dir, exist_ok=True)
+        if stage != "predict":
+            return
+        
 
+        # Get volume shape from datamodule
+        dm = trainer.datamodule
+        pred_shape = trainer.datamodule.data["test_images"][dm.cfg.test_keys[0]].shape  # (Z, Y, X)
+        rank = trainer.global_rank
+        self.rank_path = self._get_rank_out_path(rank)
+        self.rank_chunks[rank] = set()
+        
+        self.z = zarr.open(
+            self.rank_path,
+            mode='w',
+            shape=pred_shape,
+            dtype=np.int8, # Support -1 label
+            fill_value=-1,
+            chunks=self.chunks,
+        )
 
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
+        preds = prediction["preds"].cpu().numpy().astype(np.int8)  # (B,)
+        coords = prediction["coords"].cpu().numpy().astype(np.intp)  # (B,3)
+
+        zi, yi, xi = coords.T  # (B,)
+        self.z[zi, yi, xi] = preds # Write predictions to zarr array
+
+        # Track written chunks for merging
+        cz = zi // self.chunks[0]
+        cy = yi // self.chunks[1]
+        cx = xi // self.chunks[2]
+        for zc, yc, xc in zip(cz, cy, cx):
+            self.rank_chunks[trainer.global_rank].add((zc, yc, xc))
+        
+
+    def on_predict_end(self, trainer, pl_module):
+        """
+            Only on rank 0, merge the ranks outputs and write.
+        """
+        
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # Wait for all ranks to finish writing
+            torch.distributed.barrier()
+
+        # Save written chunks for this rank
+        np.save(self.out_dir / f"rank_{trainer.global_rank}_chunks.npy", 
+                np.array(list(self.rank_chunks[trainer.global_rank]), dtype=np.int32))
+
+        if trainer.is_global_zero:
+            print("Merging rank outputs...")
+            self.merge(trainer)
+    
+    def merge(self, trainer):
+        """
+            Merge all ranks zarr outputs into a final zarr array.
+            Should be ran ONLY on rank 0.
+        """
+        if not trainer.is_global_zero:
+            return
+        print("Merging Zarr ranks...")
+
+        rank0 = zarr.open(self._get_rank_out_path(0), mode="r")
+    
+        final = zarr.open(
+            self.final_out_path,
+            mode="w",
+            shape=rank0.shape,
+            chunks=rank0.chunks,
+            dtype=rank0.dtype,
+            fill_value=-1,
+        )
+
+        final[:] = rank0[:]
+
+        for rank in range(1, trainer.world_size):
+            z = zarr.open(self._get_rank_out_path(rank), mode="r")
+            chunks = np.load(self.out_dir / f"rank_{rank}_chunks.npy")
+
+            for cz, cy, cx in chunks:
+                z0 = cz * self.chunks[0]
+                y0 = cy * self.chunks[1]
+                x0 = cx * self.chunks[2]
+
+                sel = (
+                    slice(z0, z0 + self.chunks[0]),
+                    slice(y0, y0 + self.chunks[1]),
+                    slice(x0, x0 + self.chunks[2]),
+                )
+
+                data = z[sel]
+                if not np.any(data != -1):
+                    continue
+
+                out = final[sel]
+                mask = data != -1
+                out[mask] = data[mask]
+                final[sel] = out
+
+        # Convert final zarr to tiff
+        print("Converting final Zarr to TIFF...")
+        zarr_to_tiff(self.final_out_path)
+        print(f"Saved final prediction TIFF to: {self.final_out_path.with_suffix('.tif')}")
 
 class TestWriterCallback(L.Callback):
     """
@@ -148,12 +260,15 @@ def test_predict(exp_config: ExperimentConfig,
                                 strategy=strategy,
                                 callbacks=callbacks,
                                 #limit_test_batches=4,
-                                #limit_predict_batches=4,
+                                #limit_predict_batches=12,
                                 )
             if mode == "test":
                 trainer.test(model=model, datamodule=dm)
             elif mode == "predict":
-                trainer.predict(model=model, datamodule=dm)
+                trainer.predict(model=model, 
+                                datamodule=dm,
+                                return_predictions=False, # Prevents gathering all predictions in memory. We write them on the fly via callback.
+                                )
 
 def main():
     parser = argparse.ArgumentParser(description="Predict / Test EPS-Seg Model")

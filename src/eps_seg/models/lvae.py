@@ -180,10 +180,15 @@ class LVAEModel(L.LightningModule):
         super().on_test_epoch_end()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=True):
-        x, labels, coords, _ = batch
+        x, labels, _, coords = batch
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
-        return self.forward(x, y=None, validation_mode=False), batch # Return batch in predictions to reconstruct image
+        outputs = self.forward(x, y=None, validation_mode=False)
+        preds = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
+        outputs["labels"] = labels
+        outputs["coords"] = coords
+        outputs["preds"] = preds
+        return outputs
 
     def on_train_epoch_end(self):
         if self.trainer.is_global_zero:
