@@ -155,7 +155,7 @@ class LVAEModel(L.LightningModule):
         self.test_dice_score.reset()
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
-        x, y, s, c = batch
+        x, y, s, c, key = batch
         x = (x - self.model.data_mean) / self.model.data_std
         outputs = self.forward(x, 
                              y=None, 
@@ -165,6 +165,7 @@ class LVAEModel(L.LightningModule):
         outputs["preds"] = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
         outputs["labels"] = y
         outputs["coords"] = c
+        outputs["keys"] = key
         self.current_test_outputs.append(outputs)
         self.test_dice_score.update(outputs["preds"].to(y.device), y)
         return outputs
@@ -180,7 +181,7 @@ class LVAEModel(L.LightningModule):
         super().on_test_epoch_end()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=True):
-        x, labels, _, coords = batch
+        x, labels, _, coords, key = batch
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
         outputs = self.forward(x, y=None, validation_mode=False)
@@ -188,6 +189,7 @@ class LVAEModel(L.LightningModule):
         outputs["labels"] = labels
         outputs["coords"] = coords
         outputs["preds"] = preds
+        outputs["keys"] = key
         return outputs
 
     def on_train_epoch_end(self):

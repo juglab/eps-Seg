@@ -35,7 +35,45 @@ class EPSSegDataModule(L.LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
         self.predict_dataset = None
-        
+
+         # Define cache paths
+        self.cache_dirs = {
+            "train_idx": Path(self.cfg.cache_dir) / "train_idx.npy",
+            "val_idx": Path(self.cfg.cache_dir) / "val_idx.npy",
+            "data_mean": Path(self.cfg.cache_dir) / "data_mean.npy",
+            "data_std": Path(self.cfg.cache_dir) / "data_std.npy",    
+        }
+        for key in self.cfg.train_keys:
+            self.cache_dirs[f"{key}_normalized"] = Path(self.cfg.cache_dir) / f"{key}_normalized.tif"
+            self.cache_dirs[f"{key}_labels"] = Path(self.cfg.cache_dir) / f"{key}_labels.tif"
+
+    def _check_cache_dir(self):
+        """
+            Ensure data_dir and cache_dir exist and has data in it.
+        """
+        for path in self.cache_dirs.values():
+            if not path.exists():
+                raise FileNotFoundError(f"Cache file {path} does not exist. Recaching required.")
+
+    def prepare_data(self):
+        """
+            Prepare data for training, validation, testing, and prediction.
+            In EPSSeg, this means caching dataset splits to a local folder that is accessible by all nodes.
+            DO NOT assign any class state in this method.
+        """
+        if self.cfg.enable_cache:
+            try:
+                print(f"Checking cache directory at {self.cfg.cache_dir}...")
+                self._check_cache_dir()
+                print("Cache directory is valid. Skipping caching.")
+            except Exception as e:
+                print("Cache directory is invalid or incomplete. Loading original data and caching...")
+                data_to_cache = self._load_original_dataset_split(split='trainval')
+                self._cache_dataset_splits(data_to_cache)
+                print("Caching complete.")
+        else:
+            print("Caching is disabled. Skipping caching step.")
+
     def get_data_statistics(self) -> Tuple[float, float]:
         """
             Returns the data mean and standard deviation.
@@ -45,7 +83,7 @@ class EPSSegDataModule(L.LightningDataModule):
         return self.data_mean, self.data_std
     
     def train_dataloader(self):
-
+  
         train_sampler = ModeAwareBalancedAnchorBatchSampler(
                 self.train_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
@@ -66,6 +104,7 @@ class EPSSegDataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
+        
         val_sampler = ModeAwareBalancedAnchorBatchSampler(
                 self.val_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
@@ -156,7 +195,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 rng.shuffle(valid_indices)  # Shuffles in place
 
             # Compute split index
-            split_idx = int(0.85 * total_samples)
+            split_idx = int(self.cfg.train_to_val_ratio * total_samples)
 
             # Split the indices
             train_idx[key] = valid_indices[:split_idx]
@@ -181,48 +220,24 @@ class EPSSegDataModule(L.LightningDataModule):
             images[key] = (images[key] - data_mean) / data_std
         return images
     
-class BetaSegTrainDataModule(EPSSegDataModule):
-    def __init__(self, cfg: BetaSegDatasetConfig, train_cfg: TrainConfig):
-        super().__init__(cfg, train_cfg)
+    def _load_original_img_lbls(self, keys: List[str]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """
+            Load the original images and labels from data_dir according to the folder structure defined in the dataset config.
 
-        # Define cache paths
-        self.cache_dirs = {
-            "train_idx": Path(self.cfg.cache_dir) / "train_idx.npy",
-            "val_idx": Path(self.cfg.cache_dir) / "val_idx.npy",
-            "data_mean": Path(self.cfg.cache_dir) / "data_mean.npy",
-            "data_std": Path(self.cfg.cache_dir) / "data_std.npy",    
-        }
-        for key in self.cfg.train_keys:
-            self.cache_dirs[f"{key}_normalized"] = Path(self.cfg.cache_dir) / f"{key}_normalized.tif"
-            self.cache_dirs[f"{key}_labels"] = Path(self.cfg.cache_dir) / f"{key}_labels.tif"
-
-    def _check_cache_dir(self):
+            Args:
+                keys (list): List of keys (file names without extensions) to load.
+            Returns:
+                images (dict): Dictionary mapping keys to image arrays.
+                labels (dict): Dictionary mapping keys to label arrays.
         """
-            Ensure data_dir and cache_dir exist and has data in it.
-        """
-        for path in self.cache_dirs.values():
-            if not path.exists():
-                raise FileNotFoundError(f"Cache file {path} does not exist. Recaching required.")
-
-    def prepare_data(self):
-        """
-            Prepare data for training, validation, testing, and prediction.
-            In EPSSeg, this means caching dataset splits to a local folder that is accessible by all nodes.
-            DO NOT assign any class state in this method.
-        """
-        if self.cfg.enable_cache:
-            try:
-                print(f"Checking cache directory at {self.cfg.cache_dir}...")
-                self._check_cache_dir()
-                print("Cache directory is valid. Skipping caching.")
-            except Exception as e:
-                print("Cache directory is invalid or incomplete. Loading original data and caching...")
-                data_to_cache = self._load_original_dataset_split(split='trainval')
-                self._cache_dataset_splits(data_to_cache)
-                print("Caching complete.")
-        else:
-            print("Caching is disabled. Skipping caching step.")
-        
+        img_lbl_paths = self.cfg.get_image_label_paths(keys)
+        imgs = {}
+        lbls = {}
+        for key, (img_path, lbl_path) in img_lbl_paths.items():
+            imgs[key] = tiff.imread(img_path).astype(np.float16)
+            lbls[key] = tiff.imread(lbl_path).astype(np.float16)
+        return imgs, lbls
+    
     def setup(self, stage):
         """
             Setup the DataModule for different stages: 'fit', 'validate', 'test', 'predict'.
@@ -269,47 +284,68 @@ class BetaSegTrainDataModule(EPSSegDataModule):
             )
         if stage in ["test", "predict"]:
             # Define the mask for test dataset based on center slice, stepping, and half depth
-            # Only test on the first image in test_keys for now
-            # TODO: Can be easily extended for testing, but for prediction we need to track the image in the predict_step() function
-            if len(self.cfg.test_keys) != 1:
-                raise NotImplementedError("Currently only single test key is supported.")
-   
+            
+            # Currently, the only thing that differs between test and predict datasets is the region of interest (mask)
+            
+            
             if stage == "test":
                 # Define test region. Masking based on label is done in the dataset class
-                tcs = self.cfg.test_center_slice
-                tstp = self.cfg.test_stepping
-                thd = self.cfg.test_half_depth
-                mask = (slice(tcs-thd, tcs+thd+1, tstp),
-                            slice(None, None, tstp), 
-                            slice(None, None, tstp))
+               
                 # NOTICE: These images are NOT normalized! 
                 # Normalization is done in the test/predict dataset class using the statistics stored in the LVAE model
                 self.test_dataset = PredictionDataset(
-                    image=self.data[f"test_images"][self.cfg.test_keys[0]],
-                    label=self.data[f"test_labels"][self.cfg.test_keys[0]],
+                    images=self.data[f"test_images"],
+                    labels=self.data[f"test_labels"],
+                    keys=self.cfg.test_keys,
+                    masks=self._build_slice_mask(stage=stage),
                     patch_size=self.cfg.patch_size,
                     dim=self.cfg.dim,
-                    mask=mask,
                     ignore_lbl=-1,
                 )
             else:  # stage == "predict"
                 # Define predict region. Masking based on label is done in the dataset class
-                pcs = self.cfg.predict_center_slice
-                phd = self.cfg.predict_half_depth
-                mask = (slice(pcs-phd, pcs+phd+1),
-                        slice(None, None),
-                        slice(None, None))
+               
                 # NOTICE: These images are NOT normalized! 
                 # Normalization is done in the test/predict dataset class using the statistics stored in the LVAE model
                 # Also we use the same image for test and prediction to avoid loading twice
                 self.predict_dataset = PredictionDataset(
-                    image=self.data[f"test_images"][self.cfg.test_keys[0]],
-                    label=self.data[f"test_labels"][self.cfg.test_keys[0]],
+                    images=self.data[f"test_images"],
+                    labels=self.data[f"test_labels"],
+                    keys=self.cfg.test_keys,
+                    masks=self._build_slice_mask(stage=stage),
                     patch_size=self.cfg.patch_size,
                     dim=self.cfg.dim,
-                    mask=mask,
                     ignore_lbl=-1,
                 )
+
+    def _build_slice_mask(self, stage: str) -> Dict[str, Tuple[slice, slice, slice]]:
+        """
+            Build slice masks for test and predict datasets based on center slice, stepping, and half depth.
+            (Stepping is applied in all three dimensions for consistency, and it's only supported for testing but not prediction.)
+
+            Args:
+                stage (str): One of 'test' or 'predict'.
+            Returns:
+                masks (dict): Dictionary mapping keys to slice masks.
+        """
+        masks = {}
+        keys = self.cfg.test_keys # We use test_keys for both test and predict stages
+        assert stage in ['test', 'predict'], "Stage must be either 'test' or 'predict'."
+
+        for k, key in enumerate(keys):
+            cs = self.cfg.test_center_slices[k] if stage == "test" else self.cfg.predict_center_slices[k] # center slice of the region to segment
+            hd = self.cfg.test_half_depths[k] if stage == "test" else self.cfg.predict_half_depths[k] # half depth of the region to segment
+            stp = self.cfg.test_steppings[k] if stage == "test" else 1 # No stepping for prediction
+            if cs is None:
+                # If center slice is None, use the whole volume
+                masks[key] = (slice(None, None, stp),
+                              slice(None, None, stp),
+                              slice(None, None, stp))
+            else:
+                masks[key] = (slice(cs-hd, cs+hd+1, stp),
+                            slice(None, None, stp),
+                            slice(None, None, stp))
+        return masks
 
     def _cache_dataset_splits(self, data_to_cache: Dict):
         assert self.cfg.cache_dir is not None, (
@@ -338,7 +374,8 @@ class BetaSegTrainDataModule(EPSSegDataModule):
     def _load_original_dataset_split(self, split: Literal['trainval', 'test', 'predict']):
         """
             Defines how to load the original dataset splits from data_dir.
-            This function should be overridden in subclasses to implement dataset-specific loading logic.
+            This function should be overridden in subclasses to implement dataset-specific loading logic when passing key / path pairs from config is not enough.
+
             Args:
                 split (str): One of 'trainval', 'test', 'predict'.
             Returns:
@@ -352,7 +389,7 @@ class BetaSegTrainDataModule(EPSSegDataModule):
                                                                              result["trainval_labels"], 
                                                                              shuffle=self.cfg.dim == 2,
                                                                              )
-            self["data_mean"], result["data_std"] = self._compute_statistics(
+            result["data_mean"], result["data_std"] = self._compute_statistics(
                                                                              images=result["trainval_images"], 
                                                                              train_idx=result["train_idx"]
                                                                             )
@@ -397,35 +434,3 @@ class BetaSegTrainDataModule(EPSSegDataModule):
                 data[f"{split}_labels"][key] = tiff.imread(self.cache_dirs[f"{key}_labels"]).astype(np.float16)
             print(f"Loaded cached train/validation dataset splits from {self.cfg.cache_dir}.")
         return data
-
-    def _load_original_img_lbls(self, keys: List[str]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        """
-            Load the original images and labels from data_dir according to the folder structure.
-            Assumes images are stored as {data_dir}/{key}/{key}_source.tif
-            and labels are stored as {data_dir}/{key}/{key}_gt.tif
-
-            Args:
-                keys (list): List of keys (file names without extensions) to load.
-            Returns:
-                images (dict): Dictionary mapping keys to image arrays.
-                labels (dict): Dictionary mapping keys to label arrays.
-        """
-        data_dir = self.cfg.data_dir
-        img_paths = [Path(data_dir) / key / f"{key}_source.tif" for key in keys]
-        lbl_paths = [Path(data_dir) / key / f"{key}_gt.tif" for key in keys]
-        imgs = {
-            key: tiff.imread(path).astype(np.float16)
-            for key, path in zip(keys, img_paths)
-        }
-        lbls = {
-            key: tiff.imread(path).astype(np.float16)
-            for key, path in zip(keys, lbl_paths)
-        }
-        return imgs, lbls
-
-    
-
-    
-
-    
-

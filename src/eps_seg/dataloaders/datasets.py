@@ -313,13 +313,18 @@ class PredictionDataset(Dataset):
         image: (C,Z,H,W) or (Z,1,H,W)
 
             Args: 
-                image: np.ndarray
-                    Image volume of shape (C,Z,H,W) or (Z,H,W)
-                label: np.ndarray
-                    Label volume of shape (1,Z,H,W) or (Z,H,W)
-                mask: Union[slice, None]
-                    If slice, only consider this z slice for patch extraction (for faster testing).
-                    Constraint on label > -1 still apply.
+                images: dict of np.ndarrays
+                    Key: image name, 
+                    Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
+                labels: dict of np.ndarrays
+                    Key: image name,
+                    Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
+                keys: List[str] (optional)
+                    List of image names to keep ordering (if None, use keys from images dict).
+                masks: Dict[str, Union[slice, None]] (optional)
+                    Key: image name,
+                    Value: If slice, only consider this z slice for patch extraction (for faster testing).
+                    Constraint on label > -1 still apply. If None, consider all slices.
                 patch_size: int
                     Size of the extracted patches (assumed cubic or square).
                 dim: int
@@ -329,66 +334,89 @@ class PredictionDataset(Dataset):
     """
 
     def __init__(self,
-                 image, 
-                 label, 
-                 mask=Union[Tuple[slice], None], 
+                 images, 
+                 labels,
+                 keys: List[str] = None,
+                 masks: Dict[str, Union[slice, None]] = None,
                  patch_size=64, 
                  dim=2,
                  ignore_lbl=-1):
-
         self.dim = dim
         self.ignore_lbl = ignore_lbl
-        self.image = image
-        self.label = label        
-        self.mask = mask
+        self.images = images
+        self.labels = labels        
+        self.masks = masks
 
         self.ps = int(patch_size)
         assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
         self.half = self.ps // 2  # 32 for 64x64 -> center at (31,31)
+       
+        self.images = self._fix_images_shape(self.images)
+        self.labels = self._fix_images_shape(self.labels)
+        self.masks = self._fix_mask_shape(self.masks)
 
-        if image.ndim == 3:
-            Z, H, W = self.image.shape
-            C = 1
-            self.image = self.image[None, ...]  # add channel dim
-        else:
-            C, Z, H, W = self.image.shape
+        # Precompute all valid centers for all images
+        self.centers = []
 
-        if self.label.ndim == 3:
-            self.label = self.label[None, ...]  # add channel dim
+        for k in (self.images.keys() if keys is None else keys):
+            centers = self._get_valid_centers(
+                mask=self.masks.get(k, None) if self.masks is not None else None,
+                label=self.labels[k]
+            )
+            for c in centers:
+                self.centers.append((k, c[0], c[1], c[2]))  # (key, z, y, x)
 
-        if self.mask is not None and len(self.mask) == 3:
-                self.mask = (slice(None),) + self.mask  # add channel dim to mask
-
-        assert self.image.shape[-dim:] == self.label.shape[-dim:], "Image and label must have same (Z),H,W"
-
-        # Valid centers are:
-        # 1) label != -1
-        final_mask = (self.label != -1)
-        # 2) full patch inside bounds
+    def _get_valid_centers(self, mask, label):
+        """
+            Get the valid centers for each image based on the mask and label.
+            A valid center is one where:
+                - label != ignore_lbl
+                - full patch is inside bounds
+                - mask is True (if provided)
+        """
+        final_mask = (label != self.ignore_lbl)
+        C, Z, H, W = label.shape
+        # full patch inside bounds
         final_mask[:, :, :, :self.half] = False
         final_mask[:, :, :, W - self.half:] = False
         final_mask[:, :, :self.half, :] = False
         final_mask[:, :, H - self.half:, :] = False
         final_mask[:, :self.half, :, :] = False
         final_mask[:, Z - self.half:, :, :] = False
-        
-        if self.mask is not None:
+
+        if mask is not None:
             mask_array = np.zeros_like(final_mask, dtype=bool)
-            mask_array[self.mask] = True
+            mask_array[mask] = True
             final_mask = final_mask & mask_array
 
         _, zs, ys, xs = np.where(final_mask)
-        self.centers = np.stack([zs, ys, xs], axis=1).astype(np.int32)
+        centers = np.stack([zs, ys, xs], axis=1).astype(np.int32)
+        return centers
 
+    def _fix_images_shape(self, images: dict) -> dict:
+        for key, image in images.items():
+            if image.ndim == 3:
+                images[key] = image[None, ...]  # add channel dim
+        return images
+
+    def _fix_mask_shape(self, masks: dict) -> dict:
+        if masks is not None:
+            for key, mask in masks.items():
+                if mask is not None and len(mask) == 3:
+                    masks[key] = (slice(None),) + mask  # add channel dim
+        return masks
+    
     def __len__(self):
         return len(self.centers)
+
 
     def __getitem__(self, idx):
         """
             Returns a tuple:
             patch, center_label, coordinates of center and segment for compatibility with SemisupervisedDataset.
         """
-        z, y, x = self.centers[idx]
+        
+        key, z, y, x = self.centers[idx]
 
         if self.dim == 3:
             z0, z1 = z - self.half, z + self.half
@@ -397,14 +425,14 @@ class PredictionDataset(Dataset):
 
         y0, y1 = y - self.half, y + self.half
         x0, x1 = x - self.half, x + self.half
-        patch = self.image[:, z0:z1, y0:y1, x0:x1]
+        patch = self.images[key][:, z0:z1, y0:y1, x0:x1]
         patch = torch.from_numpy(patch).float()
 
-        segment = self.label[:, z0:z1, y0:y1, x0:x1]
+        segment = self.labels[key][:, z0:z1, y0:y1, x0:x1]
         segment = torch.from_numpy(segment).long()
 
 
-        center_label = torch.tensor(self.label[:, z, y, x]).long()
+        center_label = torch.tensor(self.labels[key][:, z, y, x]).long()
         # Drop channel dim to get [B, D, H, W] in the DataLoader batches.
         # TODO: For multichannel this will return different shapes!
         if self.dim == 2:
@@ -413,4 +441,4 @@ class PredictionDataset(Dataset):
 
         # return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
         coords = torch.stack([torch.tensor(z), torch.tensor(y), torch.tensor(x)])
-        return patch, center_label, segment, coords
+        return patch, center_label, segment, coords, key
