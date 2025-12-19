@@ -151,7 +151,6 @@ class LVAEModel(L.LightningModule):
 
     def on_test_epoch_start(self):
         super().on_test_epoch_start()
-        self.current_test_outputs = []
         self.test_dice_score.reset()
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
@@ -166,7 +165,6 @@ class LVAEModel(L.LightningModule):
         outputs["labels"] = y
         outputs["coords"] = c
         outputs["keys"] = key
-        self.current_test_outputs.append(outputs)
         self.test_dice_score.update(outputs["preds"].to(y.device), y)
         return outputs
 

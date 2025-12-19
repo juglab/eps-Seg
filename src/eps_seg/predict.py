@@ -28,16 +28,19 @@ class PredictionWriterCallback(BasePredictionWriter):
         self.exp_config = exp_config
         _, dataset_config, _ = exp_config.get_configs()
         self.test_keys = dataset_config.test_keys
-        self._writers: Dict[str, zarr.Array] = {} # Dict[test_key, zarr.Array]
+        self._writers: Dict[str, zarr.Array] = {} # Dict[test_key, zarr.Array], zarr writers for each test_key for the current rank
         self.out_dir = self.exp_config.outputs_dir / "predictions" / self.ckpt_path.stem
         os.makedirs(self.out_dir, exist_ok=True)
-
+        
+        # TODO: We could gain even more speed by tuning chunk sizes based rank batch sizes and volume sizes
         self.chunks = (64, 128, 128)  # Z, Y, X chunk size for zarr arrays
         
-        self.rank_chunks: Dict[str, Dict[int, Set[Tuple[int, int, int]]]] = {tk: {} for tk in self.test_keys} # Dict[test_key, Dict[rank, Set[Tuple[cz, cy, cx]]]]
-        self.final_out_paths: Dict[str, Path] = {tk: self.out_dir / f"{tk}.zarr" for tk in self.test_keys} 
-
+        # Zarr chunks written by this rank for each test_key
+        self.rank_chunks: Dict[str, Set[Tuple[int, int, int]]] = {tk: set() for tk in self.test_keys} # Dict[test_key, Set[(cz, cy, cx)]]
+        # Corresponding cache Zarr output paths for each rank and test_key
         self._get_rank_out_path = lambda rank, test_key: self.out_dir / f"rank_{rank}_{test_key}.zarr"
+        # Final output Zarr paths for each test_key
+        self.final_out_paths: Dict[str, Path] = {tk: self.out_dir / f"{tk}.zarr" for tk in self.test_keys} 
     
     def setup(self, trainer, pl_module, stage):
         # Called on each rank before prediction starts
@@ -46,7 +49,7 @@ class PredictionWriterCallback(BasePredictionWriter):
         
         # Get volume shapes from datamodule
         dm = trainer.datamodule
-        pred_shapes = {tk: trainer.datamodule.data["test_images"][tk].shape for tk in dm.cfg.test_keys}  # Dict[test_key, (Z, Y, X)]
+        pred_shapes = {tk: trainer.datamodule.data["test_images"][tk].shape for tk in dm.cfg.test_keys}  # Dict[test_key, (C, Z, Y, X)]
         
         rank = trainer.global_rank
 
@@ -56,12 +59,11 @@ class PredictionWriterCallback(BasePredictionWriter):
         for test_key in self.test_keys:
              # Initialize zarr arrays for this rank and test_key
             self.rank_paths[test_key] = self._get_rank_out_path(rank, test_key)
-            self.rank_chunks[test_key][rank] = set()
 
             self._writers[test_key] = zarr.open(
                 self.rank_paths[test_key],
                 mode='w',
-                shape=pred_shapes[test_key],
+                shape=pred_shapes[test_key][-3:], # (Z,Y,X), ignores channels
                 dtype=np.int8, # Support -1 label
                 fill_value=-1,
                 chunks=self.chunks,
@@ -71,17 +73,31 @@ class PredictionWriterCallback(BasePredictionWriter):
         
         preds = prediction["preds"].cpu().numpy().astype(np.int8)  # (B,)
         coords = prediction["coords"].cpu().numpy().astype(np.intp)  # (B,3)
-        test_keys = prediction["keys"] # Tuple containing corresponding filenames for each prediction in the batch
+        test_keys = np.asarray(prediction["keys"]) # Tuple containing corresponding filenames for each prediction in the batch
 
-        for i_tk, tk in enumerate(test_keys):
-            zi, yi, xi = coords[i_tk]  # (3,)
-            self._writers[tk][zi, yi, xi] = preds[i_tk]    
+        # A single batch may contain samples from different test volumes
+        # Group predictions by test_key so we can write them in a single operation
 
-            # Track written chunks for merging
+        for tk in np.unique(test_keys):
+            mask = test_keys == tk
+            preds_k = preds[mask]
+            coords_k = coords[mask]
+
+            zi, yi, xi = coords_k.T  # (N,)
+
+            # TODO: This could be optimized by writing every chunk at once, instead of every batch at a time
+            self._writers[tk][zi, yi, xi] = preds_k
+        
+            # Track written chunks for merging later
             cz = zi // self.chunks[0]
             cy = yi // self.chunks[1]
             cx = xi // self.chunks[2]
-            self.rank_chunks[tk][trainer.global_rank].add((cz, cy, cx))
+
+            # This updates chunks without duplicates
+            unique_chunks = np.unique(np.column_stack((cz, cy, cx)), axis=0)
+            self.rank_chunks[tk].update(map(tuple, unique_chunks))
+
+                
         
     def on_predict_end(self, trainer, pl_module):
         """
@@ -162,7 +178,9 @@ class TestWriterCallback(L.Callback):
         self.exp_config = exp_config
         self.out_csv_path = exp_config.results_csv_path
         self.ckpt_path = ckpt_path
-        
+        self.out_preds_csv = self.exp_config.outputs_dir / "test_predictions" / (self.ckpt_path.stem+".csv") 
+        self._predictions_csv_header_written = False
+
     def setup(self, trainer, pl_module, stage):
         super().setup(trainer, pl_module, stage)
         if stage == "test":
@@ -173,12 +191,51 @@ class TestWriterCallback(L.Callback):
             else:
                 self.results_df = pd.DataFrame(columns=["exp_name", "model_ckpt", "datetime"])
             # Prepare outputs csv
-            self.out_preds_csv = self.exp_config.outputs_dir / "test_predictions" / (self.ckpt_path.stem+".csv")
+                        
             os.makedirs(self.out_preds_csv.parent, exist_ok=True)
-            self.predictions_df = pd.DataFrame()
-                
+            self._predictions_csv_header_written = False
+
+    
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx = 0):
+        """
+            Writes predictions for the current batch to a CSV file.
+        """
+        # Save a batch of predictions to CSV
+        
+        class_probs = outputs["class_probabilities"].cpu().numpy()
+        true_labels = outputs["labels"].cpu().numpy()
+        pred_labels = outputs["preds"].cpu().numpy()
+        coords = outputs["coords"].cpu().numpy()
+        test_keys = outputs["keys"]
+
+        write_dict = {
+            "test_key": test_keys,
+            "coords_x": coords[:, -1],
+            "coords_y": coords[:, -2],
+            "coords_z": coords[:, -3],
+            "true_label": true_labels.squeeze(),
+            "pred_label": pred_labels.squeeze(),
+        }
+
+        for i in range(class_probs.shape[1]):
+            write_dict[f"class_prob_{i}"] = class_probs[:, i]
+
+        df = pd.DataFrame(write_dict)
+        # Append to predictions dataframe
+        df.to_csv(
+            self.out_preds_csv,
+            mode="a",
+            header=not self._predictions_csv_header_written,
+            index=False,
+        )
+        self._predictions_csv_header_written = True
+        
+
     def on_test_end(self, trainer, pl_module):
         super().on_test_end(trainer, pl_module)
+        """
+            Collects metrics and saves to results CSV.
+        """
 
         # Collect metrics
         metrics = trainer.callback_metrics
@@ -196,25 +253,7 @@ class TestWriterCallback(L.Callback):
         os.makedirs(self.out_csv_path.parent, exist_ok=True)
         self.results_df.to_csv(self.out_csv_path, index=False)
 
-        # Save predictions
-        all_outputs = pl_module.current_test_outputs
-        print(f"Writing test predictions to: {self.out_preds_csv}")
-        for batch_idx, output in enumerate(all_outputs):
-            write_dict = {}
-            class_probs = output["class_probabilities"].cpu().numpy()
-            true_labels = output["labels"].cpu().numpy()
-            pred_labels = output["preds"].cpu().numpy()
-            coords = output["coords"].cpu().numpy()
-            write_dict["coords_x"] = coords[:, -1]
-            write_dict["coords_y"] = coords[:, -2]
-            write_dict["coords_z"] = coords[:, -3]
-            write_dict["true_label"] = true_labels.squeeze()
-            write_dict["pred_label"] = pred_labels.squeeze()
-            for i in range(class_probs.shape[1]):
-                write_dict[f"class_prob_{i}"] = class_probs[:, i]
-            self.predictions_df = pd.concat([self.predictions_df, pd.DataFrame(write_dict)], ignore_index=True)
-        self.predictions_df.to_csv(self.out_preds_csv, index=False)
-        print(f"Saved test predictions to: {self.out_preds_csv}")
+       
 
 def test_predict(exp_config: ExperimentConfig, 
                  predict: bool = False, 
