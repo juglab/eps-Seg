@@ -80,7 +80,7 @@ class EPSSegDataModule(L.LightningDataModule):
             This function is called from the model during setup, to register the statistics as buffers.
             Mean and std are then used during inference for normalization.
         """
-        return self.data_mean, self.data_std
+        return self.data["data_mean"], self.data["data_std"]
     
     def train_dataloader(self):
   
