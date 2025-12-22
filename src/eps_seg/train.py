@@ -129,7 +129,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
                     ),
                 LearningRateMonitor(logging_interval='step'),
                 ThresholdSchedulerCallback(),
-                # RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
+                RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
                 ],
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
