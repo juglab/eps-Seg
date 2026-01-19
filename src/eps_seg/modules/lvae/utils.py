@@ -372,12 +372,44 @@ def get_normalized_tensor(img, model, device):
     test_images = (test_images - data_mean) / data_std
     return test_images
 
-def compute_kl_loss(q, p, label=None):
-    pass
+
+def compute_kl_loss(q, p, probabilities, label=None, conv_mult=2):
+    
+    kl_loss_per_layer = []
+    
+    for layer, (q_dist, p_dist) in enumerate(zip(q, p)):
+        if layer == len(q) - 1:
+            n_components = probabilities.size(-1)
+            prior_probs = torch.ones(n_components, device=label.device) / n_components
+            
+            kl_divergences = [
+                    kl_divergence(q_dist, p_i).mean(dim=(-3, -2, -1) if conv_mult == 2 else (-4, -3, -2, -1)) for p_i in p_dist
+                ]
+            kl_divergences = torch.stack(kl_divergences, dim=-1)
+
+            if label is not None:
+                valid_mask = label >= 0
+                if valid_mask.any():
+                    kl = kl_divergences[valid_mask, label[valid_mask].long()].mean()
+                else:
+                    kl = torch.tensor(0.0)
+            else:
+                kl = torch.tensor(0.0)
+                
+            m = 0.5 * (probabilities + prior_probs)
+            js_div = 0.5 * torch.sum(probabilities * torch.log(probabilities / (m + 1e-10)), dim=1) + 0.5 * torch.sum(
+                prior_probs * torch.log(prior_probs / (m + 1e-10)), dim=1
+            )
+
+            kl_loss_per_layer.append(kl + js_div.mean())
+        else:
+            kl_loss_per_layer.append(kl_divergence(q_dist, p_dist).mean())
+
+    return torch.stack(kl_loss_per_layer)
 
 
 def compute_ce_loss(logits, labels):
-    pass
+    return F.cross_entropy(logits, labels, ignore_index=-1)
 
 
 def compute_cl_loss(
@@ -392,16 +424,17 @@ def compute_cl_loss(
     cl_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
     return cl_loss
 
+
 def pos_neg_loss(mus, labels, margin=5.0):
     device = mus[0].device
-    labeled_mask = labels[-1] != -1
+    labeled_mask = labels != -1
     labeled_indices = torch.nonzero(labeled_mask, as_tuple=False).squeeze(-1)
 
     # If fewer than 2 labeled samples, there are no pairs to compare
     if labeled_indices.numel() < 2:
         return torch.tensor(0.0, device=device, dtype=torch.float32), {}
 
-    labels_l = labels[-1][labeled_indices]
+    labels_l = labels[labeled_indices]
     classes = torch.unique(labels_l)
 
     # 2) Build positive-pair boolean matrix (diag excluded)

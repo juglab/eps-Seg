@@ -885,7 +885,6 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         super().__init__(layer_number, c_in, c_vars, c_out, conv_mult, kernel, training_mode)
         self.n_components = n_components
         self.seg_head_dim = seg_head_dim
-        self.prior_probs = torch.ones(n_components, device=self.device) / n_components
         self.conditional_layer = ConditionalPrior(
             c_in=c_in,
             c_vars=c_vars,

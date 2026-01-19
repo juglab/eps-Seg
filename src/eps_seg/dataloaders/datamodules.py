@@ -268,6 +268,7 @@ class EPSSegDataModule(L.LightningDataModule):
             radius=self.train_cfg.initial_radius,
             dim=self.cfg.dim,
             samples_per_class=self.cfg.samples_per_class_training,
+            n_neighbors=self.cfg.n_neighbors
             )
         if stage in ["fit", "validate"]:
             self.val_dataset = SemisupervisedDataset(
@@ -281,6 +282,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 indices_dict=self.data["val_idx"],
                 dim=self.cfg.dim,
                 samples_per_class=self.cfg.samples_per_class_validation,
+                n_neighbors=self.cfg.n_neighbors
             )
         if stage in ["test", "predict"]:
             # Define the mask for test dataset based on center slice, stepping, and half depth

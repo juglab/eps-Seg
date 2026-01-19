@@ -109,7 +109,7 @@ class SemisupervisedDataset(Dataset):
         else:
             coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
             patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
-            labels = torch.tensor([g["labels"][0]] + [-1]*7, dtype=torch.long)  # [4]
+            labels = torch.tensor([g["labels"][0]] + [-1]*self.n_neighbors, dtype=torch.long)  # [4]
             segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
             return patches, labels, segments, coords
 

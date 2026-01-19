@@ -2,8 +2,9 @@ import numpy as np
 import torch
 from torch import nn
 from typing import Type, Union
-from eps_seg.modules.lvae.likelihoods import GaussianLikelihood  
+from eps_seg.modules.lvae.likelihoods import GaussianLikelihood
 from torchinfo import summary
+import torch.nn.functional as F
 
 
 from eps_seg.modules.lvae.utils import (
@@ -26,12 +27,13 @@ from eps_seg.modules.lvae.layers import (
 )
 from eps_seg.config import LVAEConfig
 
+
 class LadderVAE(nn.Module):
     def __init__(self, cfg: LVAEConfig):
         super().__init__()
         self.cfg = cfg
         self.training_mode = cfg.training_mode
-    
+
         self.n_layers = cfg.n_layers
         self.z_dims = cfg.z_dims
         self.blocks_per_layer = cfg.blocks_per_layer
@@ -65,16 +67,16 @@ class LadderVAE(nn.Module):
         self.use_contrastive_learning = cfg.use_contrastive_learning
         self.margin = cfg.margin
         self.n_components = cfg.n_components
-        self.learnable_thetas = True 
+        self.learnable_thetas = True
         self.seg_features = cfg.seg_features
         self.feature_spatial_size = cfg.feature_spatial_size
-        
+
         # Derived paramters
         self.input_array_shape = cfg.img_shape
         self.likelihood_form = "gaussian"
-       
-        #assert self.data_std is not None, "Data std is not specified"
-        #assert self.data_mean is not None, "Data mean is not specified"
+
+        # assert self.data_std is not None, "Data std is not specified"
+        # assert self.data_mean is not None, "Data mean is not specified"
         assert self.conv_mult in [
             2,
             3,
@@ -84,11 +86,10 @@ class LadderVAE(nn.Module):
             2,
             3,
         ], "Please specify correct number of input channels"
- 
+
         self.build_architecture()
 
     def build_architecture(self):
-        
         self.downsample = [1] * self.n_layers
 
         # Downsample by a factor of 2 at each downsampling operation
@@ -104,8 +105,12 @@ class LadderVAE(nn.Module):
         stride = 1 if self.no_initial_downscaling else 2
         self.first_bottom_up = nn.Sequential(
             # self.conv_type(color_ch, n_filters, 5, padding=2, stride=stride),
-            self.conv_type(self.color_ch, self.n_filters, 5, padding=2, stride=1),  # No stride here
-            BlurPool(self.n_filters, stride=stride, dim=self.conv_mult),  # Add BlurPool for downsampling
+            self.conv_type(
+                self.color_ch, self.n_filters, 5, padding=2, stride=1
+            ),  # No stride here
+            BlurPool(
+                self.n_filters, stride=stride, dim=self.conv_mult
+            ),  # Add BlurPool for downsampling
             self.nonlin(),
             BottomUpDeterministicResBlock(
                 c_in=self.n_filters,
@@ -125,7 +130,9 @@ class LadderVAE(nn.Module):
         self.feature_selection_layers = nn.ModuleList([])
 
         # Z dimensions for stochastic layers are downscaled by factor 2
-        self.head_z_dims =  int(self.input_array_shape[-1]/(2**self.n_layers)) # if isotropic, better to get size of x
+        self.head_z_dims = int(
+            self.input_array_shape[-1] / (2**self.n_layers)
+        )  # if isotropic, better to get size of x
 
         for i in range(self.n_layers):
             # Whether this is the top layer
@@ -135,35 +142,35 @@ class LadderVAE(nn.Module):
             # It's a sequence of residual blocks (BottomUpDeterministicResBlock)
             # possibly with downsampling between them.
             new_layer = BottomUpLayer(
-                    layer_number = i,
-                    n_res_blocks=self.blocks_per_layer,
-                    n_filters=self.n_filters,
-                    downsampling_steps=self.downsample[i],
-                    conv_mult=self.conv_mult,
-                    nonlin=self.nonlin,
-                    batchnorm=self.batchnorm,
-                    dropout=self.dropout,
-                    res_block_type=self.res_block_type,
-                    gated=self.use_gated_convs,
-                    grad_checkpoint=self.use_grad_checkpoint,
-                )
+                layer_number=i,
+                n_res_blocks=self.blocks_per_layer,
+                n_filters=self.n_filters,
+                downsampling_steps=self.downsample[i],
+                conv_mult=self.conv_mult,
+                nonlin=self.nonlin,
+                batchnorm=self.batchnorm,
+                dropout=self.dropout,
+                res_block_type=self.res_block_type,
+                gated=self.use_gated_convs,
+                grad_checkpoint=self.use_grad_checkpoint,
+            )
             self.bottom_up_layers.append(new_layer)
 
             new_layer = FeatureSubsetSelectionLayer(
-                    layer_number = i,
-                    crop_size=self.feature_spatial_size[i],
-                    enabled=True,
-                )
+                layer_number=i,
+                crop_size=self.feature_spatial_size[i],
+                enabled=True,
+            )
             self.feature_selection_layers.append(new_layer)
 
             # Add top-down stochastic layer at level i.
             # FIXME: Review commented out parameters and reimplement
             self.top_down_layers.append(
                 TopDownLayer(
-                    layer_number = i,
+                    layer_number=i,
                     z_dim=self.z_dims[i],
                     seg_head_dim=self.head_z_dims,
-                    #n_layers=self.n_layers,
+                    # n_layers=self.n_layers,
                     n_res_blocks=self.blocks_per_layer,
                     n_filters=self.n_filters,
                     is_top_layer=is_top,
@@ -205,18 +212,20 @@ class LadderVAE(nn.Module):
                     grad_checkpoint=self.use_grad_checkpoint,
                 )
             )
-        
+
         self.final_top_down = nn.Sequential(*modules)
         self.segmentation_head = SegmentationHead(
-                in_channels=self.n_filters,
-                n_classes=self.n_components,
-                conv_mult=self.conv_mult,
-                hidden_channels=int(self.n_filters/2),
-                n_layers=self.n_layers,
-                kernel=1,
-            )
+            in_channels=self.n_filters,
+            n_classes=self.n_components,
+            conv_mult=self.conv_mult,
+            hidden_channels=int(self.n_filters / 2),
+            n_layers=self.n_layers,
+            kernel=1,
+        )
         # Define likelihood
-        self.likelihood = GaussianLikelihood(self.n_filters, self.color_ch, self.conv_mult)
+        self.likelihood = GaussianLikelihood(
+            self.n_filters, self.color_ch, self.conv_mult
+        )
 
     def increment_global_step(self):
         """Increments global step by 1."""
@@ -234,54 +243,52 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-
     def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99):
         """
-            Forward pass through the LVAE model.
+        Forward pass through the LVAE model.
 
-            Args:
-                x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
-                y: Optional labels tensor
-                validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
-                confidence_threshold: Confidence threshold for assigning pseudo-labels
+        Args:
+            x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
+            y: Optional labels tensor
+            validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
+            confidence_threshold: Confidence threshold for assigning pseudo-labels
         """
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
         # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
         mask_input = self.training or validation_mode
         x_orig = x if mask_input else None
         x = self._mask_input(x) if mask_input else x
-        
+
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
         x_pad = self.pad_input(x, self.conv_mult)
         # Bottom-up inference: return list of length n_layers (bottom to top)
         bu_values = self.bottomup_pass(x_pad)
-       
+
         # Top-down inference/generation
-        out, td_data = self.topdown_pass(
-            y, bu_values
-        )
-        
+        out, td_data = self.topdown_pass(y, bu_values)
+
         # get logits from segmentation head
-        if self.seg_features == 'mu':
-            logits = self.get_logits(td_data['mu'])
-        elif self.seg_features == 'bu':
-            logits = self.get_logits(bu_values)
+        if self.seg_features == "mu":
+            logits, features = self.get_logits(td_data["mu"])
+        elif self.seg_features == "bu":
+            logits, features = self.get_logits(bu_values)
         else:
             KeyError(f"Unknown segmentation features type: {self.seg_features}")
-            
-        if self.training_mode == 'semisupervised' and (self.training or validation_mode):
-            # get pseudo-labels
-            pseudo_labels = self.get_pseudo_labels(td_data['mu'], threshold=confidence_threshold)
-        
 
-        
+        if self.training_mode == "semisupervised" and self.training:
+            # get pseudo-labels
+            pseudo_labels = self.get_pseudo_labels(
+                td_data["mu"][-1], y, threshold=confidence_threshold
+            )
+        else:
+            pseudo_labels = y
+
         # Restore original image size
         out = crop_img_tensor(out, img_size)
         # Log likelihood and other info (per data point)
 
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        kl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
 
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
@@ -290,26 +297,37 @@ class LadderVAE(nn.Module):
         inpainting_loss = None
         if mask_input:
             # 3) inpainting loss is centre of -loglikelihood
-            # FIXME: This "out" is not a dictionary. 
+            # FIXME: This "out" is not a dictionary.
             recons_sep = -ll
             inpainting_loss = self._centre_crop(recons_sep).mean()
 
-        if self.training or validation_mode: # TODO: Merge with above condition?
+        if self.training or validation_mode:  # TODO: Merge with above condition?
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
             # kl = torch.stack(td_data["kl"]).sum(0)
             # if self.kl_free_bits > 0:
             #     kl = free_bits_kl(kl, self.kl_free_bits)
-        
+
             if self.use_contrastive_learning:
                 cl = compute_cl_loss(
                     mus=td_data["mu"],
-                    labels=pseudo_labels if self.training_mode == 'semisupervised' else y,
-                    margin=self.margin,  
+                    labels=pseudo_labels if self.training_mode == "semisupervised" else y,
+                    margin=self.margin,
                     learnable_thetas=self.learnable_thetas,
                 )
-            ce = compute_ce_loss(logits, pseudo_labels if self.training_mode == 'semisupervised' else y)
-            kl = compute_kl_loss(td_data["posterior"], td_data["prior"], label=pseudo_labels if self.training_mode == 'semisupervised' else y)
+            ce = compute_ce_loss(
+                logits, pseudo_labels if self.training_mode == "semisupervised" else y
+            )
+
+            probabilities = F.softmax(logits, dim=-1)
+
+            kl_layer = compute_kl_loss(
+                td_data["posterior"],
+                td_data["prior"],
+                probabilities,
+                label=pseudo_labels if self.training_mode == "semisupervised" else y,
+                conv_mult=self.conv_mult,
+            )
 
         output = {
             "ll": ll,
@@ -317,7 +335,8 @@ class LadderVAE(nn.Module):
             "posterior": td_data["posterior"],
             "prior": td_data["prior"],
             "mu": td_data["mu"],
-            "kl": kl,
+            "kl_layer": kl_layer,
+            "kl": kl_layer.mean(),
             "cl": cl,
             "ce": ce,
             "out_mean": likelihood_info["mean"],
@@ -325,6 +344,7 @@ class LadderVAE(nn.Module):
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
             "inpainting_loss": inpainting_loss,
+            "class_probabilities": probabilities,
         }
         return output
 
@@ -384,7 +404,6 @@ class LadderVAE(nn.Module):
         posterior = [None] * self.n_layers
         mu = [None] * self.n_layers
 
-
         if forced_latent is None:
             forced_latent = [None] * self.n_layers
 
@@ -425,7 +444,7 @@ class LadderVAE(nn.Module):
             posterior[i] = aux["posterior"]
             mu[i] = aux["mu"]
             # class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
-            
+
             # if self.training:
             #     logprob_p += aux["logprob_p"].mean()  # mean over batch
             # else:
@@ -448,10 +467,10 @@ class LadderVAE(nn.Module):
 
     def _mask_input(self, x: torch.Tensor) -> torch.Tensor:
         """
-            Applies masking to the input tensor x according to the specified masking strategy.
+        Applies masking to the input tensor x according to the specified masking strategy.
         """
-        ann_width = self.cfg.mask_strategy # Depth of the annulus for average masking
-        
+        ann_width = self.cfg.mask_strategy  # Depth of the annulus for average masking
+
         x_masked = x.clone()
         ps = x.shape[-1]
         ms = self.mask_size
@@ -463,18 +482,26 @@ class LadderVAE(nn.Module):
             mask_binary[:, :, b:e, b:e] = 1
         else:
             mask_binary[:, :, b:e, b:e, b:e] = 1
-        
+
         mask_value = 0.0
         average_mask = None
-        if ann_width > 0: # If ann_width == 0, fill mask with zeros
+        if ann_width > 0:  # If ann_width == 0, fill mask with zeros
             average_mask = torch.zeros_like(x).bool()
             if ann_width <= b:
                 # Take an annulus around the masked region
                 if self.conv_mult == 2:
-                    average_mask[:, :, b - ann_width:e + ann_width, b - ann_width:e + ann_width] = 1
+                    average_mask[
+                        :, :, b - ann_width : e + ann_width, b - ann_width : e + ann_width
+                    ] = 1
                     average_mask[mask_binary] = 0  # Exclude the masked region itself
                 else:
-                    average_mask[:, :, b - ann_width:e + ann_width, b - ann_width:e + ann_width, b - ann_width:e + ann_width] = 1
+                    average_mask[
+                        :,
+                        :,
+                        b - ann_width : e + ann_width,
+                        b - ann_width : e + ann_width,
+                        b - ann_width : e + ann_width,
+                    ] = 1
                     average_mask[mask_binary] = 0  # Exclude the masked region itself
             else:
                 # If the annulus would go out of bounds, use the entire unmasked area
@@ -482,7 +509,7 @@ class LadderVAE(nn.Module):
             mask_value = x[average_mask].mean().item()
 
         x_masked[mask_binary] = mask_value
-        
+
         return x_masked
 
     def _centre_crop(self, x: torch.Tensor) -> torch.Tensor:
@@ -566,36 +593,77 @@ class LadderVAE(nn.Module):
             raise AssertionError("Incorrect conv layer dimensions")
         return top_layer_shape
 
-    def get_logits(self, bu_values):
+    def get_logits(self, features):
         """
-            Get segmentation logits from the model given bottom-up values.
+        Get segmentation logits from the model given bottom-up values.
 
-            Args:
-                bu_values: List of bottom-up feature tensors from each layer.
+        Args:
+            features: List of bottom-up feature (bu_values or mu) tensors from each layer.
         """
         feature_subset = []
-        for  i in range(len(bu_values)):
-            feature_subset.append(self.feature_selection_layers[i](bu_values[i]))
+        for i in range(len(features)):
+            feature_subset.append(self.feature_selection_layers[i](features[i]))
         logits = self.segmentation_head(feature_subset)
-        return logits
-    
-    def get_pseudo_labels(self, mu, threshold=0.99):
-        """
-            Get pseudo-labels based on the top layer posterior and segmentation logits.
+        return logits, feature_subset
 
-            Args:
-                top_posterior: Posterior distribution at the top layer.
-                logits: Segmentation logits from the model.
-                threshold: Confidence threshold for assigning pseudo-labels.
-        """
-        # Get class probabilities from logits
-        class_probs = torch.softmax(logits, dim=1)  # Assuming logits shape is (batch, n_classes, H, W)
+    def get_pseudo_labels(self, mu, label, threshold=0.99):
+        batch_size = mu[-1].shape[0]
+        group_size = 0
+        while(label[group_size + 1] == -1):
+            group_size += 1
+        group_size += 1 # one anchor and it's neighbors
+        num_groups = batch_size // group_size
+        anchors = torch.arange(
+            0, num_groups * group_size, group_size, device=label.device
+        )
 
-        # Get max probabilities and corresponding class labels
-        max_probs, pseudo_labels = torch.max(class_probs, dim=1)  # Shape: (batch, H, W)
+        q_mu_anchors = mu[anchors]
+        labels_anchors = label[anchors]
 
-        # Apply confidence threshold
-        mask = max_probs >= threshold
-        pseudo_labels = pseudo_labels * mask.long()  # Set low-confidence pixels to 0 (or any ignore label)
+        # Compute class means from labeled anchor samples
+        if self.conv_mult == 2:
+            sums = torch.zeros(
+                self.n_components,
+                mu.size(-3),
+                mu.size(-2),
+                mu.size(-1),
+                device=label.device,
+            )
+        else:
+            sums = torch.zeros(
+                self.n_components,
+                mu.size(-4),
+                mu.size(-3),
+                mu.size(-2),
+                mu.size(-1),
+                device=label.device,
+            )
+        counts = (
+            torch.zeros(self.n_components, 1, 1, 1, device=label.device)
+            if self.conv_mult == 2
+            else torch.zeros(self.n_components, 1, 1, 1, 1, device=label.device)
+        )
 
-        return pseudo_labels
+        for c in range(self.n_components):
+            mask = labels_anchors == c
+            if mask.any():
+                sums[c] = q_mu_anchors[mask].sum(dim=0)
+                counts[c] = mask.sum()
+
+        means = sums / counts.clamp(min=1)
+
+        # Compute distances and logits for pseudo-labeling
+        diff = mu.unsqueeze(1) - means.unsqueeze(0)
+        dists = (diff * diff).sum(dim=(2, 3, 4) if self.conv_mult == 2 else (2, 3, 4, 5))
+        logits = -dists / 200
+        logits = logits - logits.max(dim=1, keepdim=True).values
+
+        y = F.softmax(logits)
+
+        # Generate pseudo labels with confidence thresholding
+        conf, pseudo = y.max(dim=1)
+        accept = conf > threshold
+        pseudo[~accept] = -1
+        pseudo[anchors] = label[anchors].long()
+
+        return pseudo  # TODO: fix me: logit here is not used for ceoss entropy

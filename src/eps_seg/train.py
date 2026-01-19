@@ -9,7 +9,6 @@ from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, Sem
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import wandb
-from torchinfo import summary
 
 def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     """

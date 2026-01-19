@@ -25,6 +25,7 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
     mode: Literal["supervised", "semisupervised"] = Field("supervised", description="Dataset mode: supervised or semisupervised")    
     samples_per_class_validation: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for validation dataset.")
     samples_per_class_training: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for training dataset.")
+    n_neighbors: int = Field(7, description="Number of neighbors for neighbor sampling (only for semisupervised datasets).")
 
     @classmethod
     def from_yaml(cls, yaml_path: str):

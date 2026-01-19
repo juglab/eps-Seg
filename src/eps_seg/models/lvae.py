@@ -76,7 +76,7 @@ class LVAEModel(L.LightningModule):
         inpainting_loss = outputs["inpainting_loss"]
         kld_loss = outputs["kl"]
         contrastive_loss = outputs["cl"]
-        cross_entropy_loss = outputs["cross_entropy"]
+        cross_entropy_loss = outputs["ce"]
 
         total_loss = (
             self.train_cfg.alpha * inpainting_loss +
@@ -117,7 +117,7 @@ class LVAEModel(L.LightningModule):
 
         inpainting_loss = outputs["inpainting_loss"]
         kld_loss = outputs["kl"]
-        cross_entropy_loss = outputs["cross_entropy"]
+        cross_entropy_loss = outputs["ce"]
         contrastive_loss = (
             outputs["cl"] if not torch.isnan(outputs["cl"]) else torch.tensor(0.0, device=self.device)
         )
