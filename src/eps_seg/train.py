@@ -9,6 +9,7 @@ from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, Sem
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import wandb
+from torchinfo import summary
 
 def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     """
@@ -73,6 +74,18 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             )
 
         model.update_mode("supervised")
+        # Example for 2D convs
+        # batch_size = train_config.batch_size
+        # C = dataset_config.n_channels
+        # H, W = model_config.img_shape[-2], model_config.img_shape[-1]
+
+        # summary(
+        #     model,
+        #     input_size=(batch_size, C, H, W),
+        #     col_names=("input_size", "output_size", "num_params", "kernel_size"),
+        #     depth=1,  # how deep you want to go in the module tree
+        # )
+
         supervised_trainer.fit(model, datamodule=dm)
 
         print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)

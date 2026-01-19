@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from sklearn.feature_extraction import image
 from tqdm import tqdm
 from matplotlib import pyplot as plt
+from torch.distributions import Normal, kl_divergence
 
 
 class Interpolate(nn.Module):
@@ -370,6 +371,13 @@ def get_normalized_tensor(img, model, device):
     data_std = model.data_std
     test_images = (test_images - data_mean) / data_std
     return test_images
+
+def compute_kl_loss(q, p, label=None):
+    pass
+
+
+def compute_ce_loss(logits, labels):
+    pass
 
 
 def compute_cl_loss(

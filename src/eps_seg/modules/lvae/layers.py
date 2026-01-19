@@ -1,12 +1,14 @@
 import torch
 from torch import nn
-from typing import Type, Union
+from typing import Type, Union, Optional, Tuple
 from torch.distributions import Normal, kl_divergence
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+
 def no_cp(func, inp):
     return func(inp)
+
 
 class ResidualBlock(nn.Module):
     """
@@ -115,10 +117,11 @@ class ResidualBlock(nn.Module):
         else:
             return self.cp(self.block, inp) + inp  # Use checkpointing during training
 
-class ResidualGatedBlock(ResidualBlock):
 
+class ResidualGatedBlock(ResidualBlock):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, gated=True)
+
 
 class GateLayer(nn.Module):
     """
@@ -164,13 +167,14 @@ class TopDownLayer(nn.Module):
     Args:
         - stochastic_skip (bool): whether to use skip connection around stochastic block
         - skip_connection (bool): whether to use skip connection at this layer (from encoder to decoder)
-        - seg_head_dim (int): 
+        - seg_head_dim (int):
             dimension of the segmentation head - Only used in the top layers
 
     """
 
     def __init__(
         self,
+        layer_number: int,
         z_dim,
         seg_head_dim,
         n_res_blocks,
@@ -193,6 +197,7 @@ class TopDownLayer(nn.Module):
         training_mode="supervised",
     ):
         super().__init__()
+        self.layer_number = layer_number
         self.training_mode = training_mode
         self.is_top_layer = is_top_layer
         self.z_dim = z_dim
@@ -240,6 +245,7 @@ class TopDownLayer(nn.Module):
 
         if is_top_layer:
             self.stochastic = MixtureStochasticConvBlock(
+                layer_number=layer_number,
                 c_in=n_filters,
                 c_vars=z_dim,
                 c_out=n_filters,
@@ -250,12 +256,14 @@ class TopDownLayer(nn.Module):
             )
         else:
             self.stochastic = NormalStochasticConvBlock(
+                layer_number=layer_number,
                 c_in=n_filters,
                 c_vars=z_dim,
                 c_out=n_filters,
                 conv_mult=conv_mult,
                 training_mode=training_mode,
             )
+
 
         if not is_top_layer:
             # Merge layer, combine bottom-up inference with top-down
@@ -304,7 +312,9 @@ class TopDownLayer(nn.Module):
         # TODO write tests for this function
         # Extract spatial dimensions and channels
         total_channels = top_prior_param_shape[1]  # Total number of channels
-        spatial_dims: tuple = top_prior_param_shape[-self.conv_mult:]  # Spatial resolution
+        spatial_dims: tuple = top_prior_param_shape[
+            -self.conv_mult :
+        ]  # Spatial resolution
 
         # Each GMM component uses an equal fraction of the channels
         channels_per_component = total_channels // (
@@ -313,20 +323,28 @@ class TopDownLayer(nn.Module):
 
         # Initialize the tensor for means (mus)
         chunk_values = torch.zeros(
-            (n_components, channels_per_component,) + spatial_dims
+            (
+                n_components,
+                channels_per_component,
+            )
+            + spatial_dims
         )
-        # TODO hardcoded 2.0, better initialization strategy?
+        # TODO hardcoded 5.0, better initialization strategy?
         # Dynamically assign values to means
         chunk_size = channels_per_component // n_components
         for i in range(n_components):
             start_idx = i * chunk_size
             end_idx = (i + 1) * chunk_size
             chunk_values[i, start_idx:end_idx] = (
-                2.0  # Equidistant initialization for means
+                5.0  # Equidistant initialization for means
             )
 
         mus = chunk_values.view(
-            (1, n_components * channels_per_component,) + spatial_dims
+            (
+                1,
+                n_components * channels_per_component,
+            )
+            + spatial_dims
         )
 
         # Initialize standard deviations (sigmas) as zeros (or another value if needed)
@@ -349,7 +367,6 @@ class TopDownLayer(nn.Module):
         inference_mode=False,
         bu_value=None,
         n_img_prior=None,
-        confidence_threshold=0.5,
         use_mode=False,
         force_constant_output=False,
         forced_latent=None,
@@ -374,7 +391,7 @@ class TopDownLayer(nn.Module):
             print("TODO: force_constant_output is not implemented yet")
         if forced_latent is not None:
             print("TODO: forced_latent is not implemented yet")
-            
+
         # Check consistency of arguments
         inputs_none = input_ is None and skip_connection_input is None
         if self.is_top_layer and not inputs_none:
@@ -401,7 +418,6 @@ class TopDownLayer(nn.Module):
                     q_params = self.skip_connection_merger(bu_value, p_params)
                 else:
                     q_params = p_params
-                    
 
         # In generative mode, q is not used
         else:
@@ -412,7 +428,6 @@ class TopDownLayer(nn.Module):
         if self.is_top_layer:
             x, data_stoch = self.stochastic(
                 p_params=p_params, q_params=q_params,
-                label=label, confidence_threshold=confidence_threshold
             )
         else:
             x, data_stoch = self.stochastic(
@@ -443,6 +458,7 @@ class BottomUpLayer(nn.Module):
 
     def __init__(
         self,
+        layer_number: int,
         n_res_blocks,
         n_filters,
         downsampling_steps=0,
@@ -481,6 +497,7 @@ class BottomUpLayer(nn.Module):
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = nn.Sequential(*bu_blocks).to(self.device)
+        self.layer_number = layer_number
 
     def forward(self, x):
         return self.net(x)
@@ -724,12 +741,20 @@ class BlurPool(nn.Module):
 
         # Define a simple low-pass filter (approximating Gaussian)
         kernel = torch.tensor([1, 2, 1], dtype=torch.float32)
-        
-        kernel = kernel[:, None] * kernel[None, :] if dim == 2 else kernel[:, None, None] * kernel[None, :, None] * kernel[None, None, :]
+
+        kernel = (
+            kernel[:, None] * kernel[None, :]
+            if dim == 2
+            else kernel[:, None, None] * kernel[None, :, None] * kernel[None, None, :]
+        )
         kernel = kernel / kernel.sum()  # Normalize kernel
 
         # Expand kernel to all input channels
-        kernel = kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1) if dim == 2 else kernel.view(1, 1, 3, 3, 3).repeat(channels, 1, 1, 1, 1)   
+        kernel = (
+            kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+            if dim == 2
+            else kernel.view(1, 1, 3, 3, 3).repeat(channels, 1, 1, 1, 1)
+        )
 
         self.register_buffer("kernel", kernel)
 
@@ -741,16 +766,15 @@ class BlurPool(nn.Module):
             Tensor: Downsampled tensor of shape (N, C, H/stride, W/stride) for 2D or (N, C, D/stride, H/stride, W/stride) for 3D.
 
         """
-         
+
         if self.dim == 2:
             x = F.conv2d(x, self.kernel, stride=1, padding=1, groups=x.shape[1])
             # Downsample
-            return x[:, :, ::self.stride, ::self.stride]
+            return x[:, :, :: self.stride, :: self.stride]
         else:
             x = F.conv3d(x, self.kernel, stride=1, padding=1, groups=x.shape[1])
             # Downsample all spatial dimensions
-            return x[:, :, ::self.stride, ::self.stride, ::self.stride]
-    
+            return x[:, :, :: self.stride, :: self.stride, :: self.stride]
 
 
 class BaseStochasticConvBlock(nn.Module):
@@ -758,6 +782,7 @@ class BaseStochasticConvBlock(nn.Module):
 
     def __init__(
         self,
+        layer_number,
         c_in,
         c_vars,
         c_out,
@@ -766,6 +791,7 @@ class BaseStochasticConvBlock(nn.Module):
         training_mode="supervised",
     ):
         super().__init__()
+        self.layer_number = layer_number
         self.training_mode = training_mode
         assert kernel % 2 == 1
         self.pad = kernel // 2
@@ -806,6 +832,7 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
 
     def __init__(
         self,
+        layer_number,
         c_in,
         c_vars,
         c_out,
@@ -813,7 +840,7 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
         kernel=3,
         training_mode="supervised",
     ):
-        super().__init__(c_in, c_vars, c_out, conv_mult, kernel, training_mode)
+        super().__init__(layer_number, c_in, c_vars, c_out, conv_mult, kernel, training_mode)
 
         self.conv_in_q = self.conv_type(c_in, 2 * c_vars, kernel, padding=self.pad)
         self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
@@ -827,93 +854,29 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
 
         # Define q(z)
         q_params = self.conv_in_q(q_params)
-        q_mu, q_lv, q_std = self._clamp_params(q_params)
+        q_mu, _, q_std = self._clamp_params(q_params)
         q = Normal(q_mu, q_std)
 
         # Sample and compute output
         z = q.rsample()
         out = self.conv_out(z)
 
-        # Compute KL divergence
-        kl = kl_divergence(q, p).mean()
-
-        # Compute log probabilities
-        logprob_p = self._compute_logprob(p, z)
-        logprob_q = self._compute_logprob(q, z)
-
         data = {
-            "z": z,
-            "p_params": p_params,
-            "q_params": q_params,
-            "logprob_p": logprob_p,
-            "logprob_q": logprob_q,
-            "kl": kl,
+            "prior": p,
+            "posterior": q,
             "mu": q_mu,
-            "lv": q_lv,
+            "z": z,
+            "class_logits": None,
+            "class_probabilities": None,
         }
 
         return out, data
 
 
 class MixtureStochasticConvBlock(BaseStochasticConvBlock):
-    """
-        Stochastic convolutional block with a Gaussian mixture prior and FiLM conditioning.
-
-        This module models a conditional variational distribution with a discrete latent
-        mixture variable y and continuous latent variable z. It predicts q(y|x) and q(z|x,y),
-        samples z, applies FiLM modulation from y, and computes KL divergence to a mixture prior.
-
-        Args
-        ----
-        c_in : int
-            Number of input channels.
-        c_vars : int
-            Number of latent variable channels.
-        c_out : int
-            Number of output channels.
-        conv_mult : int
-            Dimensions for convolutional layers (2D or 3D).
-        kernel : int, optional
-            Convolution kernel size. Default: 3.
-        training_mode : str, optional
-            One of {"supervised", "semisupervised"}. Default: "supervised".
-        n_components : int, optional
-            Number of Gaussian mixture components. Default: 4.
-        seg_head_dim : int, optional
-            Spatial dimension of feature map for q(y|x) head. Default: 2.
-
-        Forward Args
-        ------------
-        p_params : torch.Tensor
-            Prior parameters (mean and logvar) for p(z|y),
-            shape (B, 2 * c_vars * n_components, H, W).
-        q_params : torch.Tensor
-            Input features for inferring q(y|x) and q(z|x,y),
-            shape (B, c_in, H, W).
-        label : torch.Tensor or None
-            Ground-truth class labels, shape (B,).
-        confidence_threshold : float, optional
-            Confidence threshold for pseudo-labeling.
-
-        Returns
-        -------
-        out : torch.Tensor
-            Output feature map after sampling z and convolution,
-            shape (B, c_out, H, W).
-        data : dict
-                {
-                    'z': sampled latent tensor (B, c_vars, H, W),
-                    'mu': mean of q(z|x,y) (B, c_vars, H, W),
-                    'lv': log-variance (B, c_vars, H, W),
-                    'class_probabilities': q(y|x) (B, n_components),
-                    'kl': KL divergence (scalar),
-                    'cross_entropy': cross-entropy loss (scalar),
-                    'pseudo_labels': pseudo-labels (B,)
-                }
-    """
-
     def __init__(
         self,
+        layer_number,
         c_in,
         c_vars,
         c_out,
@@ -923,46 +886,21 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         n_components=4,
         seg_head_dim=2,  # Spatial dim of feature map for segmentation head q(y|x)
     ):
-        super().__init__(c_in, c_vars, c_out, conv_mult, kernel, training_mode)
+        super().__init__(layer_number, c_in, c_vars, c_out, conv_mult, kernel, training_mode)
         self.n_components = n_components
         self.seg_head_dim = seg_head_dim
-        self.temperature = 1.0  # Initial temperature for Gumbel-Softmax
-        self.constant = 200  # Scaling constant for distances
-        self.group_size = 8
         self.prior_probs = torch.ones(n_components, device=self.device) / n_components
-        self.conv_mult = conv_mult
-
-        # q(y|x) network -> segmentation head
-        self.qy_x = nn.Sequential(
-            self.conv_type(c_in, c_vars, kernel, padding=self.pad),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(c_vars * (seg_head_dim**self.conv_mult), n_components),
+        self.conditional_layer = ConditionalPrior(
+            c_in=c_in,
+            c_vars=c_vars,
+            n_components=n_components,
+            conv_mult=conv_mult,
+            kernel=kernel,
+            seg_head_dim=seg_head_dim,
         )
-
-        # q(z|x,y) network
-        self.qz_xy = nn.Sequential(
-            self.conv_type(c_in, 2 * c_vars, kernel, padding=self.pad),
-            nn.ReLU(),
-            self.conv_type(2 * c_vars, 2 * c_vars, kernel, padding=self.pad),
-        )
-
-        # FiLM modulation layers
-        self.gamma_layer = nn.Linear(n_components, c_in)
-        self.beta_layer = nn.Linear(n_components, c_in)
-
         self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
 
-    def forward(self, p_params, q_params, label, confidence_threshold=None):
-        """
-        
-        Outputs:
-        out: output tensor after sampling and conv
-        data: 
-            pi: `q(y|x)` class probabilities
-        
-        
-        """
+    def forward(self, p_params, q_params):
         self.batch_size = q_params.shape[0]
 
         # Process prior parameters (mixture of Gaussians)
@@ -971,157 +909,221 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         p_std_chunks = p_std.chunk(self.n_components, dim=1)
         p_components = [Normal(mu, std) for mu, std in zip(p_mu_chunks, p_std_chunks)]
 
-        # Get q(y|x)
-        qy_logits = self.qy_x(q_params)
-
-        # FiLM modulation: condition z on y
-        gamma = self.gamma_layer(qy_logits).unsqueeze(-1).unsqueeze(-1)
-        beta = self.beta_layer(qy_logits).unsqueeze(-1).unsqueeze(-1)
-        if self.conv_type == nn.Conv3d:
-            gamma = gamma.unsqueeze(-1)
-            beta = beta.unsqueeze(-1)
-        
-        q_modulated = gamma * q_params + beta
-
-        # Get q(z|x,y)
-        qz_params = self.qz_xy(q_modulated)
-        q_mu, q_lv, q_std = self._clamp_params(qz_params)
+        # Get q(y|x) from prior parameters
+        # and q(z|x,y) from conditional prior
+        qz_params, class_logits, class_probs = self.conditional_layer(q_params)
+        q_mu, _, q_std = self._clamp_params(qz_params)
         q = Normal(q_mu, q_std)
         z = q.rsample()
 
-        # Initialize outputs
-        q_probs = None
-        cross_entropy = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        pseudo_label = label
-
-        # Handle different training scenarios
-        if label is None:
-            # Inference mode: use softmax for y
-            q_probs = F.softmax(qy_logits, dim=1)
-            # TODO: check if this is the right way to handle KL in inference
-            # Class is computed outside
-            kl = 0.0
-        elif self.training_mode == "semisupervised":
-            # Semi-supervised learning: use pseudo-labeling for unlabeled data
-            q_probs, pseudo_label, cross_entropy = self._semisupervised_forward(
-                label, q_mu, confidence_threshold
-            )
-            kl = self._compute_kl_mixture(q, p_components, label=pseudo_label)
-        elif self.training_mode == "supervised":
-            # Supervised learning: use Gumbel-Softmax
-            q_probs = F.softmax(qy_logits, dim=-1)
-            self._update_temperature()
-            kl = self._compute_kl_mixture(q, p_components, label=label)
-            cross_entropy = F.cross_entropy(qy_logits, label.long())
-        else:
-            raise ValueError(f"Unknown training mode: {self.training_mode}")
-
-        # Add regularization terms
-        js_div = self._compute_js_div(q_probs) if q_probs is not None else 0
-        kl = kl + js_div
-
         out = self.conv_out(z)
-        logprob_p = self._compute_logprob(p_components, z)
-        logprob_q = self._compute_logprob(q, z)
 
         data = {
-            "z": z,
-            "p_params": p_params,
-            "q_params": q_params,
-            "logprob_p": logprob_p,
-            "logprob_q": logprob_q,
-            "kl": kl,
+            "prior": p_components,
+            "posterior": q,
             "mu": q_mu,
-            "lv": q_lv,
-            "class_probabilities": q_probs,
-            "cross_entropy": cross_entropy,
-            "pseudo_labels": pseudo_label,
+            "z": z,
+            "class_logits": class_logits,
+            "class_probabilities": class_probs,
         }
 
         return out, data
 
-    def _semisupervised_forward(self, label, q_mu, confidence_threshold):
-        """Handle semi-supervised training logic with pseudo-labeling."""
 
-        num_groups = self.batch_size // self.group_size
-        anchors = torch.arange(
-            0, num_groups * self.group_size, self.group_size, device=self.device
+
+class FeatureSubsetSelectionLayer(nn.Module):
+    """
+    Layer that selects a spatial subset of the feature map.
+
+    - Works for 2D (B, C, H, W) and 3D (B, C, D, H, W).
+    - Keeps all channels; only crops spatial dims.
+    - Typically used as a center crop, but can also use explicit indices.
+
+    Args
+    ----
+    crop_size : tuple or None
+        Spatial size to crop to.
+        - For 2D: (h, w)
+        - For 3D: (d, h, w)
+        If None: passthrough.
+    center_crop : bool
+        If True, performs center crop with given crop_size.
+    spatial_start : tuple or None
+        If center_crop=False, you can specify explicit starting indices.
+        - For 2D: (h0, w0)
+        - For 3D: (d0, h0, w0)
+    enabled : bool
+        If False, always passthrough.
+    """
+
+    def __init__(
+        self,
+        layer_number: int,
+        crop_size: Optional[Tuple[int, ...]] = None,
+        enabled: bool = True,
+    ):
+        super().__init__()
+        self.layer_number = layer_number
+        self.crop_size = crop_size
+        self.enabled = enabled
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, H, W) or (B, C, D, H, W)
+        """
+        spatial_dims = x.shape[2:]   # everything after channel
+    
+        starts = [(sd - self.crop_size) // 2 for sd in spatial_dims]
+        ends   = [s + self.crop_size for s in starts]
+
+        # Build slices dynamically
+        slices = [slice(None), slice(None)]   # keep B, C
+        slices += [slice(s, e) for s, e in zip(starts, ends)]
+
+        return x[tuple(slices)]
+
+class SegmentationHead(nn.Module):
+    """Segmentation head that mirrors the original API but fixes batch mixing.
+
+    The implementation keeps the same arguments and pooling behaviour as the
+    original version, with per-level convolutions followed by global average
+    pooling. The only functional difference is concatenating pooled vectors
+    along the feature dimension (dim=1) instead of the batch dimension to avoid
+    shape mismatches during classification.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 n_classes: int,
+                 conv_mult: int,
+                 hidden_channels: int = None,
+                 n_layers: int = 3,
+                 kernel: int = 1):
+        super().__init__()
+        assert kernel % 2 == 1
+
+        if hidden_channels is None:
+            hidden_channels = in_channels
+
+        self.conv_mult = conv_mult
+        conv_type = getattr(nn, f"Conv{conv_mult}d")
+
+        self.level_nets = nn.ModuleList([
+            nn.Sequential(
+                conv_type(in_channels, hidden_channels, kernel_size=kernel),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(n_layers)
+        ])
+
+        # self.classifier = nn.Linear(n_layers * hidden_channels, n_classes)
+        self.classifier = nn.Sequential(
+            nn.LazyLinear(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, n_classes),
         )
 
-        q_mu_anchors = q_mu[anchors]
-        labels_anchors = label[anchors]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool each level and concatenate along the feature dimension.
 
-        # Compute class means from labeled anchor samples
-        if self.conv_mult == 2:
-            sums = torch.zeros(
-                self.n_components,
-                q_mu.size(-3),
-                q_mu.size(-2),
-                q_mu.size(-1),
-                device=self.device,
-            )
-        else:
-            sums = torch.zeros(
-                self.n_components,
-                q_mu.size(-4),
-                q_mu.size(-3),
-                q_mu.size(-2),
-                q_mu.size(-1),
-                device=self.device,
-            )
-        counts = torch.zeros(self.n_components, 1, 1, 1, device=self.device) if self.conv_mult == 2 else torch.zeros(self.n_components, 1, 1, 1, 1, device=self.device)
+        Args:
+            x: Iterable of feature maps with shape (B, C, H, W) for 2D or
+                (B, C, D, H, W) for 3D.
 
-        for c in range(self.n_components):
-            mask = labels_anchors == c
-            if mask.any():
-                sums[c] = q_mu_anchors[mask].sum(dim=0)
-                counts[c] = mask.sum()
+        Returns:
+            Logits of shape (B, n_classes).
+        """
 
-        means = sums / counts.clamp(min=1)
+        flattened = []
+        for z, net in zip(x, self.level_nets):
+            out = net(z)                      # (B, C, H, W) or (B, C, D, H, W)
+            out = out.flatten(start_dim=1)    # (B, C*H*W) or (B, C*D*H*W)
+            flattened.append(out)
 
-        # Compute distances and logits for pseudo-labeling
-        diff = q_mu.unsqueeze(1) - means.unsqueeze(0)
-        dists = (diff * diff).sum(dim=(2, 3, 4) if self.conv_mult == 2 else (2, 3, 4, 5))
-        logits = -dists / self.constant
-        logits = logits - logits.max(dim=1, keepdim=True).values
+        feat = torch.cat(flattened, dim=1)
+        logits = self.classifier(feat)
+        return logits
 
-        y = F.softmax(logits)
 
-        # Generate pseudo labels with confidence thresholding
-        conf, pseudo = y.max(dim=1)
-        accept = conf > confidence_threshold
-        pseudo[~accept] = -1
-        pseudo[anchors] = label[anchors].long()
-        cross_entropy = F.cross_entropy(logits, pseudo, ignore_index=-1)
 
-        return y, pseudo, cross_entropy
+class ConditionalPrior(nn.Module):
+    """
+    Conditional prior network that predicts parameters for a conditional prior distribution:
 
-    def _compute_kl_mixture(self, q, p_components, label=None):
-        """Compute KL divergence for mixture model."""
-        kl_divergences = [
-            kl_divergence(q, p_i).mean(dim=(1, 2, 3) if self.conv_mult == 2 else (1, 2, 3, 4)) for p_i in p_components
-        ]
-        kl_divergences = torch.stack(kl_divergences, dim=-1)
+        q(y|x)      : class logits/probs
+        FiLM(x, y)  : feature modulation
+        q(z|x, y)   : Gaussian parameters (mu, logvar) for posterior
 
-        if label is not None:
-            valid_mask = label >= 0
-            if valid_mask.any():
-                kl = kl_divergences[valid_mask, label[valid_mask].long()].mean()
-            else:
-                kl = torch.tensor(0.0, device=self.device)
-        else:
-            kl = torch.tensor(0.0, device=self.device)
+    This does NOT sample z or compute KL; it just outputs q-params + class info.
+    """
 
-        return kl
+    def __init__(
+        self,
+        c_in: int,
+        c_vars: int,
+        n_components: int,
+        conv_mult: int,
+        kernel: int = 3,
+        seg_head_dim: int = 2,
+    ):
+        super().__init__()
+        assert kernel % 2 == 1
+        pad = kernel // 2
 
-    def _compute_js_div(self, y):
-        """Compute Jensen-Shannon divergence between y and uniform prior."""
-        m = 0.5 * (y + self.prior_probs)
-        js_div = 0.5 * torch.sum(y * torch.log(y / (m + 1e-10)), dim=1) + 0.5 * torch.sum(
-            self.prior_probs * torch.log(self.prior_probs / (m + 1e-10)), dim=1
+        self.n_components = n_components
+        self.seg_head_dim = seg_head_dim
+        self.conv_mult = conv_mult
+        self.conv_type = getattr(nn, f"Conv{conv_mult}d")
+
+        # q(y|x) head (similar to old qy_x)
+        self.qy_x = nn.Sequential(
+            self.conv_type(c_in, c_vars, kernel, padding=pad),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(c_vars * (seg_head_dim**conv_mult), n_components),
         )
-        return js_div.mean()
 
-    def _update_temperature(self):
-        """Update temperature for Gumbel-Softmax annealing."""
-        self.temperature = max(0.5, self.temperature * 0.999)
+        # FiLM modulation layers
+        self.gamma_layer = nn.Linear(n_components, c_in)
+        self.beta_layer = nn.Linear(n_components, c_in)
+
+        # q(z|x, y) network (similar to old qz_xy)
+        self.qz_xy = nn.Sequential(
+            self.conv_type(c_in, 2 * c_vars, kernel, padding=pad),
+            nn.ReLU(inplace=True),
+            self.conv_type(2 * c_vars, 2 * c_vars, kernel, padding=pad),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        temperature: float = 1.0,
+    ):
+        """
+        x: feature map used to infer q(y|x) and q(z|x,y), shape (B, c_in, ...)
+
+        Returns:
+            qz_params      : (B, 2 * c_vars, ...)
+            class_logits   : (B, n_components)
+            class_probs    : (B, n_components)
+        """
+        # q(y|x)
+        class_logits = self.qy_x(x)  # (B, n_components)
+        class_probs = F.softmax(class_logits / temperature, dim=-1)
+
+        # FiLM modulation
+        gamma = self.gamma_layer(class_probs)  # (B, c_in)
+        beta = self.beta_layer(class_probs)  # (B, c_in)
+
+        # Broadcast to spatial dims
+        while gamma.ndim < x.ndim:
+            gamma = gamma.unsqueeze(-1)
+            beta = beta.unsqueeze(-1)
+
+        x_mod = gamma * x + beta
+
+        # q(z|x, y)
+        qz_params = self.qz_xy(x_mod)
+
+        return qz_params, class_logits, class_probs
+

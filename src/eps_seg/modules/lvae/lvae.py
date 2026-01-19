@@ -3,6 +3,8 @@ import torch
 from torch import nn
 from typing import Type, Union
 from eps_seg.modules.lvae.likelihoods import GaussianLikelihood  
+from torchinfo import summary
+
 
 from eps_seg.modules.lvae.utils import (
     crop_img_tensor,
@@ -10,6 +12,8 @@ from eps_seg.modules.lvae.utils import (
     Interpolate,
     free_bits_kl,
     compute_cl_loss,
+    compute_ce_loss,
+    compute_kl_loss,
 )
 from eps_seg.modules.lvae.layers import (
     TopDownLayer,
@@ -17,8 +21,9 @@ from eps_seg.modules.lvae.layers import (
     TopDownDeterministicResBlock,
     BottomUpDeterministicResBlock,
     BlurPool,
+    FeatureSubsetSelectionLayer,
+    SegmentationHead,
 )
-from torch.cuda.amp import autocast
 from eps_seg.config import LVAEConfig
 
 class LadderVAE(nn.Module):
@@ -64,6 +69,8 @@ class LadderVAE(nn.Module):
         self.margin = cfg.margin
         self.n_components = cfg.n_components
         self.learnable_thetas = True 
+        self.seg_features = cfg.seg_features
+        self.feature_spatial_size = cfg.feature_spatial_size
         
         # Derived paramters
         self.input_array_shape = cfg.img_shape
@@ -84,7 +91,7 @@ class LadderVAE(nn.Module):
         self.build_architecture()
 
     def build_architecture(self):
-
+        
         self.downsample = [1] * self.n_layers
 
         # Downsample by a factor of 2 at each downsampling operation
@@ -118,6 +125,7 @@ class LadderVAE(nn.Module):
         # Init lists of layers
         self.top_down_layers = nn.ModuleList([])
         self.bottom_up_layers = nn.ModuleList([])
+        self.feature_selection_layers = nn.ModuleList([])
 
         # Z dimensions for stochastic layers are downscaled by factor 2
         self.head_z_dims =  int(self.input_array_shape[-1]/(2**self.n_layers)) # if isotropic, better to get size of x
@@ -130,6 +138,7 @@ class LadderVAE(nn.Module):
             # It's a sequence of residual blocks (BottomUpDeterministicResBlock)
             # possibly with downsampling between them.
             new_layer = BottomUpLayer(
+                    layer_number = i,
                     n_res_blocks=self.blocks_per_layer,
                     n_filters=self.n_filters,
                     downsampling_steps=self.downsample[i],
@@ -143,10 +152,18 @@ class LadderVAE(nn.Module):
                 )
             self.bottom_up_layers.append(new_layer)
 
+            new_layer = FeatureSubsetSelectionLayer(
+                    layer_number = i,
+                    crop_size=self.feature_spatial_size[i],
+                    enabled=True,
+                )
+            self.feature_selection_layers.append(new_layer)
+
             # Add top-down stochastic layer at level i.
             # FIXME: Review commented out parameters and reimplement
             self.top_down_layers.append(
                 TopDownLayer(
+                    layer_number = i,
                     z_dim=self.z_dims[i],
                     seg_head_dim=self.head_z_dims,
                     #n_layers=self.n_layers,
@@ -191,8 +208,16 @@ class LadderVAE(nn.Module):
                     grad_checkpoint=self.use_grad_checkpoint,
                 )
             )
+        
         self.final_top_down = nn.Sequential(*modules)
-
+        self.segmentation_head = SegmentationHead(
+                in_channels=self.n_filters,
+                n_classes=self.n_components,
+                conv_mult=self.conv_mult,
+                hidden_channels=int(self.n_filters/2),
+                n_layers=self.n_layers,
+                kernel=1,
+            )
         # Define likelihood
         self.likelihood = GaussianLikelihood(self.n_filters, self.color_ch, self.conv_mult)
 
@@ -234,16 +259,33 @@ class LadderVAE(nn.Module):
         x_pad = self.pad_input(x, self.conv_mult)
         # Bottom-up inference: return list of length n_layers (bottom to top)
         bu_values = self.bottomup_pass(x_pad)
+       
         # Top-down inference/generation
         out, td_data = self.topdown_pass(
-            y, bu_values, confidence_threshold=confidence_threshold
+            y, bu_values
         )
+        
+        # get logits from segmentation head
+        if self.seg_features == 'mu':
+            logits = self.get_logits(td_data['mu'])
+        elif self.seg_features == 'bu':
+            logits = self.get_logits(bu_values)
+        else:
+            KeyError(f"Unknown segmentation features type: {self.seg_features}")
+            
+        if self.training_mode == 'semisupervised' and (self.training or validation_mode):
+            # get pseudo-labels
+            pseudo_labels = self.get_pseudo_labels(td_data['mu'], threshold=confidence_threshold)
+        
+
+        
         # Restore original image size
         out = crop_img_tensor(out, img_size)
         # Log likelihood and other info (per data point)
 
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         kl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
 
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
         ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
@@ -258,33 +300,33 @@ class LadderVAE(nn.Module):
         if self.training or validation_mode: # TODO: Merge with above condition?
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
-            kl = torch.stack(td_data["kl"]).sum(0)
-            if self.kl_free_bits > 0:
-                kl = free_bits_kl(kl, self.kl_free_bits)
+            # kl = torch.stack(td_data["kl"]).sum(0)
+            # if self.kl_free_bits > 0:
+            #     kl = free_bits_kl(kl, self.kl_free_bits)
         
             if self.use_contrastive_learning:
-                if td_data.get("pseudo_labels", None) is not None:
-                    # i.e., we are in either training or validation mode (we have labels)
-                    cl = compute_cl_loss(
-                        mus=td_data["mu"],
-                        labels=td_data["pseudo_labels"],
-                        margin=self.margin,  
-                        learnable_thetas=self.learnable_thetas,
-                    )
+                cl = compute_cl_loss(
+                    mus=td_data["mu"],
+                    labels=pseudo_labels if self.training_mode == 'semisupervised' else y,
+                    margin=self.margin,  
+                    learnable_thetas=self.learnable_thetas,
+                )
+            ce = compute_ce_loss(logits, pseudo_labels if self.training_mode == 'semisupervised' else y)
+            kl = compute_kl_loss(td_data["posterior"], td_data["prior"], label=pseudo_labels if self.training_mode == 'semisupervised' else y)
 
         output = {
             "ll": ll,
             "z": td_data["z"],
+            "posterior": td_data["posterior"],
+            "prior": td_data["prior"],
             "mu": td_data["mu"],
             "kl": kl,
             "cl": cl,
-            "logp": td_data["logprob_p"],
+            "ce": ce,
             "out_mean": likelihood_info["mean"],
             "out_mode": likelihood_info["mode"],
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
-            "cross_entropy": td_data["cross_entropy"][-1],
-            "class_probabilities": td_data["class_probabilities"][-1] if "class_probabilities" in td_data else None,
             "inpainting_loss": inpainting_loss,
         }
         return output
@@ -310,7 +352,6 @@ class LadderVAE(nn.Module):
         mode_layers=None,
         constant_layers=None,
         forced_latent=None,
-        confidence_threshold=0.99,
     ):
         # Default: no layer is sampled from the distribution's mode
         if mode_layers is None:
@@ -341,19 +382,16 @@ class LadderVAE(nn.Module):
         z = [None] * self.n_layers
 
         # KL divergence of each layer
-        kl = [0.0] * self.n_layers
-        ce = [0.0] * self.n_layers # There is only one cross-entropy, at the top layer
 
+        prior = [None] * self.n_layers
+        posterior = [None] * self.n_layers
         mu = [None] * self.n_layers
-        logvar = [None] * self.n_layers
-        class_prob = [None] * self.n_layers
-        pseudo_labels = [None] * self.n_layers
+
 
         if forced_latent is None:
             forced_latent = [None] * self.n_layers
 
         # log p(z) where z is the sample in the topdown pass
-        logprob_p = 0.0
 
         # Top-down inference/generation loop
         out = None
@@ -382,31 +420,32 @@ class LadderVAE(nn.Module):
                 use_mode=use_mode,
                 force_constant_output=constant_out,
                 forced_latent=forced_latent[i],
-                confidence_threshold=confidence_threshold,
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
-            kl[i] = aux["kl"]  # (batch, )
-            ce[i] = aux.get("cross_entropy", None)
+            # kl[i] = aux["kl"]  # (batch, )
+            # ce[i] = aux.get("cross_entropy", None)
+            prior[i] = aux["prior"]
+            posterior[i] = aux["posterior"]
             mu[i] = aux["mu"]
-            class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
-            pseudo_labels[i] = aux["pseudo_labels"] if "pseudo_labels" in aux else None
+            # class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
             
-            if self.training:
-                logprob_p += aux["logprob_p"].mean()  # mean over batch
-            else:
-                logprob_p = None
+            # if self.training:
+            #     logprob_p += aux["logprob_p"].mean()  # mean over batch
+            # else:
+            #     logprob_p = None
 
         # Final top-down layer
         out = self.final_top_down(out)
         data = {
             "z": z,  # list of tensors with shape (batch, ch[i], h[i], w[i])
-            "kl": kl,  # list of tensors with shape (batch, )
-            "logprob_p": logprob_p,  # scalar, mean over batch
+            # "kl": kl,  # list of tensors with shape (batch, )
+            # "logprob_p": logprob_p,  # scalar, mean over batch
+            "prior": prior,
+            "posterior": posterior,
             "mu": mu,
-            "logvar": logvar,
-            "class_probabilities": class_prob,
-            "cross_entropy": ce,
-            "pseudo_labels": pseudo_labels,
+            # "logvar": logvar,
+            # "class_probabilities": class_prob,
+            # "cross_entropy": ce,
         }
         return out, data
 
@@ -529,3 +568,37 @@ class LadderVAE(nn.Module):
         else:
             raise AssertionError("Incorrect conv layer dimensions")
         return top_layer_shape
+
+    def get_logits(self, bu_values):
+        """
+            Get segmentation logits from the model given bottom-up values.
+
+            Args:
+                bu_values: List of bottom-up feature tensors from each layer.
+        """
+        feature_subset = []
+        for  i in range(len(bu_values)):
+            feature_subset.append(self.feature_selection_layers[i](bu_values[i]))
+        logits = self.segmentation_head(feature_subset)
+        return logits
+    
+    def get_pseudo_labels(self, mu, threshold=0.99):
+        """
+            Get pseudo-labels based on the top layer posterior and segmentation logits.
+
+            Args:
+                top_posterior: Posterior distribution at the top layer.
+                logits: Segmentation logits from the model.
+                threshold: Confidence threshold for assigning pseudo-labels.
+        """
+        # Get class probabilities from logits
+        class_probs = torch.softmax(logits, dim=1)  # Assuming logits shape is (batch, n_classes, H, W)
+
+        # Get max probabilities and corresponding class labels
+        max_probs, pseudo_labels = torch.max(class_probs, dim=1)  # Shape: (batch, H, W)
+
+        # Apply confidence threshold
+        mask = max_probs >= threshold
+        pseudo_labels = pseudo_labels * mask.long()  # Set low-confidence pixels to 0 (or any ignore label)
+
+        return pseudo_labels
