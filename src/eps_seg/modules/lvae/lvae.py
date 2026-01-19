@@ -3,7 +3,6 @@ import torch
 from torch import nn
 from typing import Type, Union
 from eps_seg.modules.lvae.likelihoods import GaussianLikelihood  
-from torchinfo import summary
 
 
 from eps_seg.modules.lvae.utils import (
