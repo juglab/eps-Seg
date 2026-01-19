@@ -469,7 +469,6 @@ class BottomUpLayer(nn.Module):
         res_block_type=None,
         gated=None,
         grad_checkpoint=False,
-        device=None,
     ):
         super().__init__()
 
@@ -494,10 +493,8 @@ class BottomUpLayer(nn.Module):
                     grad_checkpoint=grad_checkpoint,
                 )
             )
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.net = nn.Sequential(*bu_blocks).to(self.device)
-        self.layer_number = layer_number
+        self.net = nn.Sequential(*bu_blocks)
+        self.layer_number = layer_number  
 
     def forward(self, x):
         return self.net(x)
@@ -799,7 +796,6 @@ class BaseStochasticConvBlock(nn.Module):
         self.c_out = c_out
         self.c_vars = c_vars
         self.batch_size = 0
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
             nn, f"Conv{conv_mult}d"
         )

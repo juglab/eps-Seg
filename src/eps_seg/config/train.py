@@ -17,9 +17,12 @@ class TrainConfig(BaseEPSConfig):
     lr_factor: float = Field(default=0.9, description="Factor for learning rate scheduler")
     lr_min: float = Field(default=1e-12, description="Minimum learning rate")
     weight_decay: float = Field(default=0.0, description="Weight decay for optimizer")
-    max_epochs: int = Field(default=1000, description="Maximum number of training epochs")
+    max_epochs: int = Field(default=1000, description="Maximum number of training (pseudo) epochs")
+    pseudo_epoch_size: int = Field(default=10000, description="Number of steps for each pseudo-epoch")
     early_stopping_patience: int = Field(default=50, description="Patience for early stopping")
     batch_size: int = Field(default=128, description="Batch size for training")
+    batches_per_pseudoepoch: Union[int, None] = Field(default=None, description="Number of batches per pseudo-epoch. If None, it is set to dataset_size / batch_size. Must be divisible by num_gpus.")
+    test_batch_size: int = Field(default=512, description="Batch size for testing/inference")
     amp: bool = Field(default=True, description="Use mixed precision training")
     gradient_scale: int = Field(default=256, description="Gradient scaling factor")
     max_grad_norm: Optional[float] = Field(default=1.0, description="Maximum gradient norm")
@@ -27,14 +30,14 @@ class TrainConfig(BaseEPSConfig):
     beta: float = Field(default=1e-2, description="Weight for the KLD loss")
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
-    log_every_n_steps: int = Field(default=5, description="Logging frequency in steps")
+    log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
     initial_threshold: float = Field(default=0.50, description="Initial confidence threshold for training in semisupervised mode")
     max_threshold: float = Field(default=0.99, description="Maximum confidence threshold for training in semisupervised mode")
     threshold_increment: float = Field(default=0.005, description="Step size for confidence threshold increase")
     initial_radius: int = Field(default=5, description="Initial radius for training in semisupervised mode")
     max_radius: int = Field(default=10, description="Maximum radius for training in semisupervised mode")
     radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
-
+    accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
 
 class ExperimentConfig(BaseEPSConfig):
     project_name: str = Field(default="eps-seg-default-project", description="Name of the project, e.g. used in WandB logging")
@@ -102,7 +105,7 @@ class ExperimentConfig(BaseEPSConfig):
         return self.experiment_root / "outputs" / self.experiment_name / train_cfg.model_name 
     
     @property
-    def results_dir(self) -> Path:
+    def results_csv_path(self) -> Path:
         """Return the directory path for saving results."""
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
         return self.experiment_root / "results" / self.experiment_name / train_cfg.model_name / "results.csv"

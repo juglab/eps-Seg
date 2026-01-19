@@ -4,7 +4,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
-from eps_seg.dataloaders.datamodules import BetaSegTrainDataModule
+from eps_seg.dataloaders.datamodules import EPSSegDataModule
 from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
@@ -20,9 +20,9 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
 
-    # TODO: write a factory also for datamodules
-    dm = BetaSegTrainDataModule(cfg=dataset_config, train_cfg=train_config)
+    dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
 
     if not skip_supervised:
         # Set random seed for reproducibility if provided
@@ -55,7 +55,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
 
         #### SUPERVISED MODE ####
         supervised_trainer = L.Trainer(
-            devices=1,
+            devices="auto",
+            strategy=strategy,
             logger=supervised_logger,
             max_epochs=train_config.max_epochs,
             callbacks=[
@@ -70,6 +71,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             gradient_clip_val=train_config.max_grad_norm, 
             log_every_n_steps=train_config.log_every_n_steps,
             deterministic=train_config.deterministic,
+            use_distributed_sampler=False, # We have our own distributed sampler
+            accumulate_grad_batches=train_config.accumulate_grad_batches,
             # fast_dev_run=True,
             )
 
@@ -125,7 +128,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         )
 
     semisupervised_trainer = L.Trainer(
-        devices=1,
+        devices="auto",
+        strategy=strategy,
         logger=semisupervised_logger,
         max_epochs=train_config.max_epochs,
         callbacks=[
@@ -138,12 +142,14 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
                     ),
                 LearningRateMonitor(logging_interval='step'),
                 ThresholdSchedulerCallback(),
-                # RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
+                RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
                 ],
         precision = "16-mixed" if train_config.amp else 32,
         gradient_clip_val=train_config.max_grad_norm, 
         log_every_n_steps=train_config.log_every_n_steps,
         deterministic=train_config.deterministic,
+        use_distributed_sampler=False, # We have our own distributed sampler
+        accumulate_grad_batches=train_config.accumulate_grad_batches,
         # fast_dev_run=True,
         )
 
