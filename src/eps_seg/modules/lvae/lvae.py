@@ -10,7 +10,6 @@ from eps_seg.modules.lvae.utils import (
     crop_img_tensor,
     pad_img_tensor,
     Interpolate,
-    free_bits_kl,
     compute_cl_loss,
     compute_ce_loss,
     compute_kl_loss,

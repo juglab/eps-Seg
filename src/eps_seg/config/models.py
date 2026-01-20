@@ -1,6 +1,6 @@
 from eps_seg.config.base import BaseEPSConfig
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Literal, Tuple
+from pydantic import Field
+from typing import List, Literal, Tuple
 import yaml
 
 class BaseEPSModelConfig(BaseEPSConfig):

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from typing import Type, Union, Optional, Tuple
-from torch.distributions import Normal, kl_divergence
+from torch.distributions import Normal
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
