@@ -289,6 +289,7 @@ class LadderVAE(nn.Module):
 
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
