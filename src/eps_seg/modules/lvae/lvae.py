@@ -21,6 +21,7 @@ from eps_seg.modules.lvae.layers import (
     BottomUpDeterministicResBlock,
     BlurPool,
     FeatureSubsetSelectionLayer,
+    EmptyFeatures,
     SegmentationHead,
 )
 from eps_seg.config import LVAEConfig
@@ -154,12 +155,17 @@ class LadderVAE(nn.Module):
             )
             self.bottom_up_layers.append(new_layer)
 
-            new_layer = FeatureSubsetSelectionLayer(
-                layer_number=i,
-                crop_size=self.feature_spatial_size[i],
-                enabled=True,
-            )
-            self.feature_selection_layers.append(new_layer)
+            if self.feature_spatial_size[i] > 0:
+                # Add feature selection layer at level i.
+                new_layer = FeatureSubsetSelectionLayer(
+                    layer_number=i,
+                    crop_size=self.feature_spatial_size[i],
+                    enabled=True,
+                )
+                self.feature_selection_layers.append(new_layer)
+            else:
+                new_layer = EmptyFeatures()
+                self.feature_selection_layers.append(new_layer)
 
             # Add top-down stochastic layer at level i.
             # FIXME: Review commented out parameters and reimplement
@@ -217,8 +223,8 @@ class LadderVAE(nn.Module):
             n_classes=self.n_components,
             conv_mult=self.conv_mult,
             hidden_channels=int(self.n_filters / 2),
-            n_layers=self.n_layers,
             kernel=1,
+            spatial_size=self.feature_spatial_size
         )
         # Define likelihood
         self.likelihood = GaussianLikelihood(
