@@ -60,6 +60,11 @@ class SemisupervisedDataset(Dataset):
             raise ValueError("stage must be 'supervised' or 'semisupervised'")
         self.mode = mode
 
+    def set_radius(self, radius: int):
+        if self.radius != radius:
+            self.radius = radius
+            self.groups = self._modify_metadata()
+
     def increase_radius(self):
         """Increase the radius for neighbor sampling."""
         self.radius += 1

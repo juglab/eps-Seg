@@ -70,9 +70,11 @@ class RadiusSchedulerCallback(L.Callback):
         super().on_validation_epoch_end(trainer, pl_module)
         if pl_module.current_training_mode == "semisupervised":
             if self.radius_increment_patience > 0 and pl_module.current_radius_patience >= self.radius_increment_patience:
-                self._backup_checkpoint(pl_module)
-                # Increase radius
-                pl_module.trainer.datamodule.increase_radius()
-                pl_module.current_radius = min(pl_module.current_radius + 1, pl_module.train_cfg.max_radius)
+                new_radius = min(pl_module.current_radius + 1, pl_module.train_cfg.max_radius)
+                if new_radius > pl_module.current_radius:
+                    self._backup_checkpoint(pl_module)
+                    # Increase radius
+                    pl_module.trainer.datamodule.set_radius(new_radius)
+                    pl_module.current_radius = new_radius
                 pl_module.current_radius_patience = 0
         pl_module.log("train/radius", pl_module.current_radius, prog_bar=True, on_epoch=True)
