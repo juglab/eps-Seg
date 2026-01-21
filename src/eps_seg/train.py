@@ -19,10 +19,9 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
 
-    dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
-
+    dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
     if not skip_supervised:
         # Set random seed for reproducibility if provided
         if train_config.supervised_seed is not None:
@@ -30,6 +29,12 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
             L.seed_everything(train_config.supervised_seed, workers=True)
 
         model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
+
+        # Dummy forward pass to initialize model parameters
+        if strategy == "ddp":
+            model.eval()
+            model(torch.zeros(size=(1,) + (model_config.color_channels,) + tuple(model_config.img_shape), device=model.device), validation_mode=False)
+            model.train()
 
         supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
         supervised_modelcheckpoint = ModelCheckpoint(
@@ -80,14 +85,6 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
         # batch_size = train_config.batch_size
         # C = dataset_config.n_channels
         # H, W = model_config.img_shape[-2], model_config.img_shape[-1]
-
-        # summary(
-        #     model,
-        #     input_size=(batch_size, C, H, W),
-        #     col_names=("input_size", "output_size", "num_params", "kernel_size"),
-        #     depth=1,  # how deep you want to go in the module tree
-        # )
-
         supervised_trainer.fit(model, datamodule=dm)
 
         print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
@@ -158,7 +155,6 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False):
     model = LVAEModel.load_from_checkpoint(best_supervised_modelcheckpoint,
                                         model_cfg=model_config,
                                         train_cfg=train_config).to(device)
-
     semisupervised_trainer.fit(model, datamodule=dm)
 
     print("Semisupervised training complete. Best model at:", semisupervised_modelcheckpoint.best_model_path)

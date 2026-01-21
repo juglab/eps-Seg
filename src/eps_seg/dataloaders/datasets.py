@@ -66,14 +66,43 @@ class SemisupervisedDataset(Dataset):
         self.groups = self._modify_metadata()
 
     def _is_valid_coord(self, name, z, y, x, Z, H, W):
+        """
+            Check if the coordinate (z,y,x) is valid:
+            - full patch is inside bounds
+            - center voxel is not ignore_lbl
+        """
         valid = (
             self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         )
+
         if self.dim == 3:
             valid = valid and (self.offset <= z < Z - self.offset - 1)
 
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
+
+        # TODO: Implement mask consistency
+        #unique_label_area = self.labels[name][z, x : x + self.label_size, y : y + self.label_size]
+        #consistent_mask = np.all(unique_label_area == unique_label_area[0, 0])
+
         return valid and in_cell
+
+    def _centre_consistent(self, patch_metadata):
+        """Vectorized version to check if the center is label-consistent.
+           (Which means that we only return patches whose mask is fully inside a single label region.)"""
+        if self.keys:
+            key, z, x, y = patch_metadata
+            unique_label_area = self.labels[key][
+                z, x : x + self.label_size, y : y + self.label_size
+            ]
+        else:
+            z, x, y = patch_metadata
+            unique_label_area = self.labels[
+                z, x : x + self.label_size, y : y + self.label_size
+            ]
+        return (
+            np.all(unique_label_area == unique_label_area[0, 0])
+            and unique_label_area[0, 0] != self.ignore_lbl
+        )
 
     def __len__(self):
         return len(self.groups)

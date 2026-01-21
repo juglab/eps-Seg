@@ -1,3 +1,4 @@
+ablations/
 experiments/*/checkpoints
 experiments/*/logs
 experiments/

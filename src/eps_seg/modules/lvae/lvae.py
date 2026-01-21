@@ -607,8 +607,8 @@ class LadderVAE(nn.Module):
         logits = self.segmentation_head(feature_subset)
         return logits, feature_subset
 
-    def get_pseudo_labels(self, mu, label, threshold=0.99):
-        batch_size = mu[-1].shape[0]
+    def get_pseudo_labels(self, innermost_mu, label, threshold=0.99):
+        batch_size = innermost_mu.shape[0]
         group_size = 0
         while(label[group_size + 1] == -1):
             group_size += 1
@@ -618,25 +618,25 @@ class LadderVAE(nn.Module):
             0, num_groups * group_size, group_size, device=label.device
         )
 
-        q_mu_anchors = mu[anchors]
+        q_mu_anchors = innermost_mu[anchors]
         labels_anchors = label[anchors]
 
         # Compute class means from labeled anchor samples
         if self.conv_mult == 2:
             sums = torch.zeros(
                 self.n_components,
-                mu.size(-3),
-                mu.size(-2),
-                mu.size(-1),
+                innermost_mu.size(-3),
+                innermost_mu.size(-2),
+                innermost_mu.size(-1),
                 device=label.device,
             )
         else:
             sums = torch.zeros(
                 self.n_components,
-                mu.size(-4),
-                mu.size(-3),
-                mu.size(-2),
-                mu.size(-1),
+                innermost_mu.size(-4),
+                innermost_mu.size(-3),
+                innermost_mu.size(-2),
+                innermost_mu.size(-1),
                 device=label.device,
             )
         counts = (
@@ -654,7 +654,7 @@ class LadderVAE(nn.Module):
         means = sums / counts.clamp(min=1)
 
         # Compute distances and logits for pseudo-labeling
-        diff = mu.unsqueeze(1) - means.unsqueeze(0)
+        diff = innermost_mu.unsqueeze(1) - means.unsqueeze(0)
         dists = (diff * diff).sum(dim=(2, 3, 4) if self.conv_mult == 2 else (2, 3, 4, 5))
         logits = -dists / 200
         logits = logits - logits.max(dim=1, keepdim=True).values
