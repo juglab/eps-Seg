@@ -218,11 +218,12 @@ class LadderVAE(nn.Module):
             )
 
         self.final_top_down = nn.Sequential(*modules)
+        seg_channel = self.n_filters//2 if self.seg_features == "mu" else self.n_filters
         self.segmentation_head = SegmentationHead(
-            in_channels=self.n_filters,
+            in_channels=seg_channel,
             n_classes=self.n_components,
             conv_mult=self.conv_mult,
-            hidden_channels=int(self.n_filters / 2),
+            hidden_channels=seg_channel,
             kernel=1,
             spatial_size=self.feature_spatial_size
         )
