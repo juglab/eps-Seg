@@ -47,6 +47,6 @@ class LVAEConfig(BaseEPSModelConfig):
     use_contrastive_learning: bool = Field(default=True, description="Whether to use contrastive loss during training.")
     margin: float = Field(default=20.0, description="Margin value for contrastive loss.")
     learnable_thetas: bool = Field(default=True, description="Whether to use NeurIPS-paper contrastive learning.")
-    seg_features: Literal['mu', 'bu'] = Field(default='bu', description="Which features to use for segmentation head ('mu' or 'bu').")
+    seg_features: Literal['mu', 'bu'] = Field(default='mu', description="Which features to use for segmentation head ('mu' or 'bu').")
     feature_spatial_size: Tuple[int, int, int] = Field(default=(0, 0, 8), description="Spatial size of the features used for segmentation head at each hierarchy. 0 if we don't want to consider the corresponding layer.")
     
