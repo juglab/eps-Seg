@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from typing import Type, Union, Optional, Tuple
-from torch.distributions import Normal, kl_divergence
+from torch.distributions import Normal
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
@@ -977,6 +977,12 @@ class FeatureSubsetSelectionLayer(nn.Module):
 
         return x[tuple(slices)]
 
+class EmptyFeatures(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C = x.shape[:2]
+        spatial_rank = x.dim() - 2
+        return x.new_empty((B, C) + (0,) * spatial_rank)
+
 class SegmentationHead(nn.Module):
     """Segmentation head that mirrors the original API but fixes batch mixing.
 
@@ -992,8 +998,8 @@ class SegmentationHead(nn.Module):
                  n_classes: int,
                  conv_mult: int,
                  hidden_channels: int = None,
-                 n_layers: int = 3,
-                 kernel: int = 1):
+                 kernel: int = 1,
+                 spatial_size: Optional[Tuple[int, ...]] = None):
         super().__init__()
         assert kernel % 2 == 1
 
@@ -1003,15 +1009,18 @@ class SegmentationHead(nn.Module):
         self.conv_mult = conv_mult
         conv_type = getattr(nn, f"Conv{conv_mult}d")
 
-        self.level_nets = nn.ModuleList([
-            nn.Sequential(
-                conv_type(in_channels, hidden_channels, kernel_size=kernel),
-                nn.ReLU(inplace=True),
-            )
-            for _ in range(n_layers)
-        ])
-
-        # self.classifier = nn.Linear(n_layers * hidden_channels, n_classes)
+        self.level_nets = nn.ModuleList([])
+        for i in spatial_size:
+            if i > 0:
+                self.level_nets.append(
+                    nn.Sequential(
+                        conv_type(in_channels, hidden_channels, kernel_size=kernel),
+                        nn.ReLU(inplace=True),
+                    )
+                )
+            else:
+                self.level_nets.append(EmptyFeatures())
+                
         self.classifier = nn.Sequential(
             nn.LazyLinear(hidden_channels),
             nn.ReLU(inplace=True),

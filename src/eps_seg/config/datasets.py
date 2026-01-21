@@ -2,7 +2,6 @@ from eps_seg.config.base import BaseEPSConfig
 from pydantic import Field
 from typing import List, Optional, Literal, Dict, Tuple, Union
 from pathlib import Path
-from pydantic import model_validator
 import yaml
 
 class BaseEPSDatasetConfig(BaseEPSConfig):
