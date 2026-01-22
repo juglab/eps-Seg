@@ -53,7 +53,6 @@ class PredictionWriterCallback(BasePredictionWriter):
         
         rank = trainer.global_rank
 
-        self.rank_chunks[rank] = set()
         self.rank_paths: Dict[str, Path] = {} # Dict[test_key, Path]
         
         for test_key in self.test_keys:
@@ -104,13 +103,15 @@ class PredictionWriterCallback(BasePredictionWriter):
             Only on rank 0, merge the ranks outputs and write.
         """
         
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            # Wait for all ranks to finish writing
-            torch.distributed.barrier()
+        
         for tk in self.test_keys:
             # Save written chunks for this rank and test_key
             np.save(self.out_dir / f"rank_{trainer.global_rank}_chunks_{tk}.npy", 
-                    np.array(list(self.rank_chunks[tk][trainer.global_rank]), dtype=np.int32))
+                    np.array(list(self.rank_chunks[tk]), dtype=np.int32))
+       
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # Wait for all ranks to finish writing
+            torch.distributed.barrier()
 
         if trainer.is_global_zero:
             print("Merging rank outputs...")
@@ -119,7 +120,7 @@ class PredictionWriterCallback(BasePredictionWriter):
     def merge(self, trainer):
         """
             Merge all ranks zarr outputs into a final zarr array.
-            Should be ran ONLY on rank 0.
+            Should be ran ONLY on rank 0 and after each rank has finished writing..
         """
         if not trainer.is_global_zero:
             return

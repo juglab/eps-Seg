@@ -258,6 +258,13 @@ class LadderVAE(nn.Module):
             validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
             confidence_threshold: Confidence threshold for assigning pseudo-labels
         """
+
+        # Defaults
+        cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
+
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
         # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
         mask_input = self.training or validation_mode
@@ -289,15 +296,11 @@ class LadderVAE(nn.Module):
         else:
             pseudo_labels = y
 
+        probabilities = F.softmax(logits, dim=-1)
+        
         # Restore original image size
         out = crop_img_tensor(out, img_size)
-        # Log likelihood and other info (per data point)
-
-        cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
-
+        
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
         ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
 
@@ -326,7 +329,6 @@ class LadderVAE(nn.Module):
                 logits, pseudo_labels if self.training_mode == "semisupervised" else y
             )
 
-            probabilities = F.softmax(logits, dim=-1)
 
             kl_layer = compute_kl_loss(
                 td_data["posterior"],
