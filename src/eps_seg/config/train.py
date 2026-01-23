@@ -18,7 +18,7 @@ class TrainConfig(BaseEPSConfig):
     lr_min: float = Field(default=1e-12, description="Minimum learning rate")
     weight_decay: float = Field(default=0.0, description="Weight decay for optimizer")
     max_epochs: int = Field(default=1000, description="Maximum number of training (pseudo) epochs")
-    early_stopping_patience: int = Field(default=100, description="Patience for early stopping")
+    early_stopping_patience: int = Field(default=150, description="Patience for early stopping")
     batch_size: int = Field(default=128, description="Batch size for training")
     batches_per_pseudoepoch: Union[int, None] = Field(default=100, description="Number of batches per pseudo-epoch. If None, it is set to dataset_size / batch_size. Must be divisible by num_gpus.")
     test_batch_size: int = Field(default=512, description="Batch size for testing/inference")
@@ -35,7 +35,7 @@ class TrainConfig(BaseEPSConfig):
     threshold_increment: float = Field(default=0.005, description="Step size for confidence threshold increase")
     initial_radius: int = Field(default=5, description="Initial radius for training in semisupervised mode")
     max_radius: int = Field(default=5, description="Maximum radius for training in semisupervised mode")
-    radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
+    radius_increment_patience: int = Field(default=100, description="Number of epochs without improvement before increasing radius in semisupervised mode")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
 
 class ExperimentConfig(BaseEPSConfig):
