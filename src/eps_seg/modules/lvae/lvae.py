@@ -54,7 +54,7 @@ class LadderVAE(nn.Module):
         self.skip_connections_merge_type = cfg.skip_connections_merge_type
         self.batchnorm = cfg.use_batchnorm
         self.color_ch = cfg.color_channels
-        self.n_filters = cfg.n_fiters
+        self.n_filters = cfg.n_filters
         self.dropout = cfg.dropout
         self.kl_free_bits = cfg.kl_free_bits
         self.learn_top_prior = cfg.learn_top_prior
