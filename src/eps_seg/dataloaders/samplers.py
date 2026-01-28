@@ -15,9 +15,10 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         - Semisupervised: 4 patches per anchor
     """
 
-    def __init__(self, dataset, total_patches_per_batch=32, seed=42, shuffle=True):
+    def __init__(self, dataset, total_patches_per_batch=32, n_neighbors=7, seed=42, shuffle=True):
         self.dataset = dataset
         self.total_patches_per_batch = total_patches_per_batch
+        self.n_neighbors = n_neighbors
         self.seed = seed
         self.rng = random.Random(seed)
         self.shuffle = shuffle
@@ -52,9 +53,9 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         if self.dataset.mode == "semisupervised":
             # in semisupervised mode, dataset returns [anchor + 7 neighbors, ancor + 7 neighbors, ...]
             assert (
-                self.total_patches_per_batch % 8 == 0  # TODO
-            ), "total_patches_per_batch must be divisible by 8 in semisupervised mode."
-            anchors_per_batch = self.total_patches_per_batch // 8  # TODO
+                self.total_patches_per_batch % (1 + self.n_neighbors) == 0  # TODO
+            ), f"total_patches_per_batch must be divisible by {1 + self.n_neighbors} in semisupervised mode."
+            anchors_per_batch = self.total_patches_per_batch // (1 + self.n_neighbors)  # TODO
         else:
             anchors_per_batch = self.total_patches_per_batch
 

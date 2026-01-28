@@ -88,6 +88,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 self.train_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
                 shuffle=True,
+                n_neighbors=self.cfg.n_neighbors,
             )
         
         train_sampler = PseudoEpochDistributedParallelBatchSampler(
@@ -109,6 +110,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 self.val_dataset,
                 total_patches_per_batch=self.train_cfg.batch_size,
                 shuffle=False,
+                n_neighbors=self.cfg.n_neighbors,
             )
         val_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.val_dataset,
