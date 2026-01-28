@@ -143,6 +143,11 @@ class EPSSegDataModule(L.LightningDataModule):
         print(f"Switching datamodule mode to {mode}...")
         self.train_dataset.set_mode(mode)
 
+    def set_radius(self, radius: float):
+        """Set the radius for semisupervised sampling."""
+        print(f"Setting semisupervised sampling radius to {radius}...")
+        self.train_dataset.set_radius(radius)
+
     def increase_radius(self):
         """Increase the radius used for semisupervised sampling."""
         print("Increasing semisupervised sampling radius...")

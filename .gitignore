@@ -216,3 +216,4 @@ __marimo__/
 .DS_Store
 *.yaml~
 scripts/
+lightning_logs/

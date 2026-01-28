@@ -1,5 +1,5 @@
 from eps_seg.config.base import BaseEPSConfig
-from pydantic import Field
+from pydantic import Field, model_validator
 from typing import List, Literal, Tuple
 import yaml
 
@@ -33,7 +33,7 @@ class LVAEConfig(BaseEPSModelConfig):
     skip_connections_merge_type: Literal["residual", "linear"] = Field(default="residual", description="Type of merge to use for skip connections.")
     use_batchnorm: bool = Field(default=True, description="Whether to use batch normalization in the model.")
     training_mode: Literal['supervised', 'semisupervised'] = Field(default='supervised', description="Training mode for the LVAE. Starts with 'supervised' and can be switched to 'semisupervised' during training.")
-    n_fiters: int = Field(default=64, description="Number of filters in all convolutional layers.")
+    n_filters: int = Field(default=64, description="Number of filters in all convolutional layers.")
     dropout: float = Field(default=0.2, description="Dropout rate to use in the model.")
     kl_free_bits: float = Field(default=0.0, description="Free bits value for KL divergence regularization.")
     learn_top_prior: bool = Field(default=False, description="Whether to learn the top prior distribution.")
@@ -48,5 +48,15 @@ class LVAEConfig(BaseEPSModelConfig):
     margin: float = Field(default=20.0, description="Margin value for contrastive loss.")
     learnable_thetas: bool = Field(default=True, description="Whether to use NeurIPS-paper contrastive learning.")
     seg_features: Literal['mu', 'bu'] = Field(default='mu', description="Which features to use for segmentation head ('mu' or 'bu').")
-    feature_spatial_size: Tuple[int, int, int] = Field(default=(0, 0, 8), description="Spatial size of the features used for segmentation head at each hierarchy. 0 if we don't want to consider the corresponding layer.")
-    
+    feature_spatial_size: List[int] = Field(
+        default_factory=lambda: [0, 0, 8],
+        description="Spatial size of the features used for segmentation head at each hierarchy. 0 disables that level."
+    )
+    @model_validator(mode="after")
+    def check_feature_spatial_size(self):
+        if len(self.feature_spatial_size) != self.n_layers:
+            raise ValueError(
+                f"feature_spatial_size must have length {self.n_layers}, "
+                f"got {len(self.feature_spatial_size)}"
+            )
+        return self
