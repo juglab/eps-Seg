@@ -60,3 +60,4 @@ class LVAEConfig(BaseEPSModelConfig):
                 f"got {len(self.feature_spatial_size)}"
             )
         return self
+    def check_
