@@ -38,7 +38,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
 
         supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
         supervised_modelcheckpoint = ModelCheckpoint(
-            monitor="val/total_loss_epoch",
+            monitor="val/CE_epoch",
             dirpath=supervised_best_ckpt_path.parent,
             filename=supervised_best_ckpt_path.stem,
             mode="min",
@@ -106,7 +106,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
 
         semisupervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="semisupervised")
         semisupervised_modelcheckpoint = ModelCheckpoint(
-            monitor="val/total_loss_epoch",
+            monitor="val/CE_epoch",
             dirpath=semisupervised_best_ckpt_path.parent,
             filename=semisupervised_best_ckpt_path.stem,
             mode="min",
