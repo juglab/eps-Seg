@@ -45,11 +45,11 @@ class LVAEConfig(BaseEPSModelConfig):
         default="ELU", description="Non-linearity to use in the model."
     )
     enable_top_down_residuals: List[bool] = Field(
-        default=[True, True, True],
+        default_factory=lambda: [True, True, True],
         description="Whether to skip the stochastic merger at each TopDown layer.",
     )
     skip_connections: List[bool] = Field(
-        default=[True, True, True],
+        default_factory=lambda: [True, True, True],
         description="Whether to use skip connections at each layer (i.e., merge bu_values with top-down values).",
     )
     skip_connections_merge_type: Literal["residual", "linear"] = Field(
@@ -122,5 +122,21 @@ class LVAEConfig(BaseEPSModelConfig):
         if len(self.z_dims) != self.n_layers:
             raise ValueError(
                 f"z_dims must have length {self.n_layers}, got {len(self.z_dims)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_skip_connections(self):
+        if len(self.skip_connections) != self.n_layers:
+            raise ValueError(
+                f"skip_connections must have length {self.n_layers}, got {len(self.skip_connections)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_enable_top_down_residuals(self):
+        if len(self.enable_top_down_residuals) != self.n_layers:
+            raise ValueError(
+                f"enable_top_down_residuals must have length {self.n_layers}, got {len(self.enable_top_down_residuals)}"
             )
         return self
