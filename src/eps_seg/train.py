@@ -69,6 +69,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                             monitor="val/total_loss_epoch",
                             patience=train_config.early_stopping_patience,
                             mode="min",
+                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
                         )
                     ],
             precision = "16-mixed" if train_config.amp else 32,
@@ -137,6 +138,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                             monitor="val/total_loss_epoch",
                             patience=train_config.early_stopping_patience,
                             mode="min",
+                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
                         ),
                     LearningRateMonitor(logging_interval='step'),
                     ThresholdSchedulerCallback(),
