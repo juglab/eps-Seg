@@ -20,9 +20,6 @@ from eps_seg.modules.lvae.layers import (
     TopDownDeterministicResBlock,
     BottomUpDeterministicResBlock,
     BlurPool,
-    FeatureSubsetSelectionLayer,
-    EmptyFeatures,
-    SegmentationHead,
 )
 from eps_seg.config import LVAEConfig
 
@@ -67,12 +64,9 @@ class LadderVAE(nn.Module):
         self.margin = cfg.margin
         self.n_components = cfg.n_components
         self.learnable_thetas = True
-        self.seg_features = cfg.seg_features
-        self.feature_spatial_size = cfg.feature_spatial_size
 
         # Derived paramters
         self.input_array_shape = cfg.img_shape
-        self.likelihood_form = "gaussian"
 
         # assert self.data_std is not None, "Data std is not specified"
         # assert self.data_mean is not None, "Data mean is not specified"
@@ -126,12 +120,11 @@ class LadderVAE(nn.Module):
         # Init lists of layers
         self.top_down_layers = nn.ModuleList([])
         self.bottom_up_layers = nn.ModuleList([])
-        self.feature_selection_layers = nn.ModuleList([])
 
         # Z dimensions for stochastic layers are downscaled by factor 2
-        self.head_z_dims = int(
-            self.input_array_shape[-1] / (2**self.n_layers)
-        )  # if isotropic, better to get size of x
+        self.head_z_dims = [
+            int(self.input_array_shape[-1] / (2 ** (i + 1))) for i in range(self.n_layers)
+        ]
 
         for i in range(self.n_layers):
             # Whether this is the top layer
@@ -155,26 +148,13 @@ class LadderVAE(nn.Module):
             )
             self.bottom_up_layers.append(new_layer)
 
-            if self.feature_spatial_size[i] > 0:
-                # Add feature selection layer at level i.
-                new_layer = FeatureSubsetSelectionLayer(
-                    layer_number=i,
-                    crop_size=self.feature_spatial_size[i],
-                    enabled=True,
-                )
-                self.feature_selection_layers.append(new_layer)
-            else:
-                new_layer = EmptyFeatures()
-                self.feature_selection_layers.append(new_layer)
-
             # Add top-down stochastic layer at level i.
             # FIXME: Review commented out parameters and reimplement
             self.top_down_layers.append(
                 TopDownLayer(
                     layer_number=i,
                     z_dim=self.z_dims[i],
-                    seg_head_dim=self.head_z_dims,
-                    # n_layers=self.n_layers,
+                    seg_head_dim=self.head_z_dims[i],
                     n_res_blocks=self.blocks_per_layer,
                     n_filters=self.n_filters,
                     is_top_layer=is_top,
@@ -218,15 +198,6 @@ class LadderVAE(nn.Module):
             )
 
         self.final_top_down = nn.Sequential(*modules)
-        seg_channel = self.n_filters//2 if self.seg_features == "mu" else self.n_filters
-        self.segmentation_head = SegmentationHead(
-            in_channels=seg_channel,
-            n_classes=self.n_components,
-            conv_mult=self.conv_mult,
-            hidden_channels=seg_channel,
-            kernel=1,
-            spatial_size=self.feature_spatial_size
-        )
         # Define likelihood
         self.likelihood = GaussianLikelihood(
             self.n_filters, self.color_ch, self.conv_mult
@@ -262,7 +233,6 @@ class LadderVAE(nn.Module):
         # Defaults
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
@@ -280,27 +250,21 @@ class LadderVAE(nn.Module):
         # Top-down inference/generation
         out, td_data = self.topdown_pass(y, bu_values)
 
-        # get logits from segmentation head
-        if self.seg_features == "mu":
-            logits, features = self.get_logits(td_data["mu"])
-        elif self.seg_features == "bu":
-            logits, features = self.get_logits(bu_values)
-        else:
-            KeyError(f"Unknown segmentation features type: {self.seg_features}")
-
         if self.training_mode == "semisupervised" and self.training:
             # get pseudo-labels
             pseudo_labels = self.get_pseudo_labels(
-                td_data["mu"][-1], y, threshold=confidence_threshold
+                td_data["mu"],
+                y,
+                td_data["class_probabilities"],
+                td_data["class_logits"],
+                threshold=confidence_threshold,
             )
         else:
             pseudo_labels = y
 
-        probabilities = F.softmax(logits, dim=-1)
-        
         # Restore original image size
         out = crop_img_tensor(out, img_size)
-        
+
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
         ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
 
@@ -312,12 +276,6 @@ class LadderVAE(nn.Module):
             inpainting_loss = self._centre_crop(recons_sep).mean()
 
         if self.training or validation_mode:  # TODO: Merge with above condition?
-            # kl[i] for each i has length batch_size
-            # resulting kl shape: (batch_size, layers)
-            # kl = torch.stack(td_data["kl"]).sum(0)
-            # if self.kl_free_bits > 0:
-            #     kl = free_bits_kl(kl, self.kl_free_bits)
-
             if self.use_contrastive_learning:
                 cl = compute_cl_loss(
                     mus=td_data["mu"],
@@ -325,16 +283,19 @@ class LadderVAE(nn.Module):
                     margin=self.margin,
                     learnable_thetas=self.learnable_thetas,
                 )
-            ce = compute_ce_loss(
-                logits, pseudo_labels if self.training_mode == "semisupervised" else y
-            )
 
+            ce = sum(
+                compute_ce_loss(
+                    logits, pseudo_labels if self.training_mode == "semisupervised" else y
+                )
+                for logits in td_data["class_logits"]
+            )
 
             kl_layer = compute_kl_loss(
                 td_data["posterior"],
                 td_data["prior"],
-                probabilities,
-                label=pseudo_labels if self.training_mode == "semisupervised" else y,
+                td_data["class_probabilities"][-1],
+                label=y,
                 conv_mult=self.conv_mult,
             )
 
@@ -353,7 +314,7 @@ class LadderVAE(nn.Module):
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
             "inpainting_loss": inpainting_loss,
-            "class_probabilities": probabilities,
+            "class_probabilities": td_data["class_probabilities"][-1],
         }
         return output
 
@@ -412,6 +373,8 @@ class LadderVAE(nn.Module):
         prior = [None] * self.n_layers
         posterior = [None] * self.n_layers
         mu = [None] * self.n_layers
+        class_probs = [None] * self.n_layers
+        class_logits = [None] * self.n_layers
 
         if forced_latent is None:
             forced_latent = [None] * self.n_layers
@@ -447,30 +410,21 @@ class LadderVAE(nn.Module):
                 forced_latent=forced_latent[i],
             )
             z[i] = aux["z"]  # sampled variable at this layer (batch, ch, h, w)
-            # kl[i] = aux["kl"]  # (batch, )
-            # ce[i] = aux.get("cross_entropy", None)
             prior[i] = aux["prior"]
             posterior[i] = aux["posterior"]
             mu[i] = aux["mu"]
-            # class_prob[i] = aux["class_probabilities"] if "class_probabilities" in aux else None
-
-            # if self.training:
-            #     logprob_p += aux["logprob_p"].mean()  # mean over batch
-            # else:
-            #     logprob_p = None
+            class_probs[i] = aux["class_probabilities"]
+            class_logits[i] = aux["class_logits"]
 
         # Final top-down layer
         out = self.final_top_down(out)
         data = {
             "z": z,  # list of tensors with shape (batch, ch[i], h[i], w[i])
-            # "kl": kl,  # list of tensors with shape (batch, )
-            # "logprob_p": logprob_p,  # scalar, mean over batch
             "prior": prior,
             "posterior": posterior,
             "mu": mu,
-            # "logvar": logvar,
-            # "class_probabilities": class_prob,
-            # "cross_entropy": ce,
+            "class_probabilities": class_probs,
+            "class_logits": class_logits,
         }
         return out, data
 
@@ -602,77 +556,96 @@ class LadderVAE(nn.Module):
             raise AssertionError("Incorrect conv layer dimensions")
         return top_layer_shape
 
-    def get_logits(self, features):
-        """
-        Get segmentation logits from the model given bottom-up values.
+    def get_pseudo_labels(
+        self,
+        mus,
+        label,
+        class_probabilities=None,
+        class_logits=None,
+        threshold=0.99,
+    ):
+        anchors = torch.where(label != -1)[0]
+        if anchors.numel() == 0:
+            return torch.full_like(label, -1, dtype=torch.long)
 
-        Args:
-            features: List of bottom-up feature (bu_values or mu) tensors from each layer.
-        """
-        feature_subset = []
-        for i in range(len(features)):
-            feature_subset.append(self.feature_selection_layers[i](features[i]))
-        logits = self.segmentation_head(feature_subset)
-        return logits, feature_subset
+        anchor_labels = label[anchors].long()
+        n_layers = len(mus)
+        per_layer_pseudo = []
 
-    def get_pseudo_labels(self, innermost_mu, label, threshold=0.99):
-        batch_size = innermost_mu.shape[0]
-        group_size = 0
-        while(label[group_size + 1] == -1):
-            group_size += 1
-        group_size += 1 # one anchor and it's neighbors
-        num_groups = batch_size // group_size
-        anchors = torch.arange(
-            0, num_groups * group_size, group_size, device=label.device
-        )
+        for i, mu in enumerate(mus):
+            flat_mu = mu.reshape(mu.size(0), -1)
+            flat_mu_anchors = flat_mu[anchors]
 
-        q_mu_anchors = innermost_mu[anchors]
-        labels_anchors = label[anchors]
+            probs_i = None
+            if class_probabilities is not None:
+                probs_i = class_probabilities[i]
+            if (
+                probs_i is None
+                and class_logits is not None
+                and class_logits[i] is not None
+            ):
+                probs_i = F.softmax(class_logits[i], dim=1)
 
-        # Compute class means from labeled anchor samples
-        if self.conv_mult == 2:
+            if probs_i is not None:
+                tp_anchors = probs_i[anchors].argmax(dim=1) == anchor_labels
+            else:
+                tp_anchors = torch.ones_like(anchor_labels, dtype=torch.bool)
+
+            selected_mu = flat_mu_anchors[tp_anchors]
+            selected_labels = anchor_labels[tp_anchors]
+
+            feature_dim = flat_mu.size(1)
             sums = torch.zeros(
-                self.n_components,
-                innermost_mu.size(-3),
-                innermost_mu.size(-2),
-                innermost_mu.size(-1),
-                device=label.device,
+                self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype
             )
-        else:
-            sums = torch.zeros(
-                self.n_components,
-                innermost_mu.size(-4),
-                innermost_mu.size(-3),
-                innermost_mu.size(-2),
-                innermost_mu.size(-1),
-                device=label.device,
+            counts = torch.zeros(
+                self.n_components, device=flat_mu.device, dtype=flat_mu.dtype
             )
-        counts = (
-            torch.zeros(self.n_components, 1, 1, 1, device=label.device)
-            if self.conv_mult == 2
-            else torch.zeros(self.n_components, 1, 1, 1, 1, device=label.device)
-        )
 
-        for c in range(self.n_components):
-            mask = labels_anchors == c
-            if mask.any():
-                sums[c] = q_mu_anchors[mask].sum(dim=0)
-                counts[c] = mask.sum()
+            if selected_labels.numel() > 0:
+                sums.index_add_(0, selected_labels, selected_mu)
+                counts.index_add_(
+                    0,
+                    selected_labels,
+                    torch.ones(
+                        selected_labels.numel(),
+                        device=flat_mu.device,
+                        dtype=flat_mu.dtype,
+                    ),
+                )
 
-        means = sums / counts.clamp(min=1)
+            valid_classes = counts > 0
+            means = sums / counts.clamp(min=1).unsqueeze(1)
 
-        # Compute distances and logits for pseudo-labeling
-        diff = innermost_mu.unsqueeze(1) - means.unsqueeze(0)
-        dists = (diff * diff).sum(dim=(2, 3, 4) if self.conv_mult == 2 else (2, 3, 4, 5))
-        logits = -dists / 200
-        logits = logits - logits.max(dim=1, keepdim=True).values
+            x2 = (flat_mu * flat_mu).sum(dim=1, keepdim=True)
+            m2 = (means * means).sum(dim=1).unsqueeze(0)
+            dists = x2 + m2 - 2.0 * (flat_mu @ means.t())
+            dists = dists.clamp_min(0.0)
 
-        y = F.softmax(logits)
+            logits = -dists / 200.0
+            logits[:, ~valid_classes] = float("-inf")
 
-        # Generate pseudo labels with confidence thresholding
-        conf, pseudo = y.max(dim=1)
-        accept = conf > threshold
-        pseudo[~accept] = -1
-        pseudo[anchors] = label[anchors].long()
+            if valid_classes.any():
+                conf, pseudo = F.softmax(logits, dim=1).max(dim=1)
+                pseudo = pseudo.long()
+                pseudo[conf <= threshold] = -1
+            else:
+                pseudo = torch.full_like(label, -1, dtype=torch.long)
 
-        return pseudo  # TODO: fix me: logit here is not used for ceoss entropy
+            pseudo[anchors] = anchor_labels
+            per_layer_pseudo.append(pseudo)
+
+        votes = torch.stack(per_layer_pseudo, dim=0)
+        valid_votes = votes != -1
+        one_hot_votes = F.one_hot(votes.clamp(min=0), num_classes=self.n_components)
+        one_hot_votes = one_hot_votes * valid_votes.unsqueeze(-1)
+        vote_counts = one_hot_votes.sum(dim=0)
+
+        majority_count, majority_label = vote_counts.max(dim=1)
+        final_pseudo = torch.full_like(label, -1, dtype=torch.long)
+        final_pseudo[majority_count > (n_layers // 2)] = majority_label[
+            majority_count > (n_layers // 2)
+        ]
+        final_pseudo[anchors] = anchor_labels
+
+        return final_pseudo

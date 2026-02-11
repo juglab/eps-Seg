@@ -99,23 +99,6 @@ class LVAEConfig(BaseEPSModelConfig):
     learnable_thetas: bool = Field(
         default=True, description="Whether to use NeurIPS-paper contrastive learning."
     )
-    seg_features: Literal["mu", "bu"] = Field(
-        default="mu",
-        description="Which features to use for segmentation head ('mu' or 'bu').",
-    )
-    feature_spatial_size: List[int] = Field(
-        default_factory=lambda: [0, 0, 8],
-        description="Spatial size of the features used for segmentation head at each hierarchy. 0 disables that level.",
-    )
-
-    @model_validator(mode="after")
-    def check_feature_spatial_size(self):
-        if len(self.feature_spatial_size) != self.n_layers:
-            raise ValueError(
-                f"feature_spatial_size must have length {self.n_layers}, "
-                f"got {len(self.feature_spatial_size)}"
-            )
-        return self
 
     @model_validator(mode="after")
     def check_z_dim_size(self):

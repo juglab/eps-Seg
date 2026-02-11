@@ -250,8 +250,8 @@ class TopDownLayer(nn.Module):
                 c_vars=z_dim,
                 c_out=n_filters,
                 conv_mult=conv_mult,
-                n_components=self.n_components,
                 training_mode=training_mode,
+                n_components=self.n_components,
                 seg_head_dim=self.seg_head_dim,
             )
         else:
@@ -262,8 +262,9 @@ class TopDownLayer(nn.Module):
                 c_out=n_filters,
                 conv_mult=conv_mult,
                 training_mode=training_mode,
+                n_components=self.n_components,
+                seg_head_dim=self.seg_head_dim,
             )
-
 
         if not is_top_layer:
             # Merge layer, combine bottom-up inference with top-down
@@ -427,13 +428,11 @@ class TopDownLayer(nn.Module):
         # depending on whether q_params is None
         if self.is_top_layer:
             x, data_stoch = self.stochastic(
-                p_params=p_params, q_params=q_params,
+                p_params=p_params,
+                q_params=q_params,
             )
         else:
-            x, data_stoch = self.stochastic(
-                p_params=p_params, q_params=q_params
-            )
-
+            x, data_stoch = self.stochastic(p_params=p_params, q_params=q_params)
 
         # Skip connection from previous layer
         if self.enable_top_down_residual and not self.is_top_layer:
@@ -494,7 +493,7 @@ class BottomUpLayer(nn.Module):
                 )
             )
         self.net = nn.Sequential(*bu_blocks)
-        self.layer_number = layer_number  
+        self.layer_number = layer_number
 
     def forward(self, x):
         return self.net(x)
@@ -786,10 +785,14 @@ class BaseStochasticConvBlock(nn.Module):
         conv_mult,
         kernel=3,
         training_mode="supervised",
+        n_components=4,
+        seg_head_dim=2,
     ):
         super().__init__()
         self.layer_number = layer_number
         self.training_mode = training_mode
+        self.n_components = n_components
+        self.seg_head_dim = seg_head_dim
         assert kernel % 2 == 1
         self.pad = kernel // 2
         self.c_in = c_in
@@ -799,6 +802,15 @@ class BaseStochasticConvBlock(nn.Module):
         self.conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
             nn, f"Conv{conv_mult}d"
         )
+        self.conditional_layer = ConditionalPosterior(
+            c_in=c_in,
+            c_vars=c_vars,
+            n_components=n_components,
+            conv_mult=conv_mult,
+            kernel=kernel,
+            seg_head_dim=seg_head_dim,
+        )
+        self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
 
     def update_mode(self, mode):
         self.training_mode = mode
@@ -835,11 +847,20 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
         conv_mult,
         kernel=3,
         training_mode="supervised",
+        n_components=4,
+        seg_head_dim=2,  # Spatial dim of feature map for segmentation head q(y|x)
     ):
-        super().__init__(layer_number, c_in, c_vars, c_out, conv_mult, kernel, training_mode)
-
-        self.conv_in_q = self.conv_type(c_in, 2 * c_vars, kernel, padding=self.pad)
-        self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
+        super().__init__(
+            layer_number,
+            c_in,
+            c_vars,
+            c_out,
+            conv_mult,
+            kernel,
+            training_mode,
+            n_components,
+            seg_head_dim,
+        )
 
     def forward(self, p_params, q_params):
         self.batch_size = q_params.shape[0]
@@ -849,8 +870,8 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
         p = Normal(p_mu, p_std)
 
         # Define q(z)
-        q_params = self.conv_in_q(q_params)
-        q_mu, _, q_std = self._clamp_params(q_params)
+        qz_params, class_logits, class_probs = self.conditional_layer(q_params)
+        q_mu, _, q_std = self._clamp_params(qz_params)
         q = Normal(q_mu, q_std)
 
         # Sample and compute output
@@ -862,8 +883,8 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
             "posterior": q,
             "mu": q_mu,
             "z": z,
-            "class_logits": None,
-            "class_probabilities": None,
+            "class_logits": class_logits,
+            "class_probabilities": class_probs,
         }
 
         return out, data
@@ -882,18 +903,17 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         n_components=4,
         seg_head_dim=2,  # Spatial dim of feature map for segmentation head q(y|x)
     ):
-        super().__init__(layer_number, c_in, c_vars, c_out, conv_mult, kernel, training_mode)
-        self.n_components = n_components
-        self.seg_head_dim = seg_head_dim
-        self.conditional_layer = ConditionalPrior(
-            c_in=c_in,
-            c_vars=c_vars,
-            n_components=n_components,
-            conv_mult=conv_mult,
-            kernel=kernel,
-            seg_head_dim=seg_head_dim,
+        super().__init__(
+            layer_number,
+            c_in,
+            c_vars,
+            c_out,
+            conv_mult,
+            kernel,
+            training_mode,
+            n_components,
+            seg_head_dim,
         )
-        self.conv_out = self.conv_type(c_vars, c_out, kernel, padding=self.pad)
 
     def forward(self, p_params, q_params):
         self.batch_size = q_params.shape[0]
@@ -925,132 +945,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
         return out, data
 
 
-
-class FeatureSubsetSelectionLayer(nn.Module):
-    """
-    Layer that selects a spatial subset of the feature map.
-
-    - Works for 2D (B, C, H, W) and 3D (B, C, D, H, W).
-    - Keeps all channels; only crops spatial dims.
-    - Typically used as a center crop, but can also use explicit indices.
-
-    Args
-    ----
-    crop_size : tuple or None
-        Spatial size to crop to.
-        - For 2D: (h, w)
-        - For 3D: (d, h, w)
-        If None: passthrough.
-    center_crop : bool
-        If True, performs center crop with given crop_size.
-    spatial_start : tuple or None
-        If center_crop=False, you can specify explicit starting indices.
-        - For 2D: (h0, w0)
-        - For 3D: (d0, h0, w0)
-    enabled : bool
-        If False, always passthrough.
-    """
-
-    def __init__(
-        self,
-        layer_number: int,
-        crop_size: Optional[Tuple[int, ...]] = None,
-        enabled: bool = True,
-    ):
-        super().__init__()
-        self.layer_number = layer_number
-        self.crop_size = crop_size
-        self.enabled = enabled
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W) or (B, C, D, H, W)
-        """
-        spatial_dims = x.shape[2:]   # everything after channel
-    
-        starts = [(sd - self.crop_size) // 2 for sd in spatial_dims]
-        ends   = [s + self.crop_size for s in starts]
-
-        # Build slices dynamically
-        slices = [slice(None), slice(None)]   # keep B, C
-        slices += [slice(s, e) for s, e in zip(starts, ends)]
-
-        return x[tuple(slices)]
-
-class EmptyFeatures(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C = x.shape[:2]
-        spatial_rank = x.dim() - 2
-        return x.new_empty((B, C) + (0,) * spatial_rank)
-
-class SegmentationHead(nn.Module):
-    """Segmentation head that mirrors the original API but fixes batch mixing.
-
-    The implementation keeps the same arguments and pooling behaviour as the
-    original version, with per-level convolutions followed by global average
-    pooling. The only functional difference is concatenating pooled vectors
-    along the feature dimension (dim=1) instead of the batch dimension to avoid
-    shape mismatches during classification.
-    """
-
-    def __init__(self,
-                 in_channels: int,
-                 n_classes: int,
-                 conv_mult: int,
-                 hidden_channels: int = None,
-                 kernel: int = 1,
-                 spatial_size: Optional[Tuple[int, ...]] = None):
-        super().__init__()
-        assert kernel % 2 == 1
-
-        if hidden_channels is None:
-            hidden_channels = in_channels
-
-        self.conv_mult = conv_mult
-        conv_type = getattr(nn, f"Conv{conv_mult}d")
-
-        self.level_nets = nn.ModuleList([])
-        for i in spatial_size:
-            if i > 0:
-                self.level_nets.append(
-                    nn.Sequential(
-                        conv_type(in_channels, hidden_channels, kernel_size=kernel),
-                        nn.ReLU(inplace=True),
-                    )
-                )
-            else:
-                self.level_nets.append(EmptyFeatures())
-                
-        self.classifier = nn.Sequential(
-            nn.LazyLinear(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_channels, n_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool each level and concatenate along the feature dimension.
-
-        Args:
-            x: Iterable of feature maps with shape (B, C, H, W) for 2D or
-                (B, C, D, H, W) for 3D.
-
-        Returns:
-            Logits of shape (B, n_classes).
-        """
-
-        flattened = []
-        for z, net in zip(x, self.level_nets):
-            out = net(z)                      # (B, C, H, W) or (B, C, D, H, W)
-            out = out.flatten(start_dim=1)    # (B, C*H*W) or (B, C*D*H*W)
-            flattened.append(out)
-
-        feat = torch.cat(flattened, dim=1)
-        logits = self.classifier(feat)
-        return logits
-
-
-
-class ConditionalPrior(nn.Module):
+class ConditionalPosterior(nn.Module):
     """
     Conditional prior network that predicts parameters for a conditional prior distribution:
 
@@ -1078,6 +973,10 @@ class ConditionalPrior(nn.Module):
         self.seg_head_dim = seg_head_dim
         self.conv_mult = conv_mult
         self.conv_type = getattr(nn, f"Conv{conv_mult}d")
+        self.tau_decay = 0.999
+        self.tau_min = 0.2
+        self._tau_step = 0
+        self.temperature = 1.0
 
         # q(y|x) head (similar to old qy_x)
         self.qy_x = nn.Sequential(
@@ -1101,7 +1000,6 @@ class ConditionalPrior(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        temperature: float = 1.0,
     ):
         """
         x: feature map used to infer q(y|x) and q(z|x,y), shape (B, c_in, ...)
@@ -1113,7 +1011,10 @@ class ConditionalPrior(nn.Module):
         """
         # q(y|x)
         class_logits = self.qy_x(x)  # (B, n_components)
-        class_probs = F.softmax(class_logits / temperature, dim=-1)
+        tau = max(self.tau_min, self.temperature * (self.tau_decay**self._tau_step))
+        if self.training and tau > self.tau_min:
+            self._tau_step += 1
+        class_probs = F.gumbel_softmax(logits=class_logits, tau=tau, hard=False, dim=-1)
 
         # FiLM modulation
         gamma = self.gamma_layer(class_probs)  # (B, c_in)
@@ -1130,4 +1031,3 @@ class ConditionalPrior(nn.Module):
         qz_params = self.qz_xy(x_mod)
 
         return qz_params, class_logits, class_probs
-

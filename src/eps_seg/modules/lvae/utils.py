@@ -411,17 +411,22 @@ def compute_kl_loss(q, p, probabilities, label=None, conv_mult=2):
 def compute_ce_loss(logits, labels):
     return F.cross_entropy(logits, labels, ignore_index=-1)
 
-
 def compute_cl_loss(
     mus,
     labels,
     margin=50.0,  # for raw per-level features
     learnable_thetas=True,
 ):
-    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin)
-    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
-    weighted_neg = compute_weighted_neg(neg_terms, thetas)
-    cl_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
+    if len(mus) == 0:
+        return torch.tensor(0.0, device=labels.device, dtype=torch.float32)
+
+    cl_loss = torch.zeros((), device=mus[0].device)
+    for mu in mus:
+        pos_pair_loss, neg_terms = pos_neg_loss([mu], labels, margin=margin)
+        thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+        weighted_neg = compute_weighted_neg(neg_terms, thetas)
+        cl_loss = cl_loss + 0.5 * pos_pair_loss + 0.5 * weighted_neg
+
     return cl_loss
 
 
