@@ -138,9 +138,8 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
         if self.batches_per_pseudoepoch is not None:
             assert self.batches_per_pseudoepoch % self.num_replicas == 0, "batches_per_pseudoepoch must be divisible by num_replicas to ensure every GPU gets equal number of batches."
         
-        # Counters to track position when using pseudo-epochs
-        self.next_pe_idx = 0 # To track position in the underlying sampler across pseudo-epochs
-        self.next_te_idx = 0 # To track position in the underlying sampler across true-epochs
+        # Counter to track position in the underlying sampler across true-epochs
+        self.next_te_idx = 0
         self.sampler_iter = None
 
 
@@ -191,16 +190,19 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
                 if should_yield:
                     yield batch
         else:
-            # This iteration goes over a pseudo-epoch
-            while self.next_pe_idx < self.batches_per_pseudoepoch:
+            # This iteration goes over one pseudo-epoch.
+            # Use a local pseudo-epoch index so each __iter__ call is self-contained.
+            # Lightning may stop iteration after len(self) batches without exhausting the generator.
+            pe_idx = 0
+            while pe_idx < self.batches_per_pseudoepoch:
                 if self.sampler_iter is None:
                     # This begins the first true epoch (and reshuffle data internally) if sampler.shuffle is True
                     self.sampler_iter = iter(self.sampler)
                 try:
                     batch = next(self.sampler_iter)
                     # TODO: is the second condition ever violated?
-                    should_yield = (self.next_pe_idx % self.num_replicas == self.rank and self.next_pe_idx < n_batches_this_replica * self.num_replicas)
-                    self.next_pe_idx += 1
+                    should_yield = (pe_idx % self.num_replicas == self.rank and pe_idx < n_batches_this_replica * self.num_replicas)
+                    pe_idx += 1
                     self.next_te_idx += 1
                     if should_yield:
                         yield batch
@@ -213,5 +215,3 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
                     self.current_true_epoch += 1
                     continue
 
-            # Pseudo-epoch ended
-            self.next_pe_idx = 0
