@@ -233,6 +233,7 @@ class LadderVAE(nn.Module):
         # Defaults
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
@@ -261,6 +262,8 @@ class LadderVAE(nn.Module):
             )
         else:
             pseudo_labels = y
+
+        probabilities = F.softmax(td_data["class_logits"][-1], dim=-1)
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)
@@ -294,7 +297,7 @@ class LadderVAE(nn.Module):
             kl_layer = compute_kl_loss(
                 td_data["posterior"],
                 td_data["prior"],
-                td_data["class_probabilities"][-1],
+                probabilities,
                 label=y,
                 conv_mult=self.conv_mult,
             )
@@ -314,7 +317,7 @@ class LadderVAE(nn.Module):
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
             "inpainting_loss": inpainting_loss,
-            "class_probabilities": td_data["class_probabilities"][-1],
+            "class_probabilities": probabilities,
         }
         return output
 
@@ -577,19 +580,8 @@ class LadderVAE(nn.Module):
             flat_mu_anchors = flat_mu[anchors]
 
             probs_i = None
-            if class_probabilities is not None:
-                probs_i = class_probabilities[i]
-            if (
-                probs_i is None
-                and class_logits is not None
-                and class_logits[i] is not None
-            ):
-                probs_i = F.softmax(class_logits[i], dim=1)
-
-            if probs_i is not None:
-                tp_anchors = probs_i[anchors].argmax(dim=1) == anchor_labels
-            else:
-                tp_anchors = torch.ones_like(anchor_labels, dtype=torch.bool)
+            probs_i = F.softmax(class_logits[i], dim=1)
+            tp_anchors = probs_i[anchors].argmax(dim=1) == anchor_labels
 
             selected_mu = flat_mu_anchors[tp_anchors]
             selected_labels = anchor_labels[tp_anchors]
