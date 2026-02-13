@@ -18,6 +18,8 @@ class EarlyStoppingWithPatiencePropagation(EarlyStopping):
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx = 0):
         if pl_module.current_training_mode == "semisupervised":
             pl_module.log("val/radius_increase_patience", pl_module.current_radius_patience, prog_bar=True, on_epoch=True, sync_dist=True)
+            pl_module.log("val/early_stopping_patience", self.wait_count, prog_bar=True, on_epoch=True, sync_dist=True)
+
         return super().on_validation_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
 
 
