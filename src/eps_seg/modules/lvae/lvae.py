@@ -263,7 +263,19 @@ class LadderVAE(nn.Module):
         else:
             pseudo_labels = y
 
-        probabilities = F.softmax(td_data["class_logits"][-1], dim=-1)
+        all_class_logits = torch.stack(td_data["class_logits"], dim=0)  # (L, B, C)
+        votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
+        vote_counts = all_class_logits.new_zeros(
+            (votes.size(0), all_class_logits.size(-1))
+        )
+        vote_counts.scatter_add_(
+            dim=1,
+            index=votes,
+            src=torch.ones_like(votes, dtype=all_class_logits.dtype),
+        )
+        probabilities = (vote_counts + 1e-8) / (
+            vote_counts.sum(dim=1, keepdim=True) + 1e-8 * vote_counts.size(1)
+        )
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)

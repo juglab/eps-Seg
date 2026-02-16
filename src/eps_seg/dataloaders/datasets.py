@@ -141,6 +141,7 @@ class SemisupervisedDataset(Dataset):
             segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]
             return patch, label, segment, torch.tensor(g["coords"][0])
         else:
+            # this return the first one as the anchor and all its neighbours come after it
             coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
             patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
             labels = torch.tensor([g["labels"][0]] + [-1]*self.n_neighbors, dtype=torch.long)  # [4]
