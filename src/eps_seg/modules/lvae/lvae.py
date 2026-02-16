@@ -309,8 +309,7 @@ class LadderVAE(nn.Module):
             kl_layer = compute_kl_loss(
                 td_data["posterior"],
                 td_data["prior"],
-                probabilities,
-                label=y,
+                label=pseudo_labels if self.training_mode == "semisupervised" else y,
                 conv_mult=self.conv_mult,
             )
 

@@ -373,15 +373,12 @@ def get_normalized_tensor(img, model, device):
     return test_images
 
 
-def compute_kl_loss(q, p, probabilities, label=None, conv_mult=2):
+def compute_kl_loss(q, p, label=None, conv_mult=2):
     
     kl_loss_per_layer = []
     
     for layer, (q_dist, p_dist) in enumerate(zip(q, p)):
-        if layer == len(q) - 1:
-            n_components = probabilities.size(-1)
-            prior_probs = torch.ones(n_components, device=label.device) / n_components
-            
+        if layer == len(q) - 1:            
             kl_divergences = [
                     kl_divergence(q_dist, p_i).mean(dim=(-3, -2, -1) if conv_mult == 2 else (-4, -3, -2, -1)) for p_i in p_dist
                 ]
@@ -396,12 +393,8 @@ def compute_kl_loss(q, p, probabilities, label=None, conv_mult=2):
             else:
                 kl = torch.tensor(0.0)
                 
-            m = 0.5 * (probabilities + prior_probs)
-            js_div = 0.5 * torch.sum(probabilities * torch.log(probabilities / (m + 1e-10)), dim=1) + 0.5 * torch.sum(
-                prior_probs * torch.log(prior_probs / (m + 1e-10)), dim=1
-            )
 
-            kl_loss_per_layer.append(kl + js_div.mean())
+            kl_loss_per_layer.append(kl)
         else:
             kl_loss_per_layer.append(kl_divergence(q_dist, p_dist).mean())
 
