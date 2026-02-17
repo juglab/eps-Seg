@@ -410,17 +410,22 @@ def compute_cl_loss(
     margin=50.0,  # for raw per-level features
     learnable_thetas=True,
 ):
+    """
+Computes contrastive loss across multiple levels of features.
+For each level, it computes positive pair losses (same class) and negative pair losses (different class).
+    """
+
     if len(mus) == 0:
         return torch.tensor(0.0, device=labels.device, dtype=torch.float32)
 
-    cl_loss = torch.zeros((), device=mus[0].device)
+    cl_loss_per_layer = []
     for mu in mus:
         pos_pair_loss, neg_terms = pos_neg_loss([mu], labels, margin=margin)
         thetas = get_thetas(neg_terms, learnable=learnable_thetas)
         weighted_neg = compute_weighted_neg(neg_terms, thetas)
-        cl_loss = cl_loss + 0.5 * pos_pair_loss + 0.5 * weighted_neg
+        cl_loss_per_layer.append(0.5 * pos_pair_loss + 0.5 * weighted_neg)
 
-    return cl_loss
+    return torch.stack(cl_loss_per_layer)
 
 
 def pos_neg_loss(mus, labels, margin=5.0):

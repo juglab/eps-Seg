@@ -231,10 +231,10 @@ class LadderVAE(nn.Module):
         """
 
         # Defaults
-        cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        cl_per_layer = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        ce_per_layer = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        kl_layer = torch.tensor([], dtype=torch.float32, device=x.device)
+        kl_per_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
         # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
@@ -269,12 +269,12 @@ class LadderVAE(nn.Module):
             (votes.size(0), all_class_logits.size(-1))
         )
         vote_counts.scatter_add_(
-            dim=1,
+            dim=-1,
             index=votes,
             src=torch.ones_like(votes, dtype=all_class_logits.dtype),
         )
         probabilities = (vote_counts + 1e-8) / (
-            vote_counts.sum(dim=1, keepdim=True) + 1e-8 * vote_counts.size(1)
+            vote_counts.sum(dim=1, keepdim=True) + 1e-8 * vote_counts.size(-1)
         )
 
         # Restore original image size
@@ -292,21 +292,22 @@ class LadderVAE(nn.Module):
 
         if self.training or validation_mode:  # TODO: Merge with above condition?
             if self.use_contrastive_learning:
-                cl = compute_cl_loss(
+                cl_per_layer = compute_cl_loss(
                     mus=td_data["mu"],
                     labels=pseudo_labels if self.training_mode == "semisupervised" else y,
                     margin=self.margin,
                     learnable_thetas=self.learnable_thetas,
                 )
 
-            ce = sum(
-                compute_ce_loss(
-                    logits, pseudo_labels if self.training_mode == "semisupervised" else y
-                )
-                for logits in td_data["class_logits"]
-            )
+            ce_per_layer = torch.stack([
+                    compute_ce_loss(
+                        layer_logits, 
+                        pseudo_labels if self.training_mode == "semisupervised" else y
+                    ) 
+                    for layer_logits in td_data["class_logits"]
+                 ])
 
-            kl_layer = compute_kl_loss(
+            kl_per_layer = compute_kl_loss(
                 td_data["posterior"],
                 td_data["prior"],
                 label=pseudo_labels if self.training_mode == "semisupervised" else y,
@@ -319,16 +320,19 @@ class LadderVAE(nn.Module):
             "posterior": td_data["posterior"],
             "prior": td_data["prior"],
             "mu": td_data["mu"],
-            "kl_layer": kl_layer,
-            "kl": torch.mean(kl_layer.mean()),
-            "cl": cl,
-            "ce": ce,
+            "kl_per_layer": kl_per_layer,
+            "kl": torch.sum(kl_per_layer),
+            "cl_per_layer": cl_per_layer,
+            "cl": torch.sum(cl_per_layer),
+            "ce_per_layer": ce_per_layer,
+            "ce": torch.sum(ce_per_layer),
             "out_mean": likelihood_info["mean"],
             "out_mode": likelihood_info["mode"],
             "out_sample": likelihood_info["sample"],
             "likelihood_params": likelihood_info["params"],
             "inpainting_loss": inpainting_loss,
             "class_probabilities": probabilities,
+            "layers_logits": td_data["class_logits"]
         }
         return output
 
