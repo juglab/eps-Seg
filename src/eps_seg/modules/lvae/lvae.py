@@ -253,7 +253,7 @@ class LadderVAE(nn.Module):
 
         if self.training_mode == "semisupervised" and self.training:
             # get pseudo-labels
-            pseudo_labels = self.get_pseudo_labels(
+            pseudo_labels, pseudo_labels_stats = self.get_pseudo_labels(
                 td_data["mu"],
                 y,
                 td_data["class_probabilities"],
@@ -262,6 +262,7 @@ class LadderVAE(nn.Module):
             )
         else:
             pseudo_labels = y
+            pseudo_labels_stats = None
 
         all_class_logits = torch.stack(td_data["class_logits"], dim=0)  # (L, B, C)
         votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
@@ -332,7 +333,9 @@ class LadderVAE(nn.Module):
             "likelihood_params": likelihood_info["params"],
             "inpainting_loss": inpainting_loss,
             "class_probabilities": probabilities,
-            "layers_logits": td_data["class_logits"]
+            "layers_logits": td_data["class_logits"],
+            "pseudo_labels": pseudo_labels,
+            "pseudo_labels_stats": pseudo_labels_stats,
         }
         return output
 
@@ -590,12 +593,14 @@ class LadderVAE(nn.Module):
         n_layers = len(mus)
         per_layer_pseudo = []
 
+        confidences = [] # Used for logging
+
         for i, mu in enumerate(mus):
             flat_mu = mu.reshape(mu.size(0), -1)
             flat_mu_anchors = flat_mu[anchors]
 
             probs_i = None
-            probs_i = F.softmax(class_logits[i], dim=1)
+            probs_i = F.softmax(class_logits[i], dim=-1)
             tp_anchors = probs_i[anchors].argmax(dim=1) == anchor_labels
 
             selected_mu = flat_mu_anchors[tp_anchors]
@@ -638,9 +643,11 @@ class LadderVAE(nn.Module):
                 pseudo[conf <= threshold] = -1
             else:
                 pseudo = torch.full_like(label, -1, dtype=torch.long)
+                conf = torch.zeros_like(label, dtype=torch.float32)
 
             pseudo[anchors] = anchor_labels
             per_layer_pseudo.append(pseudo)
+            confidences.append(conf)
 
         votes = torch.stack(per_layer_pseudo, dim=0)
         valid_votes = votes != -1
@@ -655,4 +662,23 @@ class LadderVAE(nn.Module):
         ]
         final_pseudo[anchors] = anchor_labels
 
-        return final_pseudo
+        # Collect statistics for debugging
+
+        neighbor_mask = torch.ones_like(final_pseudo, dtype=torch.bool)
+        neighbor_mask[anchors] = False # Remove anchor points from the mask
+        n_neighbors = neighbor_mask.sum()
+        
+        assigned_pseudo_labels = neighbor_mask & (final_pseudo != -1)
+        n_assigned = assigned_pseudo_labels.sum()
+
+        stats = {
+                 "per_layer_pseudo_labels": per_layer_pseudo,
+                 "pseudo_labels_confidences": confidences,
+                 "anchors_indices": anchors,
+                 "n_neighbors": n_neighbors,
+                 "n_assigned": n_assigned,
+                 "neighbor_mask": neighbor_mask,
+                 "assigned_pseudo_labels_mask": assigned_pseudo_labels,
+                 }
+
+        return final_pseudo, stats

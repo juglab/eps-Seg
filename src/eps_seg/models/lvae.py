@@ -67,9 +67,13 @@ class LVAEModel(L.LightningModule):
             print("Using existing data statistics from checkpoint.")
         print("Seen samples:", self.seen_samples.item())
 
-    def log_step(self, outputs: dict, step: Literal["train", "val", "test"], batch_size: int):
-        print(f"Logging {step} step metrics:")
-
+    def log_step(self, 
+                 outputs: dict, 
+                 step: Literal["train", "val", "test"], 
+                 batch_size: int, 
+                 segments: torch.Tensor = None):
+        
+        # Logging Loss Terms
         self.log(f"{step}/IP", outputs["inpainting_loss"] * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log(f"{step}/IP_unweighted", outputs["inpainting_loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         
@@ -80,10 +84,39 @@ class LVAEModel(L.LightningModule):
             for l, val in enumerate(outputs[f"{loss_term_name}_per_layer"]):
                 self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
                 self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        
         self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+        # Logging x axis for graphs
         self.log(f"seen_samples", float(self.seen_samples), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
         self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
+
+        # Logging correct pseudo-labeling statistics
+        if outputs.get("pseudo_labels_stats") is not None and segments is not None:
+            pl = outputs["pseudo_labels"]
+            pl_stats = outputs["pseudo_labels_stats"]
+            nbr_msk = pl_stats["neighbor_mask"]
+            pl_ass_msk = pl_stats["assigned_pseudo_labels_mask"]
+
+            center_coords = [(self.cfg.img_shape[i] - 1) // 2 for i in range(len(self.cfg.img_shape))]
+            gt_pseudo_labels = segments[:, 0, *center_coords]
+
+            correct_pseudo_labels = (gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk])
+            n_tp_pseudo_labels = correct_pseudo_labels.sum() / pl_ass_msk.sum() if pl_ass_msk.sum() > 0 else 0
+
+            self.log(f"{step}/pseudo_labels/assigned_neighbors_perc", pl_stats["n_assigned"] / pl_stats["n_neighbors"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            self.log(f"{step}/pseudo_labels/assigned_pseudo_label_accuracy", n_tp_pseudo_labels, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            for label_cls in pl[pl_ass_msk].unique():
+                n_assigned_pl_class = (pl[pl_ass_msk] == label_cls).sum()
+                n_tp_pseudo_labels_class = ((gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk]) & (gt_pseudo_labels[pl_ass_msk] == label_cls)).sum() / n_assigned_pl_class if n_assigned_pl_class > 0 else 0
+                self.log(f"{step}/pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+            for l, conf in enumerate(pl_stats["pseudo_labels_confidences"]):
+                # How confident each layer is in assigning pseudo-labels to neighbors in general
+                self.log(f"{step}/pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log(f"{step}/pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+
+
 
     def compute_total_loss(self, outputs: dict):
         return (
@@ -94,7 +127,8 @@ class LVAEModel(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        x, y, z, _ = batch
+        x, y, s, c = batch
+
         batch_size = x.shape[0]
 
         outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold)
@@ -102,7 +136,7 @@ class LVAEModel(L.LightningModule):
 
         self.seen_samples += batch_size * self.trainer.world_size
         self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
-        self.log_step(outputs, "train", batch_size)
+        self.log_step(outputs, "train", batch_size, segments=s)
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -111,7 +145,7 @@ class LVAEModel(L.LightningModule):
         return outputs
 
     def validation_step(self, batch, batch_idx):
-        x, y, z, _ = batch
+        x, y, s, c = batch
         batch_size = x.shape[0]
 
         outputs = self.forward(x, 
@@ -121,7 +155,7 @@ class LVAEModel(L.LightningModule):
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
 
-        self.log_step(outputs, "val", x.shape[0])
+        self.log_step(outputs, "val", x.shape[0], segments=s)
         
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
