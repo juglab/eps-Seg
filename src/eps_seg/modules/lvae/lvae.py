@@ -251,32 +251,22 @@ class LadderVAE(nn.Module):
         # Top-down inference/generation
         out, td_data = self.topdown_pass(y, bu_values)
 
+    
+        all_class_logits = torch.stack(td_data["class_logits"], dim=0)  # (L, B, C)
+        
+        probabilities = self.consolidation_prob(all_class_logits, )
+        
         if self.training_mode == "semisupervised" and self.training:
             # get pseudo-labels
             pseudo_labels, pseudo_labels_stats = self.get_pseudo_labels(
-                td_data["mu"],
+                td_data["posterior"],
                 y,
-                td_data["class_probabilities"],
-                td_data["class_logits"],
+                probabilities,
                 threshold=confidence_threshold,
             )
         else:
             pseudo_labels = y
             pseudo_labels_stats = None
-
-        all_class_logits = torch.stack(td_data["class_logits"], dim=0)  # (L, B, C)
-        votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
-        vote_counts = all_class_logits.new_zeros(
-            (votes.size(0), all_class_logits.size(-1))
-        )
-        vote_counts.scatter_add_(
-            dim=-1,
-            index=votes,
-            src=torch.ones_like(votes, dtype=all_class_logits.dtype),
-        )
-        probabilities = (vote_counts + 1e-8) / (
-            vote_counts.sum(dim=1, keepdim=True) + 1e-8 * vote_counts.size(-1)
-        )
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)
@@ -434,7 +424,7 @@ class LadderVAE(nn.Module):
             prior[i] = aux["prior"]
             posterior[i] = aux["posterior"]
             mu[i] = aux["mu"]
-            class_probs[i] = aux["class_probabilities"]
+            # class_probs[i] = aux["class_probabilities"]
             class_logits[i] = aux["class_logits"]
 
         # Final top-down layer
@@ -444,7 +434,7 @@ class LadderVAE(nn.Module):
             "prior": prior,
             "posterior": posterior,
             "mu": mu,
-            "class_probabilities": class_probs,
+            # "class_probabilities": class_probs,
             "class_logits": class_logits,
         }
         return out, data
@@ -579,10 +569,9 @@ class LadderVAE(nn.Module):
 
     def get_pseudo_labels(
         self,
-        mus,
+        posteriors,
         label,
-        class_probabilities=None,
-        class_logits=None,
+        class_probs,
         threshold=0.99,
     ):
         anchors = torch.where(label != -1)[0]
@@ -590,62 +579,68 @@ class LadderVAE(nn.Module):
             return torch.full_like(label, -1, dtype=torch.long)
 
         anchor_labels = label[anchors].long()
-        n_layers = len(mus)
+        n_layers = len(posteriors)
         per_layer_pseudo = []
 
         confidences = [] # Used for logging
+        
+        tp_anchors = class_probs[anchors].argmax(dim=1) == anchor_labels
 
-        for i, mu in enumerate(mus):
+
+        for i, posterior in enumerate(posteriors):
+            mu = posterior.mean
+            std = posterior.stddev
+            logvar = 2.0 * torch.log(std.clamp_min(1e-8))
+
             flat_mu = mu.reshape(mu.size(0), -1)
             flat_mu_anchors = flat_mu[anchors]
 
-            probs_i = None
-            probs_i = F.softmax(class_logits[i], dim=-1)
-            tp_anchors = probs_i[anchors].argmax(dim=1) == anchor_labels
+            flat_var = logvar.reshape(logvar.size(0), -1).exp()
+            flat_var = flat_var.clamp_min(1e-6)
 
+            
             selected_mu = flat_mu_anchors[tp_anchors]
             selected_labels = anchor_labels[tp_anchors]
 
             feature_dim = flat_mu.size(1)
-            sums = torch.zeros(
-                self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype
-            )
-            counts = torch.zeros(
-                self.n_components, device=flat_mu.device, dtype=flat_mu.dtype
-            )
+            sums = torch.zeros(self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype)
+            counts = torch.zeros(self.n_components, device=flat_mu.device, dtype=flat_mu.dtype)
 
             if selected_labels.numel() > 0:
                 sums.index_add_(0, selected_labels, selected_mu)
-                counts.index_add_(
-                    0,
-                    selected_labels,
-                    torch.ones(
-                        selected_labels.numel(),
-                        device=flat_mu.device,
-                        dtype=flat_mu.dtype,
-                    ),
-                )
+                counts.index_add_(0, selected_labels, torch.ones_like(selected_labels, dtype=flat_mu.dtype))
 
             valid_classes = counts > 0
             means = sums / counts.clamp(min=1).unsqueeze(1)
 
-            x2 = (flat_mu * flat_mu).sum(dim=1, keepdim=True)
-            m2 = (means * means).sum(dim=1).unsqueeze(0)
-            dists = x2 + m2 - 2.0 * (flat_mu @ means.t())
+            # uncertainty-aware squared euclidean
+            diff = flat_mu.unsqueeze(1) - means.unsqueeze(0)               # [N,C,D]
+            dists = (diff * diff / flat_var.unsqueeze(1)).sum(dim=2)       # [N,C]
             dists = dists.clamp_min(0.0)
 
-            logits = -dists / 200.0
+            # per-layer temperature
+            with torch.no_grad():
+                if valid_classes.any():
+                    anchor_d = dists[anchors][:, valid_classes]
+                    nearest = anchor_d.min(dim=1).values
+                    tau = nearest.median().clamp_min(1e-6)
+                else:
+                    tau = torch.tensor(1.0, device=flat_mu.device)
+
+            logits = -dists / tau
             logits[:, ~valid_classes] = float("-inf")
 
             if valid_classes.any():
                 conf, pseudo = F.softmax(logits, dim=1).max(dim=1)
                 pseudo = pseudo.long()
-                pseudo[conf <= threshold] = -1
+                non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
+                non_anchors[anchors] = False
+                pseudo[non_anchors & (conf <= threshold)] = -1
+
             else:
                 pseudo = torch.full_like(label, -1, dtype=torch.long)
                 conf = torch.zeros_like(label, dtype=torch.float32)
 
-            pseudo[anchors] = anchor_labels
             per_layer_pseudo.append(pseudo)
             confidences.append(conf)
 
@@ -682,3 +677,15 @@ class LadderVAE(nn.Module):
                  }
 
         return final_pseudo, stats
+
+    def consolidation_prob(self, all_class_logits):
+        votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
+        vote_counts = all_class_logits.new_zeros(
+            (votes.size(0), all_class_logits.size(-1))
+        )
+        vote_counts.scatter_add_(
+            dim=-1,
+            index=votes,
+            src=torch.ones_like(votes, dtype=all_class_logits.dtype),
+        )
+        return vote_counts / all_class_logits.size(0)

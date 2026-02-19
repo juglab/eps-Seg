@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from typing import Type, Union, Optional, Tuple
+from typing import Type, Union
 from torch.distributions import Normal
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -870,7 +870,7 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
         p = Normal(p_mu, p_std)
 
         # Define q(z)
-        qz_params, class_logits, class_probs = self.conditional_layer(q_params)
+        qz_params, class_logits = self.conditional_layer(q_params)
         q_mu, _, q_std = self._clamp_params(qz_params)
         q = Normal(q_mu, q_std)
 
@@ -884,7 +884,6 @@ class NormalStochasticConvBlock(BaseStochasticConvBlock):
             "mu": q_mu,
             "z": z,
             "class_logits": class_logits,
-            "class_probabilities": class_probs,
         }
 
         return out, data
@@ -926,7 +925,7 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
 
         # Get q(y|x) from prior parameters
         # and q(z|x,y) from conditional prior
-        qz_params, class_logits, class_probs = self.conditional_layer(q_params)
+        qz_params, class_logits = self.conditional_layer(q_params)
         q_mu, _, q_std = self._clamp_params(qz_params)
         q = Normal(q_mu, q_std)
         z = q.rsample()
@@ -939,7 +938,6 @@ class MixtureStochasticConvBlock(BaseStochasticConvBlock):
             "mu": q_mu,
             "z": z,
             "class_logits": class_logits,
-            "class_probabilities": class_probs,
         }
 
         return out, data
@@ -1011,14 +1009,10 @@ class ConditionalPosterior(nn.Module):
         """
         # q(y|x)
         class_logits = self.qy_x(x)  # (B, n_components)
-        tau = max(self.tau_min, self.temperature * (self.tau_decay**self._tau_step))
-        if self.training and tau > self.tau_min:
-            self._tau_step += 1
-        class_probs = F.gumbel_softmax(logits=class_logits, tau=tau, hard=False, dim=-1)
 
         # FiLM modulation
-        gamma = self.gamma_layer(class_probs)  # (B, c_in)
-        beta = self.beta_layer(class_probs)  # (B, c_in)
+        gamma = self.gamma_layer(class_logits)  # (B, c_in)
+        beta = self.beta_layer(class_logits)  # (B, c_in)
 
         # Broadcast to spatial dims
         while gamma.ndim < x.ndim:
@@ -1030,4 +1024,4 @@ class ConditionalPosterior(nn.Module):
         # q(z|x, y)
         qz_params = self.qz_xy(x_mod)
 
-        return qz_params, class_logits, class_probs
+        return qz_params, class_logits
