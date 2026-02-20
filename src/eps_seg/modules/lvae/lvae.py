@@ -64,6 +64,7 @@ class LadderVAE(nn.Module):
         self.margin = cfg.margin
         self.n_components = cfg.n_components
         self.learnable_thetas = True
+        self.aggregation_mode = cfg.aggregation_mode
 
         # Derived paramters
         self.input_array_shape = cfg.img_shape
@@ -251,17 +252,17 @@ class LadderVAE(nn.Module):
         # Top-down inference/generation
         out, td_data = self.topdown_pass(y, bu_values)
 
-    
         all_class_logits = torch.stack(td_data["class_logits"], dim=0)  # (L, B, C)
-        
-        probabilities = self.consolidation_prob(all_class_logits, )
-        
+
+        probabilities = self.consolidation_prob(
+            all_class_logits, mode=self.aggregation_mode
+        )
+
         if self.training_mode == "semisupervised" and self.training:
             # get pseudo-labels
             pseudo_labels, pseudo_labels_stats = self.get_pseudo_labels(
                 td_data["posterior"],
                 y,
-                probabilities,
                 threshold=confidence_threshold,
             )
         else:
@@ -290,13 +291,15 @@ class LadderVAE(nn.Module):
                     learnable_thetas=self.learnable_thetas,
                 )
 
-            ce_per_layer = torch.stack([
+            ce_per_layer = torch.stack(
+                [
                     compute_ce_loss(
-                        layer_logits, 
-                        pseudo_labels if self.training_mode == "semisupervised" else y
-                    ) 
+                        layer_logits,
+                        pseudo_labels if self.training_mode == "semisupervised" else y,
+                    )
                     for layer_logits in td_data["class_logits"]
-                 ])
+                ]
+            )
 
             kl_per_layer = compute_kl_loss(
                 td_data["posterior"],
@@ -571,7 +574,6 @@ class LadderVAE(nn.Module):
         self,
         posteriors,
         label,
-        class_probs,
         threshold=0.99,
     ):
         anchors = torch.where(label != -1)[0]
@@ -582,12 +584,9 @@ class LadderVAE(nn.Module):
         n_layers = len(posteriors)
         per_layer_pseudo = []
 
-        confidences = [] # Used for logging
-        
-        tp_anchors = class_probs[anchors].argmax(dim=1) == anchor_labels
+        confidences = []  # Used for logging
 
-
-        for i, posterior in enumerate(posteriors):
+        for posterior in posteriors:
             mu = posterior.mean
             std = posterior.stddev
             logvar = 2.0 * torch.log(std.clamp_min(1e-8))
@@ -598,9 +597,8 @@ class LadderVAE(nn.Module):
             flat_var = logvar.reshape(logvar.size(0), -1).exp()
             flat_var = flat_var.clamp_min(1e-6)
 
-            
-            selected_mu = flat_mu_anchors[tp_anchors]
-            selected_labels = anchor_labels[tp_anchors]
+            selected_mu = flat_mu_anchors[anchors]
+            selected_labels = anchor_labels[anchors]
 
             feature_dim = flat_mu.size(1)
             sums = torch.zeros(self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype)
@@ -678,7 +676,16 @@ class LadderVAE(nn.Module):
 
         return final_pseudo, stats
 
-    def consolidation_prob(self, all_class_logits):
+    def consolidation_prob(self, all_class_logits, mode="MV"):
+
+        if mode == "MV":
+            return self.majority_voting(all_class_logits)
+        elif mode == "PoE":
+            return self.product_of_experts(all_class_logits)
+        elif mode == "MoE":
+            return self.mixture_of_experts(all_class_logits)
+
+    def majority_voting(self, all_class_logits):
         votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
         vote_counts = all_class_logits.new_zeros(
             (votes.size(0), all_class_logits.size(-1))
@@ -688,4 +695,11 @@ class LadderVAE(nn.Module):
             index=votes,
             src=torch.ones_like(votes, dtype=all_class_logits.dtype),
         )
+
         return vote_counts / all_class_logits.size(0)
+
+    def product_of_experts(self, all_class_logits):
+        return F.softmax(all_class_logits.sum(dim=0), dim=-1)
+
+    def mixture_of_experts(self, all_class_logits):
+        return F.softmax(all_class_logits, dim=-1).mean(dim=0)

@@ -99,6 +99,10 @@ class LVAEConfig(BaseEPSModelConfig):
     learnable_thetas: bool = Field(
         default=True, description="Whether to use NeurIPS-paper contrastive learning."
     )
+    aggregation_mode: str = Field(
+        default="MV",
+        description="Aggregation mode for the segmentation prediction. ( MJ: Majority Voting, PoE: Product of Experts, MoE: Mixture of Experts)",
+    )
 
     @model_validator(mode="after")
     def check_z_dim_size(self):
