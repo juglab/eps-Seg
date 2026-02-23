@@ -81,7 +81,7 @@ class LVAEModel(L.LightningModule):
             # Average loss term over all layers
             self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name] * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
             # Log every layer loss term 
-            for l, val in enumerate(outputs[f"{loss_term_name}_per_layer"]):
+            for l, val in enumerate(outputs["kl_per_layer"]):
                 self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
                 self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
