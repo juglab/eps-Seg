@@ -592,13 +592,11 @@ class LadderVAE(nn.Module):
             logvar = 2.0 * torch.log(std.clamp_min(1e-8))
 
             flat_mu = mu.reshape(mu.size(0), -1)
-            flat_mu_anchors = flat_mu[anchors]
-
             flat_var = logvar.reshape(logvar.size(0), -1).exp()
             flat_var = flat_var.clamp_min(1e-6)
 
-            selected_mu = flat_mu_anchors[anchors]
-            selected_labels = anchor_labels[anchors]
+            selected_mu = flat_mu[anchors]
+            selected_labels = label[anchors]
 
             feature_dim = flat_mu.size(1)
             sums = torch.zeros(self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype)
