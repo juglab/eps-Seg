@@ -5,7 +5,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
-from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback
+from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback, OptimizerStateTransferCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import wandb
@@ -126,12 +126,22 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                 save_dir=exp_config.get_log_dir(),
             )
 
+        # Initialize model from best supervised checkpoint
+        best_supervised_modelcheckpoint = exp_config.best_checkpoint_path(mode="supervised") if skip_supervised else supervised_modelcheckpoint.best_model_path
+
         semisupervised_trainer = L.Trainer(
             devices="auto",
             strategy=strategy,
             logger=semisupervised_logger,
             max_epochs=train_config.max_epochs,
             callbacks=[
+                    OptimizerStateTransferCallback(
+                        checkpoint_path=str(best_supervised_modelcheckpoint),
+                        restore_optimizer=True,
+                        restore_lr_scheduler=True,
+                        restore_precision=train_config.amp,
+                        strict_counts=True,
+                    ),
                     SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
                     semisupervised_modelcheckpoint, 
                     EarlyStoppingWithPatiencePropagation(
@@ -153,9 +163,6 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
             # fast_dev_run=True,
             )
 
-        # Initialize model from best supervised checkpoint
-        best_supervised_modelcheckpoint = exp_config.best_checkpoint_path(mode="supervised") if skip_supervised else supervised_modelcheckpoint.best_model_path
-        # TODO: This resets the optimizers and the global_step, but calling .fit(ckpt_path=...) gives weird behavior when used on another trainer.
         model = LVAEModel.load_from_checkpoint(best_supervised_modelcheckpoint,
                                             model_cfg=model_config,
                                             train_cfg=train_config).to(device)

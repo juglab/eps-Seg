@@ -2,6 +2,9 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
 import shutil
 import os
+from pathlib import Path
+from typing import Optional
+import torch
 
 class EarlyStoppingWithPatiencePropagation(EarlyStopping):
     """
@@ -33,6 +36,90 @@ class SemiSupervisedModeCallback(L.Callback):
         if pl_module.current_training_mode == "supervised":
             pl_module.update_mode("semisupervised")
             pl_module.trainer.datamodule.set_mode("semisupervised")
+        return super().on_fit_start(trainer, pl_module)
+
+class OptimizerStateTransferCallback(L.Callback):
+    """
+        Restore optimization state from a source checkpoint without restoring trainer loop/callback state.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        restore_optimizer: bool = True,
+        restore_lr_scheduler: bool = True,
+        restore_precision: bool = True,
+        strict_counts: bool = True,
+    ):
+        super().__init__()
+        self.checkpoint_path = checkpoint_path
+        self.restore_optimizer = restore_optimizer
+        self.restore_lr_scheduler = restore_lr_scheduler
+        self.restore_precision = restore_precision
+        self.strict_counts = strict_counts
+        self._has_restored = False
+
+    def _validate_counts(self, what: str, available: int, expected: int):
+        if available != expected and self.strict_counts:
+            raise RuntimeError(
+                f"{what} count mismatch while restoring state from {self.checkpoint_path}: "
+                f"checkpoint has {available}, trainer has {expected}."
+            )
+
+    def on_fit_start(self, trainer, pl_module):
+        if self._has_restored:
+            return super().on_fit_start(trainer, pl_module)
+
+        ckpt_path = Path(self.checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found for optimizer state transfer: {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        print(f"OptimizerStateTransferCallback: loading training state from {ckpt_path}")
+
+        if self.restore_optimizer:
+            optimizer_states: Optional[list] = checkpoint.get("optimizer_states")
+            if optimizer_states is None:
+                if self.strict_counts:
+                    raise RuntimeError("Checkpoint does not contain 'optimizer_states'.")
+                print("OptimizerStateTransferCallback: no optimizer state found; skipping optimizer restore.")
+            else:
+                self._validate_counts("optimizer", len(optimizer_states), len(trainer.optimizers))
+                for i, (optimizer, state_dict) in enumerate(zip(trainer.optimizers, optimizer_states)):
+                    optimizer.load_state_dict(state_dict)
+                    print(f"OptimizerStateTransferCallback: restored optimizer[{i}] state.")
+
+        if self.restore_lr_scheduler:
+            scheduler_states: Optional[list] = checkpoint.get("lr_schedulers")
+            if scheduler_states is None:
+                if self.strict_counts:
+                    raise RuntimeError("Checkpoint does not contain 'lr_schedulers'.")
+                print("OptimizerStateTransferCallback: no lr scheduler state found; skipping scheduler restore.")
+            else:
+                self._validate_counts("lr scheduler", len(scheduler_states), len(trainer.lr_scheduler_configs))
+                for i, (scheduler_cfg, state_dict) in enumerate(zip(trainer.lr_scheduler_configs, scheduler_states)):
+                    scheduler_cfg.scheduler.load_state_dict(state_dict)
+                    print(f"OptimizerStateTransferCallback: restored lr_scheduler[{i}] state.")
+
+        if self.restore_precision:
+            precision_plugin = trainer.precision_plugin
+            precision_plugin_name = type(precision_plugin).__name__
+            precision_state = checkpoint.get(precision_plugin_name)
+            if precision_state is None:
+                print(
+                    f"OptimizerStateTransferCallback: no precision state for key '{precision_plugin_name}'; "
+                    "skipping precision restore."
+                )
+            elif hasattr(precision_plugin, "load_state_dict"):
+                precision_plugin.load_state_dict(precision_state)
+                print(f"OptimizerStateTransferCallback: restored precision state for '{precision_plugin_name}'.")
+            else:
+                print(
+                    f"OptimizerStateTransferCallback: precision plugin '{precision_plugin_name}' has no "
+                    "load_state_dict; skipping precision restore."
+                )
+
+        self._has_restored = True
         return super().on_fit_start(trainer, pl_module)
 
 class ThresholdSchedulerCallback(L.Callback):
