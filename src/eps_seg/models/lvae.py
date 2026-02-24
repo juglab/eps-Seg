@@ -103,17 +103,17 @@ class LVAEModel(L.LightningModule):
             correct_pseudo_labels = (gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk])
             n_tp_pseudo_labels = correct_pseudo_labels.sum() / pl_ass_msk.sum() if pl_ass_msk.sum() > 0 else 0
 
-            self.log(f"{step}/pseudo_labels/assigned_neighbors_perc", pl_stats["n_assigned"] / pl_stats["n_neighbors"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            self.log(f"{step}/pseudo_labels/assigned_pseudo_label_accuracy", n_tp_pseudo_labels, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            for label_cls in pl[pl_ass_msk].unique():
+            self.log(f"{step}_pseudo_labels/assigned_neighbors_perc", pl_stats["n_assigned"] / pl_stats["n_neighbors"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy", n_tp_pseudo_labels, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            for label_cls in range(self.cfg.n_components):
                 n_assigned_pl_class = (pl[pl_ass_msk] == label_cls).sum()
                 n_tp_pseudo_labels_class = ((gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk]) & (gt_pseudo_labels[pl_ass_msk] == label_cls)).sum() / n_assigned_pl_class if n_assigned_pl_class > 0 else 0
-                self.log(f"{step}/pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
             for l, conf in enumerate(pl_stats["pseudo_labels_confidences"]):
                 # How confident each layer is in assigning pseudo-labels to neighbors in general
-                self.log(f"{step}/pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-                self.log(f"{step}/pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log(f"{step}_pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+                self.log(f"{step}_pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
 
 
