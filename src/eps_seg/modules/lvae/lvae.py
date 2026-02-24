@@ -11,7 +11,7 @@ from eps_seg.modules.lvae.utils import (
     pad_img_tensor,
     Interpolate,
     compute_cl_loss,
-    compute_ce_loss,
+    cross_entropy_from_probs,
     compute_kl_loss,
 )
 from eps_seg.modules.lvae.layers import (
@@ -232,8 +232,8 @@ class LadderVAE(nn.Module):
         """
 
         # Defaults
-        cl_per_layer = torch.tensor(0.0, dtype=torch.float32, device=x.device)
-        ce_per_layer = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
+        ce_nll_loss = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         probabilities = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         kl_per_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
@@ -284,22 +284,14 @@ class LadderVAE(nn.Module):
 
         if self.training or validation_mode:  # TODO: Merge with above condition?
             if self.use_contrastive_learning:
-                cl_per_layer = compute_cl_loss(
+                cl = compute_cl_loss(
                     mus=td_data["mu"],
                     labels=pseudo_labels if self.training_mode == "semisupervised" else y,
                     margin=self.margin,
                     learnable_thetas=self.learnable_thetas,
                 )
-
-            ce_per_layer = torch.stack(
-                [
-                    compute_ce_loss(
-                        layer_logits,
-                        pseudo_labels if self.training_mode == "semisupervised" else y,
-                    )
-                    for layer_logits in td_data["class_logits"]
-                ]
-            )
+                
+            ce_nll_loss = cross_entropy_from_probs(probabilities, pseudo_labels if self.training_mode == "semisupervised" else y, ignore_index=-1)
 
             kl_per_layer = compute_kl_loss(
                 td_data["posterior"],
@@ -316,10 +308,8 @@ class LadderVAE(nn.Module):
             "mu": td_data["mu"],
             "kl_per_layer": kl_per_layer,
             "kl": torch.sum(kl_per_layer),
-            "cl_per_layer": cl_per_layer,
-            "cl": torch.sum(cl_per_layer),
-            "ce_per_layer": ce_per_layer,
-            "ce": torch.sum(ce_per_layer),
+            "cl": cl,
+            "ce": ce_nll_loss,
             "out_mean": likelihood_info["mean"],
             "out_mode": likelihood_info["mode"],
             "out_sample": likelihood_info["sample"],
@@ -577,14 +567,11 @@ class LadderVAE(nn.Module):
         threshold=0.99,
     ):
         anchors = torch.where(label != -1)[0]
-        if anchors.numel() == 0:
-            return torch.full_like(label, -1, dtype=torch.long)
 
-        anchor_labels = label[anchors].long()
-        n_layers = len(posteriors)
+        selected_labels = label[anchors].long()
         per_layer_pseudo = []
-
-        confidences = []  # Used for logging
+        per_layer_probs = []
+        confidences = []  # Used for logging 
 
         for posterior in posteriors:
             mu = posterior.mean
@@ -592,13 +579,10 @@ class LadderVAE(nn.Module):
             logvar = 2.0 * torch.log(std.clamp_min(1e-8))
 
             flat_mu = mu.reshape(mu.size(0), -1)
-            flat_mu_anchors = flat_mu[anchors]
+            selected_mu = flat_mu[anchors]
 
             flat_var = logvar.reshape(logvar.size(0), -1).exp()
             flat_var = flat_var.clamp_min(1e-6)
-
-            selected_mu = flat_mu_anchors[anchors]
-            selected_labels = anchor_labels[anchors]
 
             feature_dim = flat_mu.size(1)
             sums = torch.zeros(self.n_components, feature_dim, device=flat_mu.device, dtype=flat_mu.dtype)
@@ -618,42 +602,37 @@ class LadderVAE(nn.Module):
 
             # per-layer temperature
             with torch.no_grad():
-                if valid_classes.any():
-                    anchor_d = dists[anchors][:, valid_classes]
-                    nearest = anchor_d.min(dim=1).values
-                    tau = nearest.median().clamp_min(1e-6)
-                else:
-                    tau = torch.tensor(1.0, device=flat_mu.device)
+                anchor_d = dists[anchors][:, valid_classes]
+                nearest = anchor_d.min(dim=1).values
+                tau = nearest.median().clamp_min(1e-6)
+
 
             logits = -dists / tau
             logits[:, ~valid_classes] = float("-inf")
 
-            if valid_classes.any():
-                conf, pseudo = F.softmax(logits, dim=1).max(dim=1)
-                pseudo = pseudo.long()
-                non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
-                non_anchors[anchors] = False
-                pseudo[non_anchors & (conf <= threshold)] = -1
-
-            else:
-                pseudo = torch.full_like(label, -1, dtype=torch.long)
-                conf = torch.zeros_like(label, dtype=torch.float32)
+            probs = F.softmax(logits, dim=1)
+            per_layer_probs.append(probs)
+            layer_conf, pseudo = probs.max(dim=1)
+            pseudo = pseudo.long()
+            non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
+            non_anchors[anchors] = False
+            pseudo[non_anchors & (layer_conf <= threshold)] = -1
 
             per_layer_pseudo.append(pseudo)
-            confidences.append(conf)
+            confidences.append(probs)
 
-        votes = torch.stack(per_layer_pseudo, dim=0)
-        valid_votes = votes != -1
-        one_hot_votes = F.one_hot(votes.clamp(min=0), num_classes=self.n_components)
-        one_hot_votes = one_hot_votes * valid_votes.unsqueeze(-1)
-        vote_counts = one_hot_votes.sum(dim=0)
+        votes = torch.stack(per_layer_pseudo, dim=0)  # (L, B)
+        expert_mask = votes != -1
+        probs = torch.stack(per_layer_probs, dim=0)  # (L, B, C)
+        masked_probs = probs * expert_mask.unsqueeze(-1)
+        n_valid_experts = expert_mask.sum(dim=0)
+        moe_probs = masked_probs.sum(dim=0) / n_valid_experts.clamp(min=1).unsqueeze(1)
+        moe_conf, moe_label = moe_probs.max(dim=1)
 
-        majority_count, majority_label = vote_counts.max(dim=1)
         final_pseudo = torch.full_like(label, -1, dtype=torch.long)
-        final_pseudo[majority_count > (n_layers // 2)] = majority_label[
-            majority_count > (n_layers // 2)
-        ]
-        final_pseudo[anchors] = anchor_labels
+        assignable = (n_valid_experts > 0) & (moe_conf > threshold)
+        final_pseudo[assignable] = moe_label[assignable]
+        final_pseudo[anchors] = selected_labels
 
         # Collect statistics for debugging
 
@@ -678,28 +657,13 @@ class LadderVAE(nn.Module):
 
     def consolidation_prob(self, all_class_logits, mode="MV"):
 
-        if mode == "MV":
-            return self.majority_voting(all_class_logits)
-        elif mode == "PoE":
+        if mode == "PoE":
             return self.product_of_experts(all_class_logits)
-        elif mode == "MoE":
-            return self.mixture_of_experts(all_class_logits)
-
-    def majority_voting(self, all_class_logits):
-        votes = all_class_logits.argmax(dim=-1).transpose(0, 1)  # (B, L)
-        vote_counts = all_class_logits.new_zeros(
-            (votes.size(0), all_class_logits.size(-1))
-        )
-        vote_counts.scatter_add_(
-            dim=-1,
-            index=votes,
-            src=torch.ones_like(votes, dtype=all_class_logits.dtype),
-        )
-
-        return vote_counts / all_class_logits.size(0)
+        elif mode == "SMV":
+            return self.soft_majority_voting(all_class_logits)
 
     def product_of_experts(self, all_class_logits):
         return F.softmax(all_class_logits.sum(dim=0), dim=-1)
 
-    def mixture_of_experts(self, all_class_logits):
+    def soft_majority_voting(self, all_class_logits):
         return F.softmax(all_class_logits, dim=-1).mean(dim=0)

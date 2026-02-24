@@ -400,9 +400,14 @@ def compute_kl_loss(q, p, label=None, conv_mult=2):
 
     return torch.stack(kl_loss_per_layer)
 
-
-def compute_ce_loss(logits, labels):
-    return F.cross_entropy(logits, labels, ignore_index=-1)
+def cross_entropy_from_probs(probs, targets, eps=1e-12, ignore_index=-1):
+    probs = probs.clamp(min=eps)          # avoid log(0)
+    log_probs = torch.log(probs)
+    return F.nll_loss(
+        log_probs,
+        targets,
+        ignore_index=ignore_index
+    )
 
 def compute_cl_loss(
     mus,
@@ -410,22 +415,11 @@ def compute_cl_loss(
     margin=50.0,  # for raw per-level features
     learnable_thetas=True,
 ):
-    """
-Computes contrastive loss across multiple levels of features.
-For each level, it computes positive pair losses (same class) and negative pair losses (different class).
-    """
-
-    if len(mus) == 0:
-        return torch.tensor(0.0, device=labels.device, dtype=torch.float32)
-
-    cl_loss_per_layer = []
-    for mu in mus:
-        pos_pair_loss, neg_terms = pos_neg_loss([mu], labels, margin=margin)
-        thetas = get_thetas(neg_terms, learnable=learnable_thetas)
-        weighted_neg = compute_weighted_neg(neg_terms, thetas)
-        cl_loss_per_layer.append(0.5 * pos_pair_loss + 0.5 * weighted_neg)
-
-    return torch.stack(cl_loss_per_layer)
+    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin)
+    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+    weighted_neg = compute_weighted_neg(neg_terms, thetas)
+    cl_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
+    return cl_loss
 
 
 def pos_neg_loss(mus, labels, margin=5.0):
