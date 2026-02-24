@@ -81,9 +81,9 @@ class LVAEModel(L.LightningModule):
             # Average loss term over all layers
             self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name] * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
             # Log every layer loss term 
-            for l, val in enumerate(outputs["kl_per_layer"]):
-                self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-                self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        for l, val in enumerate(outputs["kl_per_layer"]):
+            self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
         # Logging x axis for graphs
@@ -110,7 +110,7 @@ class LVAEModel(L.LightningModule):
                 n_tp_pseudo_labels_class = ((gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk]) & (gt_pseudo_labels[pl_ass_msk] == label_cls)).sum() / n_assigned_pl_class if n_assigned_pl_class > 0 else 0
                 self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
-            for l, layer_probs in enumerate(pl_stats["pseudo_labels_confidences"]):
+            for l, conf in enumerate(pl_stats["pseudo_labels_confidences"]):
                 # How confident each layer is in assigning pseudo-labels to neighbors in general
                 self.log(f"{step}_pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
                 self.log(f"{step}_pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
