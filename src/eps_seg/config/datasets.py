@@ -142,7 +142,7 @@ class SliceBasedDatasetConfig(BaseEPSDatasetConfig):
             paths[key] = (img_path, lbl_path)
         return paths
         
-class ZStackedSlice2DDatasetConfig(SliceBasedDatasetConfig):
+class ZStackedSlice2DDatasetConfig(BaseEPSDatasetConfig):
     """
         Configuration for 2D slice-based datasets where the samples are patches that are previously stacked in the Z dimension. 
         This is useful so the user can balance the dataset or classes depending on intensity or other criteria, while still using the 2D training pipeline. 
