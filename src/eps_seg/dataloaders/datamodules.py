@@ -196,7 +196,7 @@ class EPSSegDataModule(L.LightningDataModule):
         rng = np.random.RandomState(self.cfg.seed)
         for key in keys:
             # valid indices are the indices of z-slices where labels are not all -1 (i.e., they are not outside the cell)
-            valid_indices = np.where(~np.all(labels == -1, axis=(-2, -1)))[0]
+            valid_indices = np.where(~np.all(labels[key] == -1, axis=(-2, -1)))[0]
             total_samples = valid_indices.shape[0]
             if shuffle:
                 rng.shuffle(valid_indices)  # Shuffles in place
