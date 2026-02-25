@@ -100,8 +100,8 @@ class LVAEConfig(BaseEPSModelConfig):
         default=True, description="Whether to use NeurIPS-paper contrastive learning."
     )
     aggregation_mode: str = Field(
-        default="MV",
-        description="Aggregation mode for the segmentation prediction. ( MJ: Majority Voting, PoE: Product of Experts, MoE: Mixture of Experts)",
+        default="SMV",
+        description="Aggregation mode for the segmentation prediction. ( SMV: Softmax Majority Voting, PoE: Product of Experts)",
     )
 
     @model_validator(mode="after")

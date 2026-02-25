@@ -377,7 +377,6 @@ class LadderVAE(nn.Module):
         prior = [None] * self.n_layers
         posterior = [None] * self.n_layers
         mu = [None] * self.n_layers
-        class_probs = [None] * self.n_layers
         class_logits = [None] * self.n_layers
 
         if forced_latent is None:
@@ -417,7 +416,6 @@ class LadderVAE(nn.Module):
             prior[i] = aux["prior"]
             posterior[i] = aux["posterior"]
             mu[i] = aux["mu"]
-            # class_probs[i] = aux["class_probabilities"]
             class_logits[i] = aux["class_logits"]
 
         # Final top-down layer
@@ -427,7 +425,6 @@ class LadderVAE(nn.Module):
             "prior": prior,
             "posterior": posterior,
             "mu": mu,
-            # "class_probabilities": class_probs,
             "class_logits": class_logits,
         }
         return out, data
@@ -655,7 +652,7 @@ class LadderVAE(nn.Module):
 
         return final_pseudo, stats
 
-    def consolidation_prob(self, all_class_logits, mode="MV"):
+    def consolidation_prob(self, all_class_logits, mode="SMV"):
 
         if mode == "PoE":
             return self.product_of_experts(all_class_logits)
