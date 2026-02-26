@@ -416,8 +416,9 @@ class PredictionDataset(Dataset):
         final_mask[:, :, :, W - self.half:] = False
         final_mask[:, :, :self.half, :] = False
         final_mask[:, :, H - self.half:, :] = False
-        final_mask[:, :self.half, :, :] = False
-        final_mask[:, Z - self.half:, :, :] = False
+        if self.dim == 3 and Z > self.half:
+            final_mask[:, :self.half, :, :] = False
+            final_mask[:, Z - self.half:, :, :] = False
 
         if mask is not None:
             mask_array = np.zeros_like(final_mask, dtype=bool)
