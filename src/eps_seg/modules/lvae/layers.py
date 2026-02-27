@@ -179,6 +179,8 @@ class TopDownLayer(nn.Module):
         seg_head_dim,
         n_res_blocks,
         n_filters,
+        td_in_filters=None,
+        bu_filters=None,
         is_top_layer=False,
         downsampling_steps=None,
         conv_mult=2,
@@ -208,6 +210,17 @@ class TopDownLayer(nn.Module):
         self.top_prior_param_shape = top_prior_param_shape
         self.skip_connection = skip_connection
         self.conv_mult = conv_mult
+        self.n_filters = n_filters
+
+        conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
+            nn, f"Conv{conv_mult}d"
+        )
+        if td_in_filters is None:
+            td_in_filters = n_filters
+        if bu_filters is None:
+            bu_filters = n_filters
+        self.td_in_filters = td_in_filters
+        self.bu_filters = bu_filters
 
         if self.is_top_layer:
             self.top_prior_params = self._get_top_prior_params()
@@ -267,10 +280,21 @@ class TopDownLayer(nn.Module):
             )
 
         if not is_top_layer:
+            if self.td_in_filters != n_filters:
+                self.topdown_input_projection = conv_type(
+                    self.td_in_filters, n_filters, kernel_size=1
+                )
+            else:
+                self.topdown_input_projection = nn.Identity()
+
+            # Project deterministic top-down features to prior params
+            # with shape (B, 2 * z_dim, ...), so p and q stay consistent.
+            self.prior_params_layer = conv_type(n_filters, 2 * z_dim, kernel_size=1)
+
             # Merge layer, combine bottom-up inference with top-down
             # generative to give posterior parameters
             self.skip_connection_merger = MergeLayer(
-                channels=n_filters,
+                channels=[self.bu_filters, n_filters, n_filters],
                 merge_type=skip_connection_merge_type,
                 conv_mult=conv_mult,
                 nonlin=nonlin,
@@ -283,7 +307,7 @@ class TopDownLayer(nn.Module):
             # Skip connection that goes around the stochastic top-down layer
             if enable_top_down_residual:
                 self.top_down_residual = MergeLayer(
-                    channels=n_filters,
+                    channels=[n_filters, self.td_in_filters, n_filters],
                     merge_type="residual",
                     conv_mult=conv_mult,
                     nonlin=nonlin,
@@ -406,9 +430,11 @@ class TopDownLayer(nn.Module):
                     n_img_prior, *[-1] * len(p_params.shape[1:])
                 )  # TODO check dims!
 
-        # Else the input from the layer above is the prior parameters
+        # Else the input from the layer above are deterministic features;
+        # map them to prior parameters p(z_i | z_{i+1}).
         else:
-            p_params = input_
+            td_features = self.topdown_input_projection(input_)
+            p_params = self.prior_params_layer(td_features)
         # In inference mode, get parameters of q from inference path,
         # merging with top-down path if it's not the top layer
         if inference_mode:
@@ -416,9 +442,9 @@ class TopDownLayer(nn.Module):
                 q_params = bu_value
             else:
                 if self.skip_connection:
-                    q_params = self.skip_connection_merger(bu_value, p_params)
+                    q_params = self.skip_connection_merger(bu_value, td_features)
                 else:
-                    q_params = p_params
+                    q_params = td_features
 
         # In generative mode, q is not used
         else:
@@ -459,7 +485,8 @@ class BottomUpLayer(nn.Module):
         self,
         layer_number: int,
         n_res_blocks,
-        n_filters,
+        c_in,
+        c_out,
         downsampling_steps=0,
         conv_mult=2,
         nonlin=None,
@@ -472,6 +499,7 @@ class BottomUpLayer(nn.Module):
         super().__init__()
 
         bu_blocks = []
+        in_channels = c_in
         for _ in range(n_res_blocks):
             do_resample = False
             if downsampling_steps > 0:
@@ -480,8 +508,8 @@ class BottomUpLayer(nn.Module):
 
             bu_blocks.append(
                 BottomUpDeterministicResBlock(
-                    c_in=n_filters,
-                    c_out=n_filters,
+                    c_in=in_channels,
+                    c_out=c_out,
                     conv_mult=conv_mult,
                     nonlin=nonlin,
                     downsample=do_resample,
@@ -492,6 +520,7 @@ class BottomUpLayer(nn.Module):
                     grad_checkpoint=grad_checkpoint,
                 )
             )
+            in_channels = c_out
         self.net = nn.Sequential(*bu_blocks)
         self.layer_number = layer_number
 

@@ -51,7 +51,7 @@ class LadderVAE(nn.Module):
         self.skip_connections_merge_type = cfg.skip_connections_merge_type
         self.batchnorm = cfg.use_batchnorm
         self.color_ch = cfg.color_channels
-        self.n_filters = cfg.n_filters
+        self.n_filters_per_layer = list(cfg.n_filters)
         self.dropout = cfg.dropout
         self.kl_free_bits = cfg.kl_free_bits
         self.learn_top_prior = cfg.learn_top_prior
@@ -96,19 +96,20 @@ class LadderVAE(nn.Module):
 
         # First bottom-up layer: change num channels + downsample by factor 2
         # unless we want to prevent this
+        first_layer_filters = self.n_filters_per_layer[0]
         stride = 1 if self.no_initial_downscaling else 2
         self.first_bottom_up = nn.Sequential(
             # self.conv_type(color_ch, n_filters, 5, padding=2, stride=stride),
             self.conv_type(
-                self.color_ch, self.n_filters, 5, padding=2, stride=1
+                self.color_ch, first_layer_filters, 5, padding=2, stride=1
             ),  # No stride here
             BlurPool(
-                self.n_filters, stride=stride, dim=self.conv_mult
+                first_layer_filters, stride=stride, dim=self.conv_mult
             ),  # Add BlurPool for downsampling
             self.nonlin(),
             BottomUpDeterministicResBlock(
-                c_in=self.n_filters,
-                c_out=self.n_filters,
+                c_in=first_layer_filters,
+                c_out=first_layer_filters,
                 conv_mult=self.conv_mult,
                 nonlin=self.nonlin,
                 batchnorm=self.batchnorm,
@@ -130,6 +131,15 @@ class LadderVAE(nn.Module):
         for i in range(self.n_layers):
             # Whether this is the top layer
             is_top = i == self.n_layers - 1
+            layer_filters = self.n_filters_per_layer[i]
+            bu_in_filters = (
+                self.n_filters_per_layer[i - 1] if i > 0 else first_layer_filters
+            )
+            td_in_filters = (
+                self.n_filters_per_layer[i + 1]
+                if i < self.n_layers - 1
+                else layer_filters
+            )
 
             # Add bottom-up deterministic layer at level i.
             # It's a sequence of residual blocks (BottomUpDeterministicResBlock)
@@ -137,7 +147,8 @@ class LadderVAE(nn.Module):
             new_layer = BottomUpLayer(
                 layer_number=i,
                 n_res_blocks=self.blocks_per_layer,
-                n_filters=self.n_filters,
+                c_in=bu_in_filters,
+                c_out=layer_filters,
                 downsampling_steps=self.downsample[i],
                 conv_mult=self.conv_mult,
                 nonlin=self.nonlin,
@@ -157,7 +168,9 @@ class LadderVAE(nn.Module):
                     z_dim=self.z_dims[i],
                     seg_head_dim=self.head_z_dims[i],
                     n_res_blocks=self.blocks_per_layer,
-                    n_filters=self.n_filters,
+                    n_filters=layer_filters,
+                    td_in_filters=td_in_filters,
+                    bu_filters=layer_filters,
                     is_top_layer=is_top,
                     downsampling_steps=self.downsample[i],
                     conv_mult=self.conv_mult,
@@ -186,8 +199,8 @@ class LadderVAE(nn.Module):
         for i in range(self.blocks_per_layer):
             modules.append(
                 TopDownDeterministicResBlock(
-                    c_in=self.n_filters,
-                    c_out=self.n_filters,
+                    c_in=first_layer_filters,
+                    c_out=first_layer_filters,
                     conv_mult=self.conv_mult,
                     nonlin=self.nonlin,
                     batchnorm=self.batchnorm,
@@ -201,7 +214,7 @@ class LadderVAE(nn.Module):
         self.final_top_down = nn.Sequential(*modules)
         # Define likelihood
         self.likelihood = GaussianLikelihood(
-            self.n_filters, self.color_ch, self.conv_mult
+            first_layer_filters, self.color_ch, self.conv_mult
         )
 
     def increment_global_step(self):
