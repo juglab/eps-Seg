@@ -354,14 +354,14 @@ class TopDownLayer(nn.Module):
             )
             + spatial_dims
         )
-        # TODO hardcoded 5.0, better initialization strategy?
+        # TODO hardcoded 10.0, better initialization strategy?
         # Dynamically assign values to means
         chunk_size = channels_per_component // n_components
         for i in range(n_components):
             start_idx = i * chunk_size
             end_idx = (i + 1) * chunk_size
             chunk_values[i, start_idx:end_idx] = (
-                5.0  # Equidistant initialization for means
+                10.0  # Equidistant initialization for means
             )
 
         mus = chunk_values.view(

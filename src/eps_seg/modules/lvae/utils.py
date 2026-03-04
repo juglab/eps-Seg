@@ -509,35 +509,32 @@ def pos_neg_loss(mus, labels, margin=5.0):
 
 def custom_distance_loss_masked(distances, mask, margin=5.0, epsilon=1e-6, alpha=1.0):
     """
-    Custom loss function to compute penalties only for selected elements based on a mask.
-
-    Args:
-        distances (torch.Tensor): Pairwise distances.
-        mask (torch.Tensor): Boolean mask to select elements for loss computation.
-        margin (float): The desired distance (e.g., 16.0).
-        epsilon (float): Small constant to avoid division by zero.
-        alpha (float): Scaling factor for the penalty term.
-
-    Returns:
-        torch.Tensor: Loss value.
+    distances: pairwise distance matrix
+    mask: boolean mask of same shape as distances selecting entries to compute loss on
     """
     # Select only the distances where the mask is True
-    masked_distances = distances[mask]
+    masked_distances = distances[mask]    # shape [N_masked]
 
-    # Loss initialization
+    # If there are no masked distances, return zero tensor on correct device
+    if masked_distances.numel() == 0:
+        return torch.tensor(0.0, device=distances.device)
+
+    # Initialize loss vector for masked distances
     loss = torch.zeros_like(masked_distances)
 
-    # Penalize distances less than margin
+    # Identify small distances (< margin)
     mask_small = masked_distances < margin
-    penalty_small = (1 / (masked_distances[mask_small] + epsilon)) + alpha * (
-        (margin - masked_distances[mask_small]) ** 2
-    )
-    loss[mask_small] = penalty_small
 
-    # Leave distances greater than or equal to margin untouched or reward
-    # mask_large = masked_distances >= margin
+    if mask_small.any():
+        # Compute penalty only for the small distances (length = M)
+        penalty_small = F.relu(margin - masked_distances[mask_small])
+        # Assign into the corresponding positions
+        loss[mask_small] = penalty_small
 
-    # Sum up the loss
+    # (Optional) if you later want to add a term for large distances, handle here
+    # e.g. reward or no-op for distances >= margin
+
+    # Sum up and return scalar loss
     return loss.sum()
 
 
