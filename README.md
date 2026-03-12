@@ -1,6 +1,7 @@
 # eps-Seg
 A hierarchical variational autoencoder based method for semantic segmentation of Electron Microscopy data.
 
+The main branch of this repository is a Torch Lightning implementation for the NeurIPS paper [ε-Seg: Sparsely Supervised Semantic Segmentation of Microscopy Data ]([url](https://arxiv.org/abs/2510.18637)). If you are looking for ε-Seg++, please refer to the corresponding branch. 
 
 ## Installation
 
