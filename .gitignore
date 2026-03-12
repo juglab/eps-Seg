@@ -218,3 +218,4 @@ __marimo__/
 scripts/
 lightning_logs/
 results.DS_Store
+.DS_Store
