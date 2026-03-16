@@ -10,7 +10,7 @@ from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import wandb
 
-def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semisupervised: bool = False):
+def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semisupervised: bool = False, direct_ssl: bool = False):
     """
         Train an EPS-Seg model based on the provided experiment configuration.
         Args:
@@ -22,7 +22,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
     dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
-    if not skip_supervised:
+    if not skip_supervised and not direct_ssl:
         # Set random seed for reproducibility if provided
         if train_config.supervised_seed is not None:
             print(f"Setting random seed to {train_config.supervised_seed} for supervised training...")
@@ -126,34 +126,48 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                 save_dir=exp_config.get_log_dir(),
             )
 
+        semisupervised_callbacks = []
         # Initialize model from best supervised checkpoint
-        best_supervised_modelcheckpoint = exp_config.best_checkpoint_path(mode="supervised") if skip_supervised else supervised_modelcheckpoint.best_model_path
+        if not direct_ssl:
+            best_supervised_modelcheckpoint = exp_config.best_checkpoint_path(mode="supervised") if skip_supervised else supervised_modelcheckpoint.best_model_path
+            model = LVAEModel.load_from_checkpoint(best_supervised_modelcheckpoint,
+                                                model_cfg=model_config,
+                                                train_cfg=train_config).to(device)
+        
+            semisupervised_callbacks += [
+                OptimizerStateTransferCallback(
+                        checkpoint_path=str(best_supervised_modelcheckpoint),
+                        restore_optimizer=True,
+                        restore_lr_scheduler=True,
+                        restore_precision=train_config.amp,
+                        strict_counts=True,
+                    ) # Restore optimizer state, learning rate scheduler state, and AMP from the best supervised checkpoint
+            ]
+        else:
+            # Initialize a SSL model directly
+            model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
+            # there is no optimizer state to transfer
+
+        semisupervised_callbacks += [
+                    SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
+                    semisupervised_modelcheckpoint, # Save best SSL checkpoint based on validation loss
+                    EarlyStoppingWithPatiencePropagation(
+                            monitor="val/total_loss_epoch",
+                            patience=train_config.early_stopping_patience,
+                            mode="min",
+                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
+                        ), # Early stopping based on validation loss, propagates patience to radius scheduler by writing it to the model's state dict
+                    LearningRateMonitor(logging_interval='epoch'), # Log learning rate at the end of each epoch
+                    ThresholdSchedulerCallback(), # Adjusts the threshold for pseudo-labeling based on the validation performance, by writing it to the model's state dict
+                    RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience), # Increments the radius for pseudo-labeling after a certain number of epochs without improvement
+                    ],
 
         semisupervised_trainer = L.Trainer(
             devices="auto",
             strategy=strategy,
             logger=semisupervised_logger,
             max_epochs=train_config.max_epochs,
-            callbacks=[
-                    OptimizerStateTransferCallback(
-                        checkpoint_path=str(best_supervised_modelcheckpoint),
-                        restore_optimizer=True,
-                        restore_lr_scheduler=True,
-                        restore_precision=train_config.amp,
-                        strict_counts=True,
-                    ),
-                    SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
-                    semisupervised_modelcheckpoint, 
-                    EarlyStoppingWithPatiencePropagation(
-                            monitor="val/total_loss_epoch",
-                            patience=train_config.early_stopping_patience,
-                            mode="min",
-                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
-                        ),
-                    LearningRateMonitor(logging_interval='step'),
-                    ThresholdSchedulerCallback(),
-                    RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
-                    ],
+            callbacks= semisupervised_callbacks,
             precision = "16-mixed" if train_config.amp else 32,
             gradient_clip_val=train_config.max_grad_norm, 
             log_every_n_steps=train_config.log_every_n_steps,
@@ -162,10 +176,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
             accumulate_grad_batches=train_config.accumulate_grad_batches,
             # fast_dev_run=True,
             )
-
-        model = LVAEModel.load_from_checkpoint(best_supervised_modelcheckpoint,
-                                            model_cfg=model_config,
-                                            train_cfg=train_config).to(device)
+        
         semisupervised_trainer.fit(model, datamodule=dm)
 
         print("Semisupervised training complete. Best model at:", semisupervised_modelcheckpoint.best_model_path)
@@ -181,14 +192,15 @@ def main():
     parser.add_argument("--env_file", type=str, default=".env", help="Path to .env file with environment variables")
     parser.add_argument("--skip_supervised", action="store_true", help="Skip supervised training phase")
     parser.add_argument("--skip_semisupervised", action="store_true", help="Skip semi-supervised training phase")
-
+    parser.add_argument("--direct_ssl", action="store_true", help="Directly switch to semi-supervised training without supervised pretraining")
+    
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
     print("Loading environment variables from:", args.env_file)
     load_dotenv(args.env_file)
     exp_config = ExperimentConfig.from_yaml(args.exp_config)
 
-    train(exp_config, skip_supervised=args.skip_supervised, skip_semisupervised=args.skip_semisupervised)
+    train(exp_config, skip_supervised=args.skip_supervised, skip_semisupervised=args.skip_semisupervised, direct_ssl=args.direct_ssl)
 
 if __name__ == "__main__":
    main()
