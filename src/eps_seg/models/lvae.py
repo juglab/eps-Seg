@@ -79,9 +79,11 @@ class LVAEModel(L.LightningModule):
         
         for loss_term_name, weigth in zip(["kl", "cl", "ce"], [self.train_cfg.beta, self.train_cfg.gamma, 1.0]):
             # Average loss term over all layers
-            self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name] * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+            # FIXME: This should account for confidence weighting
+            self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name].mean() * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
             # Log every layer loss term 
-        for l, val in enumerate(outputs["kl_per_layer"]):
+
+        for l, val in enumerate(outputs["kl_per_layer"].mean(dim=0)):
             self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
             self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
@@ -118,21 +120,28 @@ class LVAEModel(L.LightningModule):
 
 
 
-    def compute_total_loss(self, outputs: dict):
+    def compute_total_loss(self, outputs: dict, mode: Literal["train", "val"]):
+        if mode != "train" or self.train_cfg.use_threshold:
+            confidence = 1.0
+            kl = outputs["kl_per_layer"] 
+        else:
+            confidence = outputs["pseudo_labels_stats"]["final_pseudo_labels_entropy_confidence"].detach()
+            kl = outputs["kl_per_layer"].sum(dim=-1)
         return (
-            self.train_cfg.alpha * outputs["inpainting_loss"] +
-            self.train_cfg.beta * outputs["kl"] +
-            self.train_cfg.gamma * outputs["cl"] +
-            outputs["ce"]
+            self.train_cfg.alpha * outputs["inpainting_loss"].mean() +
+            self.train_cfg.beta * (kl*confidence).mean() +
+            self.train_cfg.gamma * outputs["cl"] + # confidence is included in the model
+            (outputs["ce"]*confidence).mean()
         )
+        
 
     def training_step(self, batch, batch_idx):
         x, y, s, c = batch
 
         batch_size = x.shape[0]
 
-        outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold)
-        outputs["loss"] = self.compute_total_loss(outputs)
+        outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold if self.train_cfg.use_threshold else 0)
+        outputs["loss"] = self.compute_total_loss(outputs, mode="train")
 
         self.seen_samples += batch_size * self.trainer.world_size
         self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
@@ -151,9 +160,9 @@ class LVAEModel(L.LightningModule):
         outputs = self.forward(x, 
                              y, 
                              validation_mode=True, 
-                             confidence_threshold=self.current_threshold,
+                             confidence_threshold=self.current_threshold if self.train_cfg.use_threshold else 0,
                              )
-        outputs["loss"] = self.compute_total_loss(outputs)   
+        outputs["loss"] = self.compute_total_loss(outputs, mode="val")   
 
         self.log_step(outputs, "val", x.shape[0], segments=s)
         
@@ -173,7 +182,7 @@ class LVAEModel(L.LightningModule):
         outputs = self.forward(x, 
                              y=None, 
                              validation_mode=False, 
-                             confidence_threshold=0.99,
+                             confidence_threshold=0.99 if self.train_cfg.use_threshold else 0,
                              )
         outputs["preds"] = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
         outputs["labels"] = y

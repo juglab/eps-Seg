@@ -160,7 +160,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                     LearningRateMonitor(logging_interval='epoch'), # Log learning rate at the end of each epoch
                     ThresholdSchedulerCallback(), # Adjusts the threshold for pseudo-labeling based on the validation performance, by writing it to the model's state dict
                     RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience), # Increments the radius for pseudo-labeling after a certain number of epochs without improvement
-                    ],
+                    ]
 
         semisupervised_trainer = L.Trainer(
             devices="auto",

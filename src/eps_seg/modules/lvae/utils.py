@@ -374,64 +374,106 @@ def get_normalized_tensor(img, model, device):
 
 
 def compute_kl_loss(q, p, label=None, conv_mult=2):
-    
-    kl_loss_per_layer = []
-    
-    for layer, (q_dist, p_dist) in enumerate(zip(q, p)):
-        if layer == len(q) - 1:            
-            kl_divergences = [
-                    kl_divergence(q_dist, p_i).mean(dim=(-3, -2, -1) if conv_mult == 2 else (-4, -3, -2, -1)) for p_i in p_dist
-                ]
-            kl_divergences = torch.stack(kl_divergences, dim=-1)
+    """
+        Computes the KL divergence loss between two lists of distributions q and p, 
+        where q is the list of approximate posterior distributions and p is the list of prior distributions.
+        The KL divergence is computed for each layer. 
+        If label is provided, it is used to select the appropriate prior distribution for the last layer, 
+        which is assumed to be a mixture of Gaussians. 
 
+        Args:
+            q (list of torch.distributions): List of approximate posterior distributions for each layer.
+            p (list of torch.distributions or list of lists of torch.distributions): List of
+                prior distributions for each layer. 
+            label (torch.Tensor, optional): Tensor of shape (batch_size,) containing the class labels for each sample in the batch.
+            conv_mult (int, optional): Convolution dimension for the network
+        Returns:
+            torch.Tensor: KL divergence loss for each sample in the batch and layer, with shape (batch_size, num_layers)
+    """
+ 
+    reduce_dim = (-3, -2, -1) if conv_mult == 2 else (-4, -3, -2, -1)
+    kl_loss_per_layer = []
+
+    for layer, (q_dist, p_dist) in enumerate(zip(q, p)):
+        if layer == len(q) - 1:
+            kl_divergences = torch.stack(
+                [kl_divergence(q_dist, p_i).mean(dim=reduce_dim) for p_i in p_dist],
+                dim=-1,
+            )
+
+            kl = torch.zeros(kl_divergences.size(0), device=q_dist.mean.device)
             if label is not None:
                 valid_mask = label >= 0
                 if valid_mask.any():
-                    kl = kl_divergences[valid_mask, label[valid_mask].long()].mean()
-                else:
-                    kl = torch.tensor(0.0)
-            else:
-                kl = torch.tensor(0.0)
-                
-
-            kl_loss_per_layer.append(kl)
+                    kl[valid_mask] = kl_divergences[
+                        valid_mask, label[valid_mask].long()
+                    ]
         else:
-            kl_loss_per_layer.append(kl_divergence(q_dist, p_dist).mean())
+            kl = kl_divergence(q_dist, p_dist).mean(dim=reduce_dim)
 
-    return torch.stack(kl_loss_per_layer)
+        kl_loss_per_layer.append(kl)
 
-def cross_entropy_from_probs(probs, targets, eps=1e-12, ignore_index=-1):
+    return torch.stack(kl_loss_per_layer, dim=1)  # [B, L]
+
+def cross_entropy_from_probs(probs, targets, eps=1e-12, ignore_index=-1, reduction="none"):
     probs = probs.clamp(min=eps)          # avoid log(0)
     log_probs = torch.log(probs)
     return F.nll_loss(
         log_probs,
         targets,
-        ignore_index=ignore_index
-    )
+        ignore_index=ignore_index,
+        reduction=reduction,
+    ) # [B] if reduction='none' else scalar
 
 def compute_cl_loss(
     mus,
     labels,
+    confidence=None,
     margin=50.0,  # for raw per-level features
     learnable_thetas=True,
+    reduction="sum",
 ):
-    pos_pair_loss, neg_terms = pos_neg_loss(mus, labels, margin=margin)
-    thetas = get_thetas(neg_terms, learnable=learnable_thetas)
+    pos_pair_loss, neg_terms, neg_supports = pos_neg_loss(
+        mus,
+        labels,
+        confidence=confidence,
+        margin=margin,
+    )
+    neg_terms_scalar = {k: v.sum() for k, v in neg_terms.items()}
+    thetas = get_thetas(
+        neg_terms_scalar,
+        supports=neg_supports,
+        learnable=learnable_thetas,
+    )
     weighted_neg = compute_weighted_neg(neg_terms, thetas)
     cl_loss = 0.5 * pos_pair_loss + 0.5 * weighted_neg
-    return cl_loss
+
+    if reduction == "none":
+        return cl_loss
+    if reduction == "sum":
+        return cl_loss.sum()
+    if reduction == "mean":
+        return cl_loss.mean()
+    raise ValueError(f"Invalid reduction: {reduction}")
 
 
-def pos_neg_loss(mus, labels, margin=5.0):
+def pos_neg_loss(mus, labels, confidence=None, margin=5.0, eps=1e-8):
     device = mus[0].device
+    batch_size = labels.size(0)
+    if confidence is None:
+        confidence = torch.ones(batch_size, device=device, dtype=torch.float32)
+    else:
+        confidence = confidence.to(device=device, dtype=torch.float32)
+
     labeled_mask = labels != -1
     labeled_indices = torch.nonzero(labeled_mask, as_tuple=False).squeeze(-1)
 
     # If fewer than 2 labeled samples, there are no pairs to compare
     if labeled_indices.numel() < 2:
-        return torch.tensor(0.0, device=device, dtype=torch.float32), {}
+        return torch.zeros(batch_size, device=device, dtype=torch.float32), {}, {}
 
     labels_l = labels[labeled_indices]
+    confidence_l = confidence[labeled_indices]
     classes = torch.unique(labels_l)
 
     # 2) Build positive-pair boolean matrix (diag excluded)
@@ -439,7 +481,9 @@ def pos_neg_loss(mus, labels, margin=5.0):
     labels_row = labels_l.unsqueeze(0)  # [1, n]
     pos_mask = labels_row == labels_row.T  # [n, n]
     pos_mask.fill_diagonal_(False)
-    pos_count = pos_mask.sum().clamp(min=1)  # avoid div-by-zero later
+    pair_conf = confidence_l.unsqueeze(0) * confidence_l.unsqueeze(1)
+    pos_weight = pos_mask.to(device=device, dtype=torch.float32) * pair_conf
+    pos_norm = pos_weight.sum().clamp_min(eps)
 
     def pairwise_dist(x):
         # x: [n, ...] -> flatten features per sample
@@ -451,10 +495,14 @@ def pos_neg_loss(mus, labels, margin=5.0):
     top = mus[-1][labeled_indices]
     dist_top = pairwise_dist(top)
 
-    pos_pair_loss = (pos_mask.to(device) * dist_top).sum() / pos_count
+    # Keep the same pairwise normalization as the scalar objective and then
+    # attribute each pair contribution to its incident samples.
+    pos_pair_matrix = (pos_weight * dist_top) / pos_norm
+    pos_pair_loss_subset = pos_pair_matrix.sum(dim=1)
 
     # 4) Negative pair losses per class pair
     neg_pair_loss_terms = {}
+    neg_pair_supports = {}
     # Iterate over *actual* class ids (not reindexed), excluding -1 already
     class_list = classes.tolist()
     class_list.sort()
@@ -466,24 +514,28 @@ def pos_neg_loss(mus, labels, margin=5.0):
             mask_j = (labels_l == cb).unsqueeze(0)  # [1, n]
             neg_mask = (mask_i.T & mask_j) | (mask_j.T & mask_i)  # symmetrical [n, n]
 
-            num_neg_pairs = neg_mask.sum()
-            if num_neg_pairs.item() == 0:
-                neg_loss = torch.tensor(0.0, device=device)
+            neg_weight = neg_mask.to(device=device, dtype=torch.float32) * pair_conf
+            neg_norm = neg_weight.sum()
+            if neg_norm.item() <= eps:
+                neg_loss_subset = torch.zeros(n, device=device, dtype=torch.float32)
             else:
                 neg_loss = custom_distance_loss_masked(
                     dist_top, neg_mask.to(device), margin=margin
                 )
-                neg_loss = neg_loss / num_neg_pairs
+                neg_loss_subset = ((neg_loss * pair_conf) / neg_norm.clamp_min(eps)).sum(dim=1)
 
-            neg_pair_loss_terms[f"{ca}-{cb}"] = neg_loss
+            full_neg_loss = torch.zeros(batch_size, device=device, dtype=torch.float32)
+            full_neg_loss[labeled_indices] = neg_loss_subset
+            neg_pair_loss_terms[f"{ca}-{cb}"] = full_neg_loss
+            neg_pair_supports[f"{ca}-{cb}"] = neg_norm
 
     for level_idx, mu in enumerate(mus[:-1]):
         x = mu[labeled_indices]
         dist = pairwise_dist(x)
 
-        # weight factor matches your original (top level handled separately)
         weight_div = 2 ** (2 - level_idx)
-        pos_pair_loss += (pos_mask.to(device) * dist).sum() / (pos_count * weight_div)
+        pos_pair_matrix = (pos_weight * dist) / (pos_norm * weight_div)
+        pos_pair_loss_subset = pos_pair_loss_subset + pos_pair_matrix.sum(dim=1)
 
         for idx_a in range(len(class_list) - 1):
             for idx_b in range(idx_a + 1, len(class_list)):
@@ -493,18 +545,27 @@ def pos_neg_loss(mus, labels, margin=5.0):
                 mask_j = (labels_l == cb).unsqueeze(0)
                 neg_mask = (mask_i.T & mask_j) | (mask_j.T & mask_i)
 
-                num_neg_pairs = neg_mask.sum()
-                if num_neg_pairs.item() == 0:
-                    add_loss = torch.tensor(0.0, device=device)
+                neg_weight = neg_mask.to(device=device, dtype=torch.float32) * pair_conf
+                neg_norm = neg_weight.sum()
+                if neg_norm.item() <= eps:
+                    add_loss_subset = torch.zeros(n, device=device, dtype=torch.float32)
                 else:
                     add_loss = custom_distance_loss_masked(
                         dist, neg_mask.to(device), margin=margin
                     )
-                    add_loss = add_loss / (num_neg_pairs * weight_div)
+                    add_loss_subset = (
+                        (add_loss * pair_conf) / (neg_norm.clamp_min(eps) * weight_div)
+                    ).sum(dim=1)
 
-                neg_pair_loss_terms[f"{ca}-{cb}"] += add_loss
+                full_add_loss = torch.zeros(batch_size, device=device, dtype=torch.float32)
+                full_add_loss[labeled_indices] = add_loss_subset
+                neg_pair_loss_terms[f"{ca}-{cb}"] = neg_pair_loss_terms[f"{ca}-{cb}"] + full_add_loss
+                neg_pair_supports[f"{ca}-{cb}"] = neg_pair_supports[f"{ca}-{cb}"] + neg_norm
 
-    return pos_pair_loss, neg_pair_loss_terms
+    pos_pair_loss = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    pos_pair_loss[labeled_indices] = pos_pair_loss_subset
+
+    return pos_pair_loss, neg_pair_loss_terms, neg_pair_supports
 
 
 def custom_distance_loss_masked(distances, mask, margin=5.0, epsilon=1e-6, alpha=1.0):
@@ -512,44 +573,46 @@ def custom_distance_loss_masked(distances, mask, margin=5.0, epsilon=1e-6, alpha
     Custom loss function to compute penalties only for selected elements based on a mask.
 
     Args:
-        distances (torch.Tensor): Pairwise distances.
-        mask (torch.Tensor): Boolean mask to select elements for loss computation.
+        distances (torch.Tensor) [n, n]: Pairwise distances.
+        mask (torch.Tensor) [n, n]: Boolean mask to select elements for loss computation.
         margin (float): The desired distance (e.g., 16.0).
         epsilon (float): Small constant to avoid division by zero.
         alpha (float): Scaling factor for the penalty term.
 
     Returns:
-        torch.Tensor: Loss value.
+        torch.Tensor[n, n]: Element-wise loss value. 
     """
-    # Select only the distances where the mask is True
-    masked_distances = distances[mask]
-
-    # Loss initialization
-    loss = torch.zeros_like(masked_distances)
-
-    # Penalize distances less than margin
-    mask_small = masked_distances < margin
-    penalty_small = (1 / (masked_distances[mask_small] + epsilon)) + alpha * (
-        (margin - masked_distances[mask_small]) ** 2
+    raw_penalty = (
+        1.0 / (distances + epsilon)
+        + alpha * torch.clamp(margin - distances, min=0.0) ** 2
     )
-    loss[mask_small] = penalty_small
-
-    # Leave distances greater than or equal to margin untouched or reward
-    # mask_large = masked_distances >= margin
-
-    # Sum up the loss
-    return loss.sum()
+    active = mask & (distances < margin)
+    return torch.where(active, raw_penalty, torch.zeros_like(distances))
 
 
-def get_thetas(neg_pair_loss_terms, learnable=True):
+def get_thetas(neg_pair_loss_terms, supports=None, learnable=True, support_eps=1e-8):
     keys = list(neg_pair_loss_terms.keys())
+    if len(keys) == 0:
+        return {}
+
     vals = torch.stack([neg_pair_loss_terms[k] for k in keys])
+    if supports is None:
+        supported = torch.ones_like(vals, dtype=torch.bool)
+    else:
+        support_vals = torch.stack([supports[k] for k in keys]).to(vals.device)
+        supported = support_vals > support_eps
+
     if not learnable:
         vals = vals.detach()
-    if (vals != 0).any():
-        w = F.softmax(vals, dim=0)
-    else:
-        w = torch.full_like(vals, 1.0 / max(len(vals), 1))
+
+    w = torch.zeros_like(vals)
+    if supported.any():
+        supported_vals = vals[supported]
+        if (supported_vals != 0).any():
+            w[supported] = F.softmax(supported_vals, dim=0)
+        else:
+            w[supported] = 1.0 / supported.sum()
+
     return {k: w[i].item() if not learnable else w[i] for i, k in enumerate(keys)}
 
 
@@ -559,7 +622,11 @@ def compute_weighted_neg(neg_pair_loss_terms, neg_thetas):
         if len(neg_pair_loss_terms)
         else "cpu"
     )
-    weighted_neg = torch.zeros((), device=device)
+    weighted_neg = (
+        torch.zeros_like(next(iter(neg_pair_loss_terms.values())))
+        if len(neg_pair_loss_terms)
+        else torch.zeros((), device=device)
+    )
     for pair, loss in neg_pair_loss_terms.items():
         weight = neg_thetas[pair]
         if isinstance(weight, float):

@@ -302,16 +302,17 @@ class LadderVAE(nn.Module):
                     labels=pseudo_labels if self.training_mode == "semisupervised" else y,
                     margin=self.margin,
                     learnable_thetas=self.learnable_thetas,
+                    confidence=pseudo_labels_stats["final_pseudo_labels_entropy_confidence"].detach() if pseudo_labels_stats is not None else None,
                 )
                 
-            ce_nll_loss = cross_entropy_from_probs(probabilities, pseudo_labels if self.training_mode == "semisupervised" else y, ignore_index=-1)
+            ce_nll_loss = cross_entropy_from_probs(probabilities, pseudo_labels if self.training_mode == "semisupervised" else y, ignore_index=-1) # [B]
 
             kl_per_layer = compute_kl_loss(
                 td_data["posterior"],
                 td_data["prior"],
                 label=pseudo_labels if self.training_mode == "semisupervised" else y,
                 conv_mult=self.conv_mult,
-            )
+            ) # [B, L]
 
         output = {
             "ll": ll,
@@ -575,13 +576,31 @@ class LadderVAE(nn.Module):
         posteriors,
         label,
         threshold=0.99,
+        confidence_method="maxprob",
     ):
+        if confidence_method not in {"maxprob", "entropy"}:
+            raise ValueError(
+                f"Invalid confidence_method: {confidence_method}. Expected one of ['maxprob', 'entropy']."
+            )
+
+        def entropy_confidence(x, input_is_logits=True):
+            if input_is_logits:
+                log_p = torch.log_softmax(x, dim=-1)
+            else:
+                log_p = torch.log(x.clamp_min(1e-12))
+            p = torch.exp(log_p)
+            entropy = -(p * log_p).sum(dim=-1)
+            max_entropy = torch.log(torch.tensor(x.size(-1), dtype=x.dtype, device=x.device))
+            normalized_entropy = 1 - entropy / max_entropy.clamp_min(1e-12)
+            return normalized_entropy
+
         anchors = torch.where(label != -1)[0]
 
         selected_labels = label[anchors].long()
         per_layer_pseudo = []
         per_layer_probs = []
-        confidences = []  # Used for logging 
+        per_layer_assignment_confidences = []
+        per_layer_entropy_confidences = []
 
         for posterior in posteriors:
             mu = posterior.mean
@@ -622,14 +641,17 @@ class LadderVAE(nn.Module):
 
             probs = F.softmax(logits, dim=1)
             per_layer_probs.append(probs)
-            layer_conf, pseudo = probs.max(dim=1)
+            maxprob_conf, pseudo = probs.max(dim=1)
+            entropy_conf = entropy_confidence(probs, input_is_logits=False)
+            layer_conf = maxprob_conf if confidence_method == "maxprob" else entropy_conf
             pseudo = pseudo.long()
             non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
             non_anchors[anchors] = False
             pseudo[non_anchors & (layer_conf <= threshold)] = -1
 
             per_layer_pseudo.append(pseudo)
-            confidences.append(probs)
+            per_layer_assignment_confidences.append(layer_conf)
+            per_layer_entropy_confidences.append(entropy_conf)
 
         votes = torch.stack(per_layer_pseudo, dim=0)  # (L, B)
         expert_mask = votes != -1
@@ -637,12 +659,22 @@ class LadderVAE(nn.Module):
         masked_probs = probs * expert_mask.unsqueeze(-1)
         n_valid_experts = expert_mask.sum(dim=0)
         moe_probs = masked_probs.sum(dim=0) / n_valid_experts.clamp(min=1).unsqueeze(1)
-        moe_conf, moe_label = moe_probs.max(dim=1)
+        maxprob_conf, moe_label = moe_probs.max(dim=1)
+        entropy_conf = entropy_confidence(moe_probs, input_is_logits=False)
+        final_assignment_confidence = (
+            maxprob_conf if confidence_method == "maxprob" else entropy_conf
+        )
 
         final_pseudo = torch.full_like(label, -1, dtype=torch.long)
-        assignable = (n_valid_experts > 0) & (moe_conf > threshold)
+        assignable = (n_valid_experts > 0) & (final_assignment_confidence > threshold)
         final_pseudo[assignable] = moe_label[assignable]
         final_pseudo[anchors] = selected_labels
+
+        final_entropy_confidence = entropy_conf.clone()
+        final_entropy_confidence[anchors] = 1.0
+
+        final_assignment_confidence = final_assignment_confidence.clone()
+        final_assignment_confidence[anchors] = 1.0
 
         # Collect statistics for debugging
 
@@ -654,13 +686,18 @@ class LadderVAE(nn.Module):
         n_assigned = assigned_pseudo_labels.sum()
 
         stats = {
-                 "per_layer_pseudo_labels": per_layer_pseudo,
-                 "pseudo_labels_confidences": confidences,
-                 "anchors_indices": anchors,
-                 "n_neighbors": n_neighbors,
-                 "n_assigned": n_assigned,
-                 "neighbor_mask": neighbor_mask,
-                 "assigned_pseudo_labels_mask": assigned_pseudo_labels,
+                 "per_layer_pseudo_labels": per_layer_pseudo, # list[Tensor[B]], len: n_layers
+                 "pseudo_labels_confidences": per_layer_probs, # list[Tensor[B, C]], len: n_layers
+                 "per_layer_assignment_confidences": per_layer_assignment_confidences, # list[Tensor[B]], len: n_layers
+                 "per_layer_entropy_confidences": per_layer_entropy_confidences, # list[Tensor[B]], len: n_layers
+                 "final_pseudo_labels_confidence": final_assignment_confidence, # Tensor[B]
+                 "final_pseudo_labels_entropy_confidence": final_entropy_confidence, # Tensor[B]
+                 "confidence_method": confidence_method,
+                 "anchors_indices": anchors, # Tensor[num_anchors]
+                 "n_neighbors": n_neighbors, # int
+                 "n_assigned": n_assigned, # int
+                 "neighbor_mask": neighbor_mask, # Tensor[B], bool 
+                 "assigned_pseudo_labels_mask": assigned_pseudo_labels, # Tensor[B], bool
                  }
 
         return final_pseudo, stats
