@@ -10,7 +10,9 @@ from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
 from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
-import yaml
+from sklearn.model_selection import StratifiedKFold
+import warnings
+
 from typing import Literal, List, Optional
 
 class EPSSegDataModule(L.LightningDataModule):
@@ -28,7 +30,8 @@ class EPSSegDataModule(L.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.train_cfg = train_cfg
-        
+        self.cache_dir = cfg.get_cache_folder()
+
         self.data = {}
 
         self.train_dataset = None
@@ -38,14 +41,14 @@ class EPSSegDataModule(L.LightningDataModule):
 
          # Define cache paths
         self.cache_dirs = {
-            "train_idx": Path(self.cfg.cache_dir) / "train_idx.npy",
-            "val_idx": Path(self.cfg.cache_dir) / "val_idx.npy",
-            "data_mean": Path(self.cfg.cache_dir) / "data_mean.npy",
-            "data_std": Path(self.cfg.cache_dir) / "data_std.npy",    
+            "train_idx": self.cache_dir / "train_idx.npy",
+            "val_idx": self.cache_dir / "val_idx.npy",
+            "data_mean": self.cache_dir / "data_mean.npy",
+            "data_std": self.cache_dir / "data_std.npy",    
         }
         for key in self.cfg.train_keys:
-            self.cache_dirs[f"{key}_normalized"] = Path(self.cfg.cache_dir) / f"{key}_normalized.tif"
-            self.cache_dirs[f"{key}_labels"] = Path(self.cfg.cache_dir) / f"{key}_labels.tif"
+            self.cache_dirs[f"{key}_normalized"] = Path(self.cache_dir) / f"{key}_normalized.tif"
+            self.cache_dirs[f"{key}_labels"] = Path(self.cache_dir) / f"{key}_labels.tif"
 
     def _check_cache_dir(self):
         """
@@ -63,7 +66,7 @@ class EPSSegDataModule(L.LightningDataModule):
         """
         if self.cfg.enable_cache:
             try:
-                print(f"Checking cache directory at {self.cfg.cache_dir}...")
+                print(f"Checking cache directory at {self.cache_dir}...")
                 self._check_cache_dir()
                 print("Cache directory is valid. Skipping caching.")
             except Exception as e:
@@ -173,6 +176,47 @@ class EPSSegDataModule(L.LightningDataModule):
         data_std = np.std(all_elements.astype(np.float32))
         return data_mean, data_std
 
+    def _generate_fold_splits(self, labels: Dict[str, np.ndarray], shuffle=True) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """
+        Generates training and validation splits for cross-validation folds.
+        This function should be used instead of _shuffle_and_split for generating fold splits.
+
+        Args:
+            labels (dict): Dictionary mapping keys (file names) to label arrays.
+            shuffle (bool): Whether to shuffle the indices before splitting.
+        Returns:
+            train_idx (dict): Dictionary mapping keys (file names) to training indices.
+            val_idx (dict): Dictionary mapping keys (file names) to validation indices.
+        """
+        keys = self.cfg.train_keys
+        train_idx, val_idx = {}, {}
+        
+        # We use stratified K-fold splitting using strata defined by each stack (file) to ensure that each fold has samples from all stacks 
+        # and that the distribution of slices across stacks is balanced in each fold.
+
+        all_data = []
+        keys_assignment = []
+        for k, key in enumerate(keys):
+            # We remove the slices where labels are all -1 (i.e., they are outside the cell) and we only consider the valid slices for splitting
+            valid_indices = np.where(~np.all(labels[key] == -1, axis=(-2, -1)))[0]
+            all_data.append(valid_indices)
+            keys_assignment.append([k,] * len(valid_indices))
+        all_data = np.concatenate(all_data)
+        keys_assignment = np.concatenate(keys_assignment)
+
+        skf = StratifiedKFold(n_splits=self.cfg.max_folds, shuffle=shuffle, random_state=self.cfg.seed)
+
+        for fold, (train_idx_idx, val_idx_idx) in enumerate(skf.split(all_data, keys_assignment)):
+            # We just keep the desired fold
+            if fold == self.cfg.fold:
+                for k, key in enumerate(keys):
+                    # Keep only the indices that belong to the current fold for each stack
+                    train_idx[key] = all_data[train_idx_idx][keys_assignment[train_idx_idx] == k]
+                    val_idx[key] = all_data[val_idx_idx][keys_assignment[val_idx_idx] == k]
+                break
+        return train_idx, val_idx
+
+        
     def _shuffle_and_split(
         self, labels: Dict[str, np.ndarray], shuffle=True
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
@@ -188,6 +232,11 @@ class EPSSegDataModule(L.LightningDataModule):
             val_idx (dict): Dictionary mapping keys (file names) to validation indices.
 
         """
+        warnings.warn(
+        "This function is deprecated and should not be used directly. It is kept for backward compatibility with original dataset splits. Please use the new _generate_fold_splits function).",
+        DeprecationWarning,
+        stacklevel=2
+    )
         # Function adapted from original boilerplate.dataloader script to preserve reproducible splits
         keys = self.cfg.train_keys
         train_idx, val_idx = {}, {}
@@ -357,13 +406,13 @@ class EPSSegDataModule(L.LightningDataModule):
         return masks
 
     def _cache_dataset_splits(self, data_to_cache: Dict):
-        assert self.cfg.cache_dir is not None, (
+        assert self.cache_dir is not None, (
             "cache_dir must be specified to cache dataset splits."
         )
-        assert Path(self.cfg.cache_dir).resolve() != Path(self.cfg.data_dir).resolve(), (
+        assert Path(self.cache_dir).resolve() != Path(self.cfg.data_dir).resolve(), (
             "cache_dir and data_dir must not be the same."
         )
-        Path(self.cfg.cache_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
         # Save train_idx, val_idx, data_mean, data_std to cache_dir
         np.save(self.cache_dirs["train_idx"], data_to_cache["train_idx"])
@@ -394,7 +443,7 @@ class EPSSegDataModule(L.LightningDataModule):
 
         if split == 'trainval':
             result["trainval_images"], result["trainval_labels"] = self._load_original_img_lbls(self.cfg.train_keys)
-            result["train_idx"], result["val_idx"] = self._shuffle_and_split(
+            result["train_idx"], result["val_idx"] = self._generate_fold_splits(
                                                                              result["trainval_labels"], 
                                                                              shuffle=self.cfg.dim == 2,
                                                                              )
@@ -423,15 +472,15 @@ class EPSSegDataModule(L.LightningDataModule):
         # TODO: Maybe support also caching for test and predict splits in the future
         if split != 'trainval':
             raise NotImplementedError("Cached loading is currently only implemented for 'trainval' split. Please load original data for other splits.")
-        if not Path(self.cfg.cache_dir).resolve().exists():
+        if not Path(self.cache_dir).resolve().exists():
             raise FileNotFoundError(
-                f"Cache directory {self.cfg.cache_dir} does not exist."
+                f"Cache directory {self.cache_dir} does not exist."
             )
         # Load cached splits, mean, std from cache_dir
         data = {}
         data["data_mean"] = np.load(self.cache_dirs["data_mean"])
         data["data_std"] = np.load(self.cache_dirs["data_std"])
-        print(f"Loaded cached data statistics from {self.cfg.cache_dir}.")
+        print(f"Loaded cached data statistics from {self.cache_dir}.")
         if split == 'trainval':
             data["train_idx"] = np.load(self.cache_dirs["train_idx"], allow_pickle=True).item()
             data["val_idx"] = np.load(self.cache_dirs["val_idx"], allow_pickle=True).item()
@@ -441,5 +490,5 @@ class EPSSegDataModule(L.LightningDataModule):
             for key in keys:
                 data[f"{split}_images"][key] = tiff.imread(self.cache_dirs[f"{key}_normalized"]).astype(np.float16)
                 data[f"{split}_labels"][key] = tiff.imread(self.cache_dirs[f"{key}_labels"]).astype(np.float16)
-            print(f"Loaded cached train/validation dataset splits from {self.cfg.cache_dir}.")
+            print(f"Loaded cached train/validation dataset splits from {self.cache_dir} (fold: {self.cfg.fold}).")
         return data

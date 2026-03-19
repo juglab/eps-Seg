@@ -5,9 +5,10 @@ from pathlib import Path
 import yaml
 
 class BaseEPSDatasetConfig(BaseEPSConfig):
+    name: str = Field(..., description="Name of the dataset, used for cache naming")
     dim: int = Field(..., description="Dimensionality of the data (2D or 3D)")
     data_dir: str = Field(..., description="Path to the dataset directory")
-    cache_dir: Optional[str] = Field(..., description="Path to cache directory where normalized data and split indices are stored")
+    cache_root: Optional[str] = Field(..., description="Path to root cache directory where normalized data and split indices are stored (cache will be stored in a subfolder depending on seed and fold)")
     enable_cache: bool = Field(..., description="Whether to use/store cached dataset splits if available. Set to false to preserve disk space.")
     train_keys: List[str] = Field(..., description="List of dataset keys to load for training")
     test_keys: List[str] = Field(..., description="List of dataset keys to load for testing")
@@ -25,6 +26,8 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
     samples_per_class_validation: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for validation dataset.")
     samples_per_class_training: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for training dataset.")
     n_neighbors: int = Field(7, description="Number of neighbors for neighbor sampling (only for semisupervised datasets).")
+    fold: int = Field(..., description="Fold number for cross-validation")
+    max_folds: int = Field(..., description="Maximum number of folds for cross-validation")
 
     @classmethod
     def from_yaml(cls, yaml_path: str):
@@ -55,7 +58,16 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
-        
+    def get_cache_folder(self) -> Path:
+        """
+            Get the cache folder path for this dataset configuration, which depends on the dataset name, seed and fold.
+            The cache folder will be [cache_root]/[dataset_name]_seed_[seed]_fold_[fold]/
+        """
+        if self.cache_root is None:
+            raise ValueError("cache_root must be specified to get the cache folder.")
+        cache_folder = Path(self.cache_root) / f"{self.name}_seed_{self.seed}_fold_{self.fold}"
+        return cache_folder
+
 class ZStacked2DDatasetConfig(BaseEPSDatasetConfig):
     """
         Configuration for 2D slice-based datasets where the samples are patches that are previously stacked in the Z dimension. 
@@ -103,7 +115,6 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     # Defaults for BetaSeg 2D dataset
     dim: int = 2
     data_dir: str = Field(..., description="Path to the dataset directory")
-    cache_dir: Optional[str] = Field(None, description="Path to cache directory where normalized data and split indices are stored")
     enable_cache: bool = Field(True, description="Whether to use/store cached dataset splits if available. Set to false to preserve disk space.")
     train_keys: List[str] = ["high_c1", "high_c2", "high_c3"]
     test_keys: List[str] = ["high_c4"]
@@ -119,6 +130,7 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
     n_classes: int = 4
     samples_per_class_training: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for training dataset.")
     samples_per_class_validation: Optional[Dict[int, int]] = Field(..., description="Number of samples per class for validation dataset.")
+    max_folds: int = 5
     
     def get_image_label_paths(self, keys: List[str]) -> Dict[str, Tuple[Path, Path]]:
         """
@@ -131,12 +143,12 @@ class BetaSegDatasetConfig(BaseEPSDatasetConfig):
             lbl_path = Path(self.data_dir) / key / f"{key}_gt.tif"
             paths[key] = (img_path, lbl_path)
         return paths
+    
 
 
 class LiverFibsemDatasetConfig(BaseEPSDatasetConfig):
     dim: int = 2
     data_dir: str = Field(..., description="Path to the dataset directory")
-    cache_dir: Optional[str] = Field(None, description="Path to cache directory where normalized data and split indices are stored")
     enable_cache: bool = Field(True, description="Whether to use/store cached dataset splits if available. Set to false to preserve disk space.")
     train_keys: List[str] = ["crop_01", "crop_02", "crop_03", "crop_04", "crop_05", "crop_06", "crop_07", "crop_08", "crop_09"]
     test_keys: List[str] = ["crop_00", "crop_10"]
