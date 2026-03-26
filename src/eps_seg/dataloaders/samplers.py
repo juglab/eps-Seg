@@ -1,7 +1,6 @@
 import random
 import itertools
 from torch.utils.data import BatchSampler, DistributedSampler
-from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from typing import Optional
 from typing import Iterator
 import torch.distributed as dist
@@ -26,7 +25,7 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         # Build per-class pools once (anchors only)
         self.pools = {
             c: [i for i, g in enumerate(dataset.groups) if g["labels"][0] == c]
-            for c in dataset.unique_vals
+            for c in dataset.unique_labels
         }
         self.labels = [c for c, v in self.pools.items() if len(v) > 0]
         if not self.labels:
@@ -93,7 +92,105 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
     def __len__(self):
         # compute against current mode so progress bars don't go crazy after mode flip
         anchors_per_batch, _, num_batches = self._compute_epoch_plan()
-        return num_batches    
+        return num_batches
+
+
+class BalancedAnchorLabelBatchSampler(BatchSampler):
+    """
+        Yields class-balanced batches for PseudoLabelDataset-like schedules.
+
+        The balancing label for every valid sample is derived from their respective anchors:
+        - anchors are balanced by their own current label
+        - neighbors are balanced by the current label of their anchor
+
+        Pools are rebuilt at the start of every epoch from dataset.valid_indices so
+        confidence-threshold updates, radius growth, and anchor elections are
+        reflected immediately.
+    """
+
+    def __init__(self, dataset, batch_size=32, seed=42, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.shuffle = shuffle
+
+        self.labels = None
+        self.pools = None
+        self._iters = None
+
+    def _anchor_labels_for_valid_indices(self):
+        valid_indices = self.dataset.valid_indices
+        if len(valid_indices) == 0:
+            raise ValueError("No valid samples available in dataset.")
+
+        anchor_indices = self.dataset.schedule["anchor_id"][valid_indices]
+        anchor_labels = self.dataset.schedule["current_label"][anchor_indices]
+        is_anchor = self.dataset.schedule["is_anchor"][valid_indices]
+        current_labels = self.dataset.schedule["current_label"][valid_indices]
+
+        # Prefer the sample's own label when it is a labeled anchor. This keeps the
+        # sampler aligned with anchor elections once the schedule starts treating a
+        # pseudo-label as a real anchor.
+        return [
+            int(current_label if is_anchor and current_label >= 0 else anchor_label)
+            for current_label, anchor_label, is_anchor in zip(current_labels, anchor_labels, is_anchor)
+        ]
+
+    def _rebuild_pools(self):
+        anchor_labels = self._anchor_labels_for_valid_indices()
+        valid_indices = self.dataset.valid_indices
+
+        pools = {}
+        for dataset_idx, anchor_label in enumerate(anchor_labels):
+            pools.setdefault(anchor_label, []).append(dataset_idx)
+
+        self.pools = pools
+        self.labels = [label for label, pool in self.pools.items() if len(pool) > 0]
+        if not self.labels:
+            raise ValueError("No valid samples available in any class.")
+
+    def _reset_iters(self):
+        self._iters = {}
+        for label in self.labels:
+            pool = list(self.pools[label])
+            if self.shuffle:
+                self.rng.shuffle(pool)
+            self._iters[label] = itertools.cycle(pool)
+
+    def _compute_epoch_plan(self):
+        self._rebuild_pools()
+
+        base = self.batch_size // len(self.labels)
+        rem = self.batch_size % len(self.labels)
+        per_label_counts = {label: base for label in self.labels}
+        for label in self.labels[:rem]:
+            per_label_counts[label] += 1
+
+        max_class = max(len(self.pools[label]) for label in self.labels)
+        num_batches = max(1, (max_class * len(self.labels)) // self.batch_size)
+        return per_label_counts, num_batches
+
+    def __iter__(self):
+        per_label_counts, num_batches = self._compute_epoch_plan()
+        self._reset_iters()
+
+        label_order = list(self.labels)
+        if self.shuffle:
+            self.rng.shuffle(label_order)
+
+        for _ in range(num_batches):
+            batch = []
+            for label in label_order:
+                take = per_label_counts[label]
+                batch.extend(next(self._iters[label]) for _ in range(take))
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        _, num_batches = self._compute_epoch_plan()
+        return num_batches
 
 class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
     """
@@ -120,8 +217,8 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
     """
     def __init__(
         self,
-        dataset: SemisupervisedDataset,
-        sampler: ModeAwareBalancedAnchorBatchSampler,
+        dataset,
+        sampler: BatchSampler,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
         shuffle: bool = False,
@@ -214,4 +311,3 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
                     self.next_te_idx = 0
                     self.current_true_epoch += 1
                     continue
-

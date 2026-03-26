@@ -37,6 +37,8 @@ class TrainConfig(BaseEPSConfig):
     max_radius: int = Field(default=7, description="Maximum radius for training in semisupervised mode")
     radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
+    pseudolabel_age_for_election: int = Field(default=10, description="Number of re-evaluations of a pseudolabel's confidence before it is considered for election as an anchor.")
+
 
 class ExperimentConfig(BaseEPSConfig):
     project_name: str = Field(default="eps-seg-default-project", description="Name of the project, e.g. used in WandB logging")

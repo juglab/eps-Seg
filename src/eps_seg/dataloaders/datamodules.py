@@ -1,14 +1,14 @@
 import lightning as L
 from tqdm import tqdm
-from eps_seg.config.datasets import BaseEPSDatasetConfig, BetaSegDatasetConfig, LiverFibsemDatasetConfig
+from eps_seg.config.datasets import BaseEPSDatasetConfig, BetaSegDatasetConfig, LiverFibsemDatasetConfig 
 from pathlib import Path
 import tifffile as tiff
 import numpy as np
 from typing import Dict, Tuple
-from eps_seg.dataloaders.datasets import SemisupervisedDataset, PredictionDataset
+from eps_seg.dataloaders.datasets import SemisupervisedDataset, PredictionDataset, PseudoLabelDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
-from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
+from eps_seg.dataloaders.samplers import BalancedAnchorLabelBatchSampler, ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
 from sklearn.model_selection import StratifiedKFold
 import warnings
@@ -87,12 +87,12 @@ class EPSSegDataModule(L.LightningDataModule):
     
     def train_dataloader(self):
   
-        train_sampler = ModeAwareBalancedAnchorBatchSampler(
-                self.train_dataset,
-                total_patches_per_batch=self.train_cfg.batch_size,
-                shuffle=True,
-                n_neighbors=self.cfg.n_neighbors,
-            )
+        train_sampler = BalancedAnchorLabelBatchSampler(
+            self.train_dataset,
+            batch_size=self.train_cfg.batch_size,
+            shuffle=True,
+            seed=self.cfg.seed,
+        )
         
         train_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.train_dataset,
@@ -144,7 +144,8 @@ class EPSSegDataModule(L.LightningDataModule):
     def set_mode(self, mode: str):
         """Switch between supervised and semisupervised modes."""
         print(f"Switching datamodule mode to {mode}...")
-        self.train_dataset.set_mode(mode)
+        if hasattr(self.train_dataset, "set_mode"):
+            self.train_dataset.set_mode(mode)
 
     def set_radius(self, radius: float):
         """Set the radius for semisupervised sampling."""
@@ -154,7 +155,8 @@ class EPSSegDataModule(L.LightningDataModule):
     def increase_radius(self):
         """Increase the radius used for semisupervised sampling."""
         print("Increasing semisupervised sampling radius...")
-        self.train_dataset.increase_radius()
+        if hasattr(self.train_dataset, "increase_radius"):
+            self.train_dataset.increase_radius()
 
     def _compute_statistics(
         self, images: Dict[str, np.ndarray], train_idx: Dict[str, np.ndarray]
@@ -312,21 +314,25 @@ class EPSSegDataModule(L.LightningDataModule):
 
         # Define Datasets based on the stage
         if stage in ["fit"]:
-            self.train_dataset = SemisupervisedDataset(
-            images=self.data["trainval_images"],
-            labels=self.data["trainval_labels"],
-            patch_size=self.cfg.patch_size,
-            label_size=1,
-            mode=self.cfg.mode,
-            n_classes=self.cfg.n_classes,
-            ignore_lbl=-1,
-            indices_dict=self.data["train_idx"],
-            radius=self.train_cfg.initial_radius,
-            dim=self.cfg.dim,
-            samples_per_class=self.cfg.samples_per_class_training,
-            n_neighbors=self.cfg.n_neighbors
+            print(f"Setting up training dataset with {self.cfg.samples_per_class_training} samples per class...")
+            self.train_dataset = PseudoLabelDataset(
+                images=self.data["trainval_images"],
+                labels=self.data["trainval_labels"],
+                indices_dict=self.data["train_idx"],
+                patch_size=self.cfg.patch_size,
+                label_size=1,
+                n_classes=self.cfg.n_classes,
+                ignore_lbl=-1,
+                radius=self.train_cfg.initial_radius,
+                dim=self.cfg.dim,
+                seed=self.cfg.seed,
+                n_neighbors=self.cfg.n_neighbors,
+                samples_per_class=self.cfg.samples_per_class_training,
+                confidence_threshold=1.0,
+                age_for_election=self.train_cfg.pseudolabel_age_for_election,
             )
         if stage in ["fit", "validate"]:
+            print(f"Setting up validation dataset with {self.cfg.samples_per_class_validation} samples per class...")
             self.val_dataset = SemisupervisedDataset(
                 images=self.data["trainval_images"],
                 labels=self.data["trainval_labels"],

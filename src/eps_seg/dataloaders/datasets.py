@@ -1,15 +1,441 @@
-import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-import numpy as np
-from glob import glob
-import numpy as np
-import torch
-import torch.nn.functional as F
 import random
 from collections import Counter
-from typing import Dict, List, Tuple, Iterable, Any, Union
+from typing import Any, Dict, Iterable, List, Tuple, Union
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import pandas as pd
+from tqdm import tqdm
+
+from typing import Dict
+import random
+import numpy as np
+import torch
+import pandas as pd
+from tqdm import tqdm
+
+
+class PseudoLabelDataset(torch.utils.data.Dataset):
+
+    def __init__(
+        self,
+        images,
+        labels,
+        patch_size=64,
+        label_size=1,
+        n_classes=4,
+        ignore_lbl=-1,
+        indices_dict=None,
+        radius=5,
+        dim=2,
+        seed=42,
+        n_neighbors=1,
+        samples_per_class: Dict[int, int] | None = None,
+        confidence_threshold: float = 1.0,
+        age_for_election: int = 5,
+    ):
+        """
+        Dataset that holds a table of anchors and neighbors.
+
+        The schedule has this form:
+
+        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Is Anchor | Anchor ID | Radius from Anchor | High Confidence Age |
+
+        Where:
+            - Coords: coordinates of the anchor pixel/voxel
+            - Current Label: Most recent label assigned to the voxel. If the voxel is an anchor, this is the same as the GT label. If the voxel is a neighbor, this is the label assigned externally during validation.
+            - GT Label: Ground truth label of the voxel (used for logging scheduler performances, not training)
+            - Confidence: Confidence score of the current label. For anchors it is always 1.0. For neighbors, it is assigned externally during validation. Used to sample labels and construct batches.
+            - Is Anchor: Boolean flag indicating whether the voxel is an anchor.
+            - Anchor ID: ID of the anchor voxel if the current voxel is a neighbor.
+            - Radius from Anchor: Distance from the anchor voxel if the current voxel is a neighbor.
+            - High Confidence Age: Number of validations with confidence above the threshold for a pseudo-labeled neighbor.
+            
+        The dataset has also two parameters to control the sampling of anchors and neighbors:
+            - threshold: confidence threshold to sample neighbors. Only neighbors with confidence score above or equal to the threshold are returned during training.
+            - radius: maximum distance in pixels to sample neighbors from the anchor. Only neighbors within this radius are returned during training.
+
+        This class work by keeping a pool of anchors and neighbors. Anchors are sampled at initialization and remain fixed during training. 
+        Neighbors are sampled at initialization based on the initial radius and then re-sampled (added) when the radius is updated after validation.
+
+        Confidence scores of neighbors are updated externally during validation (i.e., after a new best model is found). 
+
+        Sample returned during training are kept in an internal buffer that is updated upon changing the confidence threshold.
+        In addition, when a neighbor's confidence score is above the threshold for a certain number of re-evaluations, it is elected as a new anchor and treated as such
+        (i.e., it can have new neighbors sampled around it).
+
+        Args:
+            images: dict of np.ndarrays
+                Key: image name,
+                Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
+            labels: dict of np.ndarrays
+                Key: image name,
+                Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
+            patch_size: int (Default: 64)
+                Spatial size of the extracted patches
+            label_size: int (Default: 1)
+                Spatial size of the label patch (must be <= patch_size//2)
+            n_classes: int (Default: 4)
+                Number of semantic classes in the labels (including background)
+            ignore_lbl: int (Default: -1)
+                Label value to ignore when sampling anchors and neighbors
+            indices_dict: dict (Default: None)
+                Key: image name,
+                Value: list of z indices to sample from for that image
+            radius: int (Default: 5)
+                Maximum distance in pixels to sample neighbors from the anchor
+            dim: int (Default: 2)
+                Whether to sample 2D or 3D patches (must be 2 or 3)
+            seed: int (Default: 42)
+                Random seed for reproducible neighbor sampling         
+            n_neighbors: int (Default: 1)
+                Number of neighbors to sample around each anchor.
+            samples_per_class: dict (Default: None)
+                Optional per-class override for number of anchors to sample from each class.
+                Key: class label (int), Value: number of anchors to sample (int).
+                 If not provided, defaults to 1 anchor per class.
+            confidence_threshold: float (Default: 1.0)
+                Initial confidence threshold to return samples during training. Only neighbors with confidence score above or equal to the threshold are returned during training.
+            age_for_election: int (Default: 5)
+                Minimum number of re-evaluations with confidence above threshold for a pseudo-labeled neighbor to be elected as an anchor.
+        
+        """
+        self.images = images
+        self.labels = labels
+        self.indices_dict = indices_dict or {}
+        self.patch_size = patch_size
+        
+        self.label_size = label_size
+
+        # Offset between the center of the patch and the beginning of the label patch.
+        self.offset = self.patch_size // 2 - self.label_size
+        self.ignore_lbl = ignore_lbl
+        self.n_classes = n_classes
+        self.unique_labels = np.array(range(n_classes))
+        self.radius = radius
+        
+        # Helper to map between stack names and integer IDs used in the schedule table
+        self.stack_names = list(self.images.keys())
+        self.name_to_id = {name: i for i, name in enumerate(self.stack_names)}
+        self.id_to_name = {i: name for i, name in enumerate(self.stack_names)}
+
+        self.n_neighbors = n_neighbors
+        self.seed = seed
+        self.rng = random.Random(self.seed)
+
+        self.samples_per_class = samples_per_class
+        self.default_samples_per_class: int = 1
+        self.dim = dim
+        
+        self.confidence_threshold = confidence_threshold
+        self.age_for_election = age_for_election
+
+        # The schedule contains the pool of anchors and neighbors we can sample from
+        # Anchors are fixed and sampled at initialization
+        # Neigbors are sampled when hyperparameters are updated after validation
+        self.schedule = {
+            "name_id": np.empty((0,), dtype=np.int32), # [N] integer ID (in self.stack_names) of the stack the voxel belongs to
+            "coords": np.empty((0, 3), dtype=np.int32), # [N, 3] coordinates of the voxel (z,y,x)
+            "current_label": np.empty((0,), dtype=np.int32), # [N] most recent label assigned to the voxel. 
+            "gt_label": np.empty((0,), dtype=np.int32), # [N] ground truth label of the voxel
+            "confidence": np.empty((0,), dtype=np.float32), # [N] confidence score of the current label. 
+            "is_anchor": np.empty((0,), dtype=bool), # [N] whether the voxel is an anchor
+            "anchor_id": np.empty((0,), dtype=np.int32), # [N] ID of the anchor the voxel is associated with
+            "radius": np.empty((0,), dtype=np.float32), # [N] radius of this voxel from its anchor (0 for anchors)
+            "high_confidence_age": np.empty((0,), dtype=np.int32), # [N] number of re-evaluations with high confidence (confidence >= threshold). Used to elect pseudo-labels as anchors.
+        }
+        self.valid_indices = np.array([], dtype=np.int32)  # indices of the schedule that are currently valid for sampling (i.e., confidence >= threshold)
+
+        print(f"Sampling new anchors...")
+        self._sample_anchors()
+        self._print_schedule_report()
+        print(f"Sampling initial neighbors with radius={self.radius}...")
+        self._sample_neighbors()
+        self._print_schedule_report()
+        self._rebuild_current_pool()
+
+    def _add_to_schedule(self, name_id, coords, current_label, gt_label, confidence, is_anchor, anchor_id, radius):
+        """Helper function to add new entries to the schedule."""
+        
+        self.schedule["name_id"] = np.append(self.schedule["name_id"], np.array([name_id], dtype=np.int32))
+        self.schedule["coords"] = np.append(self.schedule["coords"], [coords], axis=0)
+        self.schedule["current_label"] = np.append(self.schedule["current_label"], np.array([current_label], dtype=np.int32))
+        self.schedule["gt_label"] = np.append(self.schedule["gt_label"], np.array([gt_label], dtype=np.int32))
+        self.schedule["confidence"] = np.append(self.schedule["confidence"], np.array([confidence], dtype=np.float32))
+        self.schedule["is_anchor"] = np.append(self.schedule["is_anchor"], np.array([is_anchor], dtype=bool))
+        self.schedule["anchor_id"] = np.append(self.schedule["anchor_id"], np.array([anchor_id], dtype=np.int32))
+        self.schedule["radius"] = np.append(self.schedule["radius"], np.array([radius], dtype=np.float32))
+        self.schedule["high_confidence_age"] = np.append(self.schedule["high_confidence_age"], np.array([0], dtype=np.int32))
+
+    def _sample_anchors(self):
+        """
+            Sample ancors from each stack using the provided indices_dict of z indices to sample from. 
+        """
+        for name, z_indices in self.indices_dict.items():
+            img_stack = self.images[name]
+            lbl_stack = self.labels[name]
+            name_id = self.name_to_id[name]
+            Z, H, W = img_stack.shape
+
+            coords_in_use = set(map(tuple, self.schedule["coords"]))  # to avoid sampling the same voxel multiple times
+            
+            for cz in tqdm(z_indices, desc=f"Sampling anchors for {name}"):
+                for lbl in self.unique_labels:
+                    for cy, cx in self._sample_anchors_from_slice(z_slice=lbl_stack[cz], 
+                                                                class_label=lbl, 
+                                                                num_samples=self.samples_per_class.get(lbl, self.default_samples_per_class)):
+                        if not self._is_valid_coord(name, cz, cy, cx, Z, H, W):
+                            continue
+                        if (cz, cy, cx) in coords_in_use:
+                            print(f"Warning: coordinate {(cz, cy, cx)} already in use. Skipping this anchor.")
+                            continue
+                        coords_in_use.add((cz, cy, cx))
+                        gt_label = lbl_stack[cz, cy, cx]
+                        self._add_to_schedule(
+                            name_id=name_id,
+                            coords=(cz, cy, cx),
+                            current_label=gt_label,
+                            gt_label=gt_label,
+                            confidence=1.0,
+                            is_anchor=True,
+                            anchor_id=len(self.schedule["name_id"]), 
+                            radius=0.0,
+                        )
+
+    def _sample_anchors_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
+        """
+            Sample a given number of anchors from a slice for a specific class label.
+        """
+        label_coords = np.argwhere(z_slice == class_label)
+        if len(label_coords) < num_samples:
+            # Some slices does not represent all classes
+            return []
+        
+        idx = self.rng.sample(range(len(label_coords)), num_samples)
+        sampled = label_coords[idx]
+        return [(int(y), int(x)) for y, x in sampled]       
+
+    def _is_valid_coord(self, name, z, y, x, Z, H, W):
+        """Return whether a coordinate can be used as an anchor/neighbor center."""
+        valid = (
+            self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
+        )
+
+        if self.dim == 3:
+            valid = valid and (self.offset <= z < Z - self.offset - 1)
+
+        in_cell = self.labels[name][z, y, x] != self.ignore_lbl
+
+        # TODO: Implement mask consistency
+
+        return valid and in_cell
+
+    def _sample_neighbors(self, 
+                          max_retries: int = 100
+                          ):
+        """
+            Sample n_neighbors for each anchor in the schedule based on the current radius setting.
+            This function is called upon change of maximum sampling radius.
+
+            Args:
+                max_retries: maximum number of retries to find a valid neighbor for each anchor. 
+        """
+
+        total_new_neighbors = 0
+        used_coords = set(map(tuple, self.schedule["coords"]))  # to avoid sampling the same voxel multiple times
+        anchors = np.where(self.schedule["is_anchor"])[0]
+        for anchor_idx in tqdm(anchors, desc="Sampling neighbors"):
+            anchor_name_id = self.schedule["name_id"][anchor_idx]
+            anchor_coords = self.schedule["coords"][anchor_idx]
+
+            current_neighbor_count = 0
+            tries = 0
+
+            while current_neighbor_count < self.n_neighbors and tries < max_retries:
+                tries += 1
+
+                dz = self.rng.randint(-self.radius, self.radius) if self.dim == 3 else 0
+                dy = self.rng.randint(-self.radius, self.radius)
+                dx = self.rng.randint(-self.radius, self.radius)
+                new_neighbor_coords = anchor_coords + np.array([dz, dy, dx])
+
+                is_center = (dz == 0 and dy == 0 and dx == 0)
+                outside_sphere = (dz**2 + dy**2 + dx**2 > self.radius**2)
+                already_used = tuple(new_neighbor_coords) in used_coords
+                if is_center or outside_sphere or already_used:
+                    continue
+
+                Z, H, W = self.images[self.id_to_name[anchor_name_id]].shape
+
+                if self._is_valid_coord(
+                    name=self.id_to_name[anchor_name_id],
+                    z=new_neighbor_coords[0],
+                    y=new_neighbor_coords[1],
+                    x=new_neighbor_coords[2],
+                    Z=Z,
+                    H=H,
+                    W=W,
+                ):
+                    gt_label = self.labels[self.id_to_name[anchor_name_id]][
+                        new_neighbor_coords[0], new_neighbor_coords[1], new_neighbor_coords[2]
+                    ]
+                    self._add_to_schedule(
+                        name_id=anchor_name_id,
+                        coords=new_neighbor_coords,
+                        current_label=-1,  # Unlabeled neighbor
+                        gt_label=gt_label,
+                        confidence=0.0,
+                        is_anchor=False,
+                        anchor_id=anchor_idx,
+                        radius=np.linalg.norm(new_neighbor_coords - anchor_coords),
+                    )
+                    used_coords.add(tuple(new_neighbor_coords))
+                    current_neighbor_count += 1
+                    total_new_neighbors += 1
+            
+        print(f"Sampled {total_new_neighbors} new neighbors for {len(anchors)} anchors.")
+
+    def _rebuild_current_pool(self):
+        """
+            Rebuild the pool of valid samples for training based on the current confidence threshold.
+        """
+        self.valid_indices = np.where(self.schedule["confidence"] >= self.confidence_threshold)[0]
+
+    def __len__(self):
+        """Return the number of valid samples in the schedule."""
+        return len(self.valid_indices)
+
+    def set_confidence_threshold(self, new_threshold: float):
+        """Update the confidence threshold and rebuild the pool of valid samples."""
+        if new_threshold != self.confidence_threshold:
+            self.confidence_threshold = new_threshold
+            self._rebuild_current_pool()
+            print(f"Updated confidence threshold to {self.confidence_threshold}. Now {len(self.valid_indices)} valid samples available for training.")
+
+    def _elect_new_anchors(self):
+        """
+            Elect new anchors among the neighbors that have been above the confidence threshold for enough re-evaluations. This function is called after updating confidence scores.
+        """
+        candidate_mask = (
+            (self.schedule["is_anchor"] == False) &
+            (self.schedule["confidence"] >= self.confidence_threshold) &
+            (self.schedule["high_confidence_age"] >= self.age_for_election)
+        )
+
+        self.schedule["is_anchor"][candidate_mask] = True
+        print(f"Elected {candidate_mask.sum()} new anchors based on current confidence threshold.")
+        
+    def set_radius(self, new_radius: float):
+        """
+            Update the sampling radius and add new neighbors for all anchors based on the new radius.
+        """
+
+        if self.radius != new_radius:
+            self.radius = new_radius
+            print(f"Updated sampling radius to {self.radius}. Adding new neighbors to schedule...")
+            self._sample_neighbors()
+            self._print_schedule_report()
+    
+    # TODO: Implement a mechanism for the re-evaluation phase to iterate over the neighbors to update their confidence.
+    def update_confidence(self, indices: np.ndarray, new_confidences: np.ndarray, current_labels: np.ndarray):
+        """
+            Update the confidence scores of the samples at the given indices.
+            This function is called externally during re-evaluation of pseudo-labels.
+
+            Args:
+                indices: indices of the schedule to update
+                new_confidences: new confidence scores to assign to the given indices
+                current_labels: new current labels to assign to the given indices in case they get elected as anchors (i.e., they are above the confidence threshold for enough re-evaluations)
+
+        """
+        self.schedule["confidence"][indices] = new_confidences
+
+        # Update high confidence age for neighbors above threshold and reset if below threshold
+        for idx in indices:
+            if not self.schedule["is_anchor"][idx]:
+                if self.schedule["confidence"][idx] >= self.confidence_threshold:
+                    self.schedule["high_confidence_age"][idx] += 1
+                else:
+                    self.schedule["high_confidence_age"][idx] = 0
+        
+        # Elect new anchors if they have been above threshold for enough validations
+        self._elect_new_anchors()
+
+    def patch_at(self, img_stack, z, y, x):
+        """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
+        if self.dim == 2:
+            p = img_stack[
+                z,
+                y - self.offset : y + self.offset + 2,
+                x - self.offset : x + self.offset + 2,
+            ]
+            return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
+        else:  # 3D
+            p = img_stack[
+                z - self.offset : z + self.offset + 2,
+                y - self.offset : y + self.offset + 2,
+                x - self.offset : x + self.offset + 2,
+            ]
+            return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
+
+    def _print_schedule_report(self):
+        """Helper function to print statistics about the current schedule."""
+        sch = {k: v for k, v in self.schedule.items()}
+        sch["z"] = self.schedule["coords"][:, 0]
+        sch["y"] = self.schedule["coords"][:, 1]
+        sch["x"] = self.schedule["coords"][:, 2]
+        del sch["coords"]
+
+        spd = pd.DataFrame(sch)
+        spd["name_id"] = spd["name_id"].apply(lambda x: self.id_to_name[x])
+    
+        print(spd.groupby(["is_anchor", "name_id"])["gt_label"].value_counts().unstack(fill_value=0))
+
+    def __getitem__(self, idx):
+        """Return a training sample from the schedule based on the current valid indices."""
+        schedule_idx = self.valid_indices[idx]
+        name_id = self.schedule["name_id"][schedule_idx]
+        coords = self.schedule["coords"][schedule_idx]
+        current_label = self.schedule["current_label"][schedule_idx]
+        gt_label = self.schedule["gt_label"][schedule_idx]
+        is_anchor = self.schedule["is_anchor"][schedule_idx]
+        anchor_id = self.schedule["anchor_id"][schedule_idx]
+        radius = self.schedule["radius"][schedule_idx]
+        name = self.id_to_name[name_id]
+
+        patch = self.patch_at(self.images[name], coords[0], coords[1], coords[2])
+        label = torch.tensor(current_label).long() 
+        gt = torch.tensor(gt_label).long()
+        segmentation = self.patch_at(self.labels[name], coords[0], coords[1], coords[2])
+        return {
+            "name": name,
+            "patch": patch, 
+            "label": label, 
+            "gt": gt, 
+            "coords": torch.tensor(coords).long(),
+            "schedule_idx": torch.tensor(schedule_idx).long(),
+            "is_anchor": torch.tensor(is_anchor).bool(), 
+            "anchor_id": torch.tensor(anchor_id).long(),
+            "radius": torch.tensor(radius).float(),
+            "segmentation": segmentation,
+            "confidence": torch.tensor(self.schedule["confidence"][schedule_idx]).float(),
+        }
+
+
 
 class SemisupervisedDataset(Dataset):
+    """Dataset for anchor-centered supervised and semisupervised patch sampling.
+
+    The dataset is built from preselected ``z`` indices per volume. For each selected
+    slice, it samples a configurable number of anchor coordinates per class and, for
+    each anchor, tries to sample ``n_neighbors`` nearby valid coordinates inside the
+    current radius.
+
+    In ``supervised`` mode, ``__getitem__`` returns only the anchor patch and label.
+    In ``semisupervised`` mode, it returns the anchor followed by its neighbors.
+    """
+
     def __init__(
         self,
         images,
@@ -22,10 +448,45 @@ class SemisupervisedDataset(Dataset):
         indices_dict=None,
         radius=5,
         dim=2,
-        seed = 42,
+        seed=42,
         n_neighbors=7,
-        samples_per_class: Dict[int, int] = {1: 2},
+        samples_per_class: Dict[int, int] | None = None,
     ):
+        """
+        
+        Args:
+            images: dict of np.ndarrays
+                Key: image name,
+                Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
+            labels: dict of np.ndarrays
+                Key: image name,
+                Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
+            patch_size: int (Default: 64)
+                Spatial size of the extracted patches
+            label_size: int (Default: 1)
+                Spatial size of the label patch (must be <= patch_size//2)
+            mode: str (Default: "semisupervised")
+                Whether to return only anchors ("supervised") or anchors + neighbors ("semisupervised")
+            n_classes: int (Default: 4)
+                Number of semantic classes in the labels (including background)
+            ignore_lbl: int (Default: -1)
+                Label value to ignore when sampling anchors and neighbors
+            indices_dict: dict (Default: None)
+                Key: image name,
+                Value: list of z indices to sample from for that image
+            radius: int (Default: 5)
+                Maximum distance in pixels to sample neighbors from the anchor
+            dim: int (Default: 2)
+                Whether to sample 2D or 3D patches (must be 2 or 3)
+            seed: int (Default: 42)
+                Random seed for reproducible neighbor sampling         n_neighbors: int (Default: 7)
+                Number of neighbors to sample per anchor in semisupervised mode
+            samples_per_class: dict (Default: None)
+                Optional per-class override for number of anchors to sample from each class.
+                Key: class label (int), Value: number of anchors to sample (int).
+                 If not provided, defaults to 1 anchor per class.
+        
+        """
         self.patch_size = patch_size
         self.label_size = label_size
         self.offset = self.patch_size // 2 - self.label_size
@@ -33,26 +494,18 @@ class SemisupervisedDataset(Dataset):
         self.labels = labels
         self.ignore_lbl = ignore_lbl
         self.n_classes = n_classes
-        # Convert back to sorted numpy array if needed
-        self.unique_vals = np.array(range(n_classes))
+        self.unique_labels = np.array(range(n_classes))
         self.mode = mode
         self.indices_dict = indices_dict or {}
         self.radius = radius
         self.n_neighbors = n_neighbors
         self.seed = seed
         self.rng = random.Random(self.seed)
-        self.samples_per_class = samples_per_class # for class 1 (nucleus), we take 2 to compensate for rarity along z
-        self.default_samples_per_class: int = 1  # We take 1 sample per class per slice
+        # Use per-class overrides when present; otherwise fall back to one anchor per class.
+        self.samples_per_class = samples_per_class or {1: 2}
+        self.default_samples_per_class: int = 1
         self.dim = dim
         self.groups = self._prepare_metadata()
-        self.n_label_per_class = {
-            c: len([g for g in self.groups if g["labels"][0] == c])
-            for c in range(self.n_classes)
-        }
-        self.anchor_indices_by_label = {
-            c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c]
-            for c in range(self.n_classes)
-        }
 
     def set_mode(self, mode: str):
         """Switch between supervised and semisupervised modes."""
@@ -61,6 +514,7 @@ class SemisupervisedDataset(Dataset):
         self.mode = mode
 
     def set_radius(self, radius: int):
+        """Update the neighbor radius and recompute neighbor metadata if needed."""
         if self.radius != radius:
             self.radius = radius
             self.groups = self._modify_metadata()
@@ -71,11 +525,7 @@ class SemisupervisedDataset(Dataset):
         self.groups = self._modify_metadata()
 
     def _is_valid_coord(self, name, z, y, x, Z, H, W):
-        """
-            Check if the coordinate (z,y,x) is valid:
-            - full patch is inside bounds
-            - center voxel is not ignore_lbl
-        """
+        """Return whether a coordinate can be used as an anchor/neighbor center."""
         valid = (
             self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         )
@@ -86,33 +536,14 @@ class SemisupervisedDataset(Dataset):
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
 
         # TODO: Implement mask consistency
-        #unique_label_area = self.labels[name][z, x : x + self.label_size, y : y + self.label_size]
-        #consistent_mask = np.all(unique_label_area == unique_label_area[0, 0])
 
         return valid and in_cell
-
-    def _centre_consistent(self, patch_metadata):
-        """Vectorized version to check if the center is label-consistent.
-           (Which means that we only return patches whose mask is fully inside a single label region.)"""
-        if self.keys:
-            key, z, x, y = patch_metadata
-            unique_label_area = self.labels[key][
-                z, x : x + self.label_size, y : y + self.label_size
-            ]
-        else:
-            z, x, y = patch_metadata
-            unique_label_area = self.labels[
-                z, x : x + self.label_size, y : y + self.label_size
-            ]
-        return (
-            np.all(unique_label_area == unique_label_area[0, 0])
-            and unique_label_area[0, 0] != self.ignore_lbl
-        )
 
     def __len__(self):
         return len(self.groups)
 
     def patch_at(self, img_stack, z, y, x):
+        """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
         if self.dim == 2:
             p = img_stack[
                 z,
@@ -129,6 +560,7 @@ class SemisupervisedDataset(Dataset):
             return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
 
     def __getitem__(self, idx):
+        """Return one anchor group in the format expected by the training pipeline."""
         g = self.groups[idx]
         name, z = g["name"], int(g["z"])
         img_vol = self.images[name]
@@ -136,19 +568,29 @@ class SemisupervisedDataset(Dataset):
 
         if self.mode == "supervised":
             cz, cy, cx = map(int, g["coords"][0])
-            patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]  <-- extra dim
-            label = torch.tensor([int(g["labels"][0])], dtype=torch.long)  # [1]
-            segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)  # [1, Z, H, W]
+            # Keep a leading singleton group dimension so the collate output matches
+            # the semisupervised path: [group, channel, ...].
+            patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)
+            label = torch.tensor([int(g["labels"][0])], dtype=torch.long)
+            segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)
             return patch, label, segment, torch.tensor(g["coords"][0])
-        else:
-            # this return the first one as the anchor and all its neighbours come after it
-            coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
-            patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
-            labels = torch.tensor([g["labels"][0]] + [-1]*self.n_neighbors, dtype=torch.long)  # [4]
-            segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])  # [4, 1, Z, H, W]
-            return patches, labels, segments, coords
+
+        # The first coordinate is the anchor; the remaining entries are sampled neighbors.
+        coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
+        patches = torch.stack(
+            [self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords]
+        )
+        labels = torch.tensor(
+            [g["labels"][0]] + [-1] * self.n_neighbors,
+            dtype=torch.long,
+        )
+        segments = torch.stack(
+            [self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords]
+        )
+        return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
+        """Build anchor groups once from the configured per-volume slice indices."""
         groups: List[dict] = []
 
         for name, z_list in self.indices_dict.items():
@@ -157,7 +599,7 @@ class SemisupervisedDataset(Dataset):
             Z, H, W = img.shape
 
             used_coords = set()
-            for cz in z_list:   
+            for cz in z_list:
                 stack = lbl[cz]
 
                 for c in range(self.n_classes):
@@ -198,7 +640,7 @@ class SemisupervisedDataset(Dataset):
         return groups
 
     def _modify_metadata(self) -> List[dict]:
-        """Recompute metadata after changing radius."""
+        """Refresh neighbors for existing anchors after a radius change."""
 
         for g in self.groups:
             name, z = g["name"], int(g["z"])
@@ -243,14 +685,14 @@ class SemisupervisedDataset(Dataset):
     def _sample_coords_for_class(
         self, stack: np.ndarray, c: int
     ) -> Iterable[Tuple[int, int]]:
-        """Return up to N (y, x) coordinates for class c from a 2D label stack."""
+        """Sample anchor centers for one class from a single 2D label slice."""
 
         n_needed = getattr(self, "samples_per_class", {}).get(
             c,
             getattr(
                 self,
                 "default_samples_per_class",
-            ),  # TODO
+            ),
         )
 
         label_coords = np.argwhere(stack == c)
@@ -275,23 +717,24 @@ class SemisupervisedDataset(Dataset):
         k: int = 3,
         max_tries: int = 100,
     ) -> List[Dict[str, int]]:
-        """Randomly sample up to k valid nearby coordinates within a disk (radius=self.radius)."""
+        """Randomly sample up to ``k`` valid nearby coordinates within ``self.radius``."""
         neighbors: List[Dict[str, int]] = []
         tries = 0
 
         while len(neighbors) < k and tries < max_tries:
-            dz = self.rng.randint(-self.radius, self.radius) if self.dim ==3 else 0
+            dz = self.rng.randint(-self.radius, self.radius) if self.dim == 3 else 0
             dy = self.rng.randint(-self.radius, self.radius)
             dx = self.rng.randint(-self.radius, self.radius)
 
-            # reject outside disk or center itself
-            if dx * dx + dy * dy + dz * dz > self.radius * self.radius or (dx == 0 and dy == 0 and (dz == 0 if self.dim==3 else False)):
+            # Reject offsets outside the radius and avoid resampling the anchor itself.
+            is_center = dx == 0 and dy == 0 and dz == 0
+            if dx * dx + dy * dy + dz * dz > self.radius * self.radius or is_center:
                 tries += 1
                 continue
 
             nz, ny, nx = cz + dz, cy + dy, cx + dx
             coord = (nz, ny, nx)
-            
+
             if coord in used_coords:
                 tries += 1
                 continue
@@ -320,7 +763,7 @@ class SemisupervisedDataset(Dataset):
         c: int,
         neighbors: List[Dict[str, int]],
     ) -> Dict[str, Any]:
-        """Create the output dict for one (center + neighbors) group."""
+        """Create the metadata record for one anchor plus its sampled neighbors."""
         return {
             "name": name,
             "z": int(cz),
@@ -329,7 +772,7 @@ class SemisupervisedDataset(Dataset):
         }
 
     def _report_class_counts(self, groups: List[dict]) -> None:
-        """Print class counts for centers and neighbors separately."""
+        """Print class counts for anchors and neighbors to aid dataset inspection."""
         centers = [g["labels"][0] for g in groups]
         neighbors = [lab for g in groups for lab in g["labels"][1:]]
 
