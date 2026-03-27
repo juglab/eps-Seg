@@ -130,6 +130,8 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         
         self.confidence_threshold = confidence_threshold
         self.age_for_election = age_for_election
+        # Used to track changes in the schedule pool and signal samplers to update their cached valid samples.
+        self.sampling_version = 0 
 
         # The schedule contains the pool of anchors and neighbors we can sample from
         # Anchors are fixed and sampled at initialization
@@ -145,7 +147,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "radius": np.empty((0,), dtype=np.float32), # [N] radius of this voxel from its anchor (0 for anchors)
             "high_confidence_age": np.empty((0,), dtype=np.int32), # [N] number of re-evaluations with high confidence (confidence >= threshold). Used to elect pseudo-labels as anchors.
         }
-        self.valid_indices = np.array([], dtype=np.int32)  # indices of the schedule that are currently valid for sampling (i.e., confidence >= threshold)
 
         print(f"Sampling new anchors...")
         self._sample_anchors()
@@ -153,7 +154,11 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         print(f"Sampling initial neighbors with radius={self.radius}...")
         self._sample_neighbors()
         self._print_schedule_report()
-        self._rebuild_current_pool()
+        self._bump_sampling_version()
+
+    def _bump_sampling_version(self):
+        """Increase version to signal sampler that the pool of available samples has changed."""
+        self.sampling_version += 1
 
     def _add_to_schedule(self, name_id, coords, current_label, gt_label, confidence, is_anchor, anchor_id, radius):
         """Helper function to add new entries to the schedule."""
@@ -296,22 +301,16 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             
         print(f"Sampled {total_new_neighbors} new neighbors for {len(anchors)} anchors.")
 
-    def _rebuild_current_pool(self):
-        """
-            Rebuild the pool of valid samples for training based on the current confidence threshold.
-        """
-        self.valid_indices = np.where(self.schedule["confidence"] >= self.confidence_threshold)[0]
-
     def __len__(self):
-        """Return the number of valid samples in the schedule."""
-        return len(self.valid_indices)
+        """Return the total number of rows in the persistent schedule."""
+        return len(self.schedule["name_id"])
 
     def set_confidence_threshold(self, new_threshold: float):
-        """Update the confidence threshold and rebuild the pool of valid samples."""
+        """Update the confidence threshold used by samplers to select trainable rows."""
         if new_threshold != self.confidence_threshold:
             self.confidence_threshold = new_threshold
-            self._rebuild_current_pool()
-            print(f"Updated confidence threshold to {self.confidence_threshold}. Now {len(self.valid_indices)} valid samples available for training.")
+            self._bump_sampling_version()
+            print(f"Updated confidence threshold to {self.confidence_threshold}.")
 
     def _elect_new_anchors(self):
         """
@@ -324,7 +323,9 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         )
 
         self.schedule["is_anchor"][candidate_mask] = True
-        print(f"Elected {candidate_mask.sum()} new anchors based on current confidence threshold.")
+        elected = int(candidate_mask.sum())
+        print(f"Elected {elected} new anchors based on current confidence threshold.")
+        return elected
         
     def set_radius(self, new_radius: float):
         """
@@ -336,6 +337,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             print(f"Updated sampling radius to {self.radius}. Adding new neighbors to schedule...")
             self._sample_neighbors()
             self._print_schedule_report()
+            self._bump_sampling_version()
     
     # TODO: Implement a mechanism for the re-evaluation phase to iterate over the neighbors to update their confidence.
     def update_confidence(self, indices: np.ndarray, new_confidences: np.ndarray, current_labels: np.ndarray):
@@ -350,6 +352,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
 
         """
         self.schedule["confidence"][indices] = new_confidences
+        self.schedule["current_label"][indices] = current_labels
 
         # Update high confidence age for neighbors above threshold and reset if below threshold
         for idx in indices:
@@ -361,6 +364,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         
         # Elect new anchors if they have been above threshold for enough validations
         self._elect_new_anchors()
+        self._bump_sampling_version()
 
     def patch_at(self, img_stack, z, y, x):
         """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
@@ -393,15 +397,15 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         print(spd.groupby(["is_anchor", "name_id"])["gt_label"].value_counts().unstack(fill_value=0))
 
     def __getitem__(self, idx):
-        """Return a training sample from the schedule based on the current valid indices."""
-        schedule_idx = self.valid_indices[idx]
-        name_id = self.schedule["name_id"][schedule_idx]
-        coords = self.schedule["coords"][schedule_idx]
-        current_label = self.schedule["current_label"][schedule_idx]
-        gt_label = self.schedule["gt_label"][schedule_idx]
-        is_anchor = self.schedule["is_anchor"][schedule_idx]
-        anchor_id = self.schedule["anchor_id"][schedule_idx]
-        radius = self.schedule["radius"][schedule_idx]
+        """Return one training sample from the schedule by its absolute schedule index."""
+        schedule_idx = idx
+        name_id = self.schedule["name_id"][idx]
+        coords = self.schedule["coords"][idx]
+        current_label = self.schedule["current_label"][idx]
+        gt_label = self.schedule["gt_label"][idx]
+        is_anchor = self.schedule["is_anchor"][idx]
+        anchor_id = self.schedule["anchor_id"][idx]
+        radius = self.schedule["radius"][idx]
         name = self.id_to_name[name_id]
 
         patch = self.patch_at(self.images[name], coords[0], coords[1], coords[2])
@@ -419,7 +423,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "anchor_id": torch.tensor(anchor_id).long(),
             "radius": torch.tensor(radius).float(),
             "segmentation": segmentation,
-            "confidence": torch.tensor(self.schedule["confidence"][schedule_idx]).float(),
+            "confidence": torch.tensor(self.schedule["confidence"][idx]).float(),
         }
 
 

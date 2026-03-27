@@ -104,7 +104,7 @@ class EPSSegDataModule(L.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_sampler=train_sampler,
-            collate_fn=flex_collate,
+            # collate_fn=flex_collate, Default collate for PseudoLabelDataset
         )
 
     def val_dataloader(self):
@@ -151,6 +151,12 @@ class EPSSegDataModule(L.LightningDataModule):
         """Set the radius for semisupervised sampling."""
         print(f"Setting semisupervised sampling radius to {radius}...")
         self.train_dataset.set_radius(radius)
+
+    def set_confidence_threshold(self, threshold: float):
+        """Set the confidence threshold used by the training sampler."""
+        print(f"Setting training confidence threshold to {threshold}...")
+        if hasattr(self.train_dataset, "set_confidence_threshold"):
+            self.train_dataset.set_confidence_threshold(threshold)
 
     def increase_radius(self):
         """Increase the radius used for semisupervised sampling."""
