@@ -334,7 +334,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 seed=self.cfg.seed,
                 n_neighbors=self.cfg.n_neighbors,
                 samples_per_class=self.cfg.samples_per_class_training,
-                confidence_threshold=1.0,
+                confidence_threshold=self.train_cfg.initial_threshold,
                 age_for_election=self.train_cfg.pseudolabel_age_for_election,
             )
         if stage in ["fit", "validate"]:

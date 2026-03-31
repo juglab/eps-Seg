@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional, Union, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
 from eps_seg.config.models import BaseEPSModelConfig, LVAEConfig
@@ -38,6 +38,19 @@ class TrainConfig(BaseEPSConfig):
     radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
     pseudolabel_age_for_election: int = Field(default=10, description="Number of re-evaluations of a pseudolabel's confidence before it is considered for election as an anchor.")
+    train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
+
+    @model_validator(mode="after")
+    def disable_threshold_schedule_for_fully_supervised(self):
+        """
+            In fully supervised training, the confidence threshold is set to 0 so the sampler always returns all available neighbors for the current radius.
+        """
+        if self.train_fully_supervised:
+            self.initial_threshold = 0.0
+            self.threshold_increment = 0.0
+            self.max_threshold = 0.0
+        return self
+
 
 
 class ExperimentConfig(BaseEPSConfig):

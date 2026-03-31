@@ -18,92 +18,81 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
             skip_supervised (bool): If True, skip the supervised training phase and only perform semi-supervised training by loading the best supervised checkpoint.
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
     dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
-    if not skip_supervised:
-        # Set random seed for reproducibility if provided
+    model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
+
+    if train_config.train_fully_supervised:
+        print("Training in fully supervised mode...")
+
         if train_config.supervised_seed is not None:
             print(f"Setting random seed to {train_config.supervised_seed} for supervised training...")
             L.seed_everything(train_config.supervised_seed, workers=True)
-
-        model = LVAEModel(model_cfg=model_config, train_cfg=train_config).to(device)
 
         # Dummy forward pass to initialize model parameters
         if strategy == "ddp":
             model.eval()
             model(torch.zeros(size=(1,) + (model_config.color_channels,) + tuple(model_config.img_shape), device=model.device), validation_mode=False)
             model.train()
-
-        supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
-        supervised_modelcheckpoint = ModelCheckpoint(
-            monitor="val/CE_epoch",
-            dirpath=supervised_best_ckpt_path.parent,
-            filename=supervised_best_ckpt_path.stem,
-            mode="min",
-            save_last=True,
-        )
-
-        if train_config.use_wandb:
-            supervised_logger = WandbLogger(
-                name=f"{exp_config.experiment_name}_supervised",
-                project=exp_config.project_name,
-                save_dir=exp_config.get_log_dir(),
-            )
-        else:
-            supervised_logger = TensorBoardLogger(
-                name=f"{exp_config.experiment_name}_supervised",
-                save_dir=exp_config.get_log_dir(),
+        
+            supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
+            supervised_modelcheckpoint = ModelCheckpoint(
+                monitor="val/CE_epoch",
+                dirpath=supervised_best_ckpt_path.parent,
+                filename=supervised_best_ckpt_path.stem,
+                mode="min",
+                save_last=True,
             )
 
-        #### SUPERVISED MODE ####
-        supervised_trainer = L.Trainer(
-            devices="auto",
-            strategy=strategy,
-            logger=supervised_logger,
-            max_epochs=train_config.max_epochs,
-            callbacks=[
-                        supervised_modelcheckpoint,
-                        EarlyStoppingWithPatiencePropagation(
-                            monitor="val/total_loss_epoch",
-                            patience=train_config.early_stopping_patience,
-                            mode="min",
-                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
-                        )
-                    ],
-            precision = "16-mixed" if train_config.amp else 32,
-            gradient_clip_val=train_config.max_grad_norm, 
-            log_every_n_steps=train_config.log_every_n_steps,
-            deterministic=train_config.deterministic,
-            use_distributed_sampler=False, # We have our own distributed sampler
-            accumulate_grad_batches=train_config.accumulate_grad_batches,
-            # fast_dev_run=True,
-            )
+            if train_config.use_wandb:
+                supervised_logger = WandbLogger(
+                    name=f"{exp_config.experiment_name}_supervised",
+                    project=exp_config.project_name,
+                    save_dir=exp_config.get_log_dir(),
+                )
+            else:
+                supervised_logger = TensorBoardLogger(
+                    name=f"{exp_config.experiment_name}_supervised",
+                    save_dir=exp_config.get_log_dir(),
+                )
+            
+            supervised_trainer = L.Trainer(
+                                devices="auto",
+                                strategy=strategy,
+                                logger=supervised_logger,
+                                max_epochs=train_config.max_epochs,
+                                callbacks=[
+                                            supervised_modelcheckpoint,
+                                            EarlyStoppingWithPatiencePropagation(
+                                                monitor="val/total_loss_epoch",
+                                                patience=train_config.early_stopping_patience,
+                                                mode="min",
+                                                check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
+                                            )
+                                        ],
+                                precision = "16-mixed" if train_config.amp else 32,
+                                gradient_clip_val=train_config.max_grad_norm, 
+                                log_every_n_steps=train_config.log_every_n_steps,
+                                deterministic=train_config.deterministic,
+                                use_distributed_sampler=False, # We have our own distributed sampler
+                                accumulate_grad_batches=train_config.accumulate_grad_batches,
+                                # fast_dev_run=True,
+                                )
+            
+            supervised_trainer.fit(model, datamodule=dm)
 
-        model.update_mode("supervised")
-        # Example for 2D convs
-        # batch_size = train_config.batch_size
-        # C = dataset_config.n_channels
-        # H, W = model_config.img_shape[-2], model_config.img_shape[-1]
-        supervised_trainer.fit(model, datamodule=dm)
-
-        print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
-        # Finish the wandb run to avoid next run to log into the same run
-        if train_config.use_wandb:
-            wandb.finish()
+            print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
+            # Finish the wandb run to avoid next run to log into the same run
+            if train_config.use_wandb:
+                wandb.finish()
     else:
-        print("Skipping supervised training as per the argument.")
-
-    #### SEMISUPERVISED TRAINING ####
-    if not skip_semisupervised:
         print("Starting semisupervised training...")
 
         # Set random seed for reproducibility if provided
         if train_config.semisupervised_seed is not None:
             print(f"Setting random seed to {train_config.semisupervised_seed} for semisupervised training...")
             L.seed_everything(train_config.semisupervised_seed, workers=True)
-
 
         semisupervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="semisupervised")
         semisupervised_modelcheckpoint = ModelCheckpoint(
@@ -126,31 +115,28 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                 save_dir=exp_config.get_log_dir(),
             )
 
-        # Initialize model from best supervised checkpoint
-        best_supervised_modelcheckpoint = exp_config.best_checkpoint_path(mode="supervised") if skip_supervised else supervised_modelcheckpoint.best_model_path
-
         semisupervised_trainer = L.Trainer(
             devices="auto",
             strategy=strategy,
             logger=semisupervised_logger,
             max_epochs=train_config.max_epochs,
             callbacks=[
-                    OptimizerStateTransferCallback(
-                        checkpoint_path=str(best_supervised_modelcheckpoint),
-                        restore_optimizer=True,
-                        restore_lr_scheduler=True,
-                        restore_precision=train_config.amp,
-                        strict_counts=True,
-                    ),
-                    SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
-                    semisupervised_modelcheckpoint, 
+                    # OptimizerStateTransferCallback(
+                    #     checkpoint_path=str(best_supervised_modelcheckpoint),
+                    #     restore_optimizer=True,
+                    #     restore_lr_scheduler=True,
+                    #     restore_precision=train_config.amp,
+                    #     strict_counts=True,
+                    # ),
+                    # SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
+                    semisupervised_modelcheckpoint,
                     EarlyStoppingWithPatiencePropagation(
                             monitor="val/total_loss_epoch",
                             patience=train_config.early_stopping_patience,
                             mode="min",
                             check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
                         ),
-                    LearningRateMonitor(logging_interval='step'),
+                    LearningRateMonitor(logging_interval='epoch'),
                     ThresholdSchedulerCallback(),
                     RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
                     ],
@@ -163,16 +149,12 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
             # fast_dev_run=True,
             )
 
-        model = LVAEModel.load_from_checkpoint(best_supervised_modelcheckpoint,
-                                            model_cfg=model_config,
-                                            train_cfg=train_config).to(device)
         semisupervised_trainer.fit(model, datamodule=dm)
 
         print("Semisupervised training complete. Best model at:", semisupervised_modelcheckpoint.best_model_path)
         if train_config.use_wandb:
                 wandb.finish()
-    else:
-        print("Skipping semisupervised training as per the argument.")
+
 
 def main():
     # Allows to be run as: python -m eps_seg.train --exp_config path/to/exp_config.yaml --env_file path/to/.env
