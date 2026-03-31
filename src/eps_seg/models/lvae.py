@@ -26,6 +26,7 @@ class LVAEModel(L.LightningModule):
         self.current_radius = self.train_cfg.initial_radius if self.train_cfg else 5
         # Patience counter for radius increase
         self.current_radius_patience = 0
+        self.current_threshold_patience = 0
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
                                    "train_config": train_cfg.model_dump() if train_cfg else None})
         

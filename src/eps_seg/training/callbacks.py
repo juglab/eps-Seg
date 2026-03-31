@@ -16,12 +16,15 @@ class EarlyStoppingWithPatiencePropagation(EarlyStopping):
         if pl_module.current_training_mode == "semisupervised":
             if self.wait_count > 0:
                 pl_module.current_radius_patience += 1
+                pl_module.current_threshold_patience += 1
             else:
                 pl_module.current_radius_patience = 0
+                pl_module.current_threshold_patience = 0
                 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx = 0):
         if pl_module.current_training_mode == "semisupervised":
             pl_module.log("val/radius_increase_patience", pl_module.current_radius_patience, prog_bar=True, on_epoch=True, sync_dist=True)
+            pl_module.log("val/threshold_decrease_patience", pl_module.current_threshold_patience, prog_bar=True, on_epoch=True, sync_dist=True)
             pl_module.log("val/early_stopping_patience", self.wait_count, prog_bar=True, on_epoch=True, sync_dist=True)
 
         return super().on_validation_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
@@ -125,16 +128,17 @@ class OptimizerStateTransferCallback(L.Callback):
 
 class ThresholdSchedulerCallback(L.Callback):
     """
-        Move the training confidence threshold towards the configured max 
-        threshold. This supports both increasing and decreasing schedules.
+        Decrease the training confidence threshold only after a configurable
+        number of validation epochs without improvement.
     """
-    def on_train_epoch_end(self, trainer, pl_module):
-        super().on_train_epoch_end(trainer, pl_module)
+    def on_validation_epoch_end(self, trainer, pl_module):
+        super().on_validation_epoch_end(trainer, pl_module)
         if pl_module.current_training_mode == "semisupervised":
             target_threshold = pl_module.train_cfg.max_threshold
             step = abs(pl_module.train_cfg.threshold_increment)
+            patience = pl_module.train_cfg.threshold_decrement_patience
 
-            if step > 0:
+            if step > 0 and patience > 0 and pl_module.current_threshold_patience >= patience:
                 if pl_module.current_threshold > target_threshold:
                     new_threshold = max(pl_module.current_threshold - step, target_threshold)
                 else:
@@ -143,6 +147,7 @@ class ThresholdSchedulerCallback(L.Callback):
                 if new_threshold != pl_module.current_threshold:
                     trainer.datamodule.set_confidence_threshold(new_threshold)
                     pl_module.current_threshold = new_threshold
+                pl_module.current_threshold_patience = 0
         pl_module.log("train/threshold", pl_module.current_threshold, prog_bar=True, on_epoch=True)
 
 class RadiusSchedulerCallback(L.Callback):
