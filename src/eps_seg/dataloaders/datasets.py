@@ -44,7 +44,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
 
         Where:
             - Coords: coordinates of the anchor pixel/voxel
-            - Current Label: Most recent label assigned to the voxel. If the voxel is an anchor, this is the same as the GT label. If the voxel is a neighbor, this is the label assigned externally during validation.
+            - Current Label: Training label currently assigned to the voxel. If the voxel is an anchor, this is the anchor label used for training. If the voxel is a neighbor, it stays at -1 until the neighbor is promoted to an anchor.
             - GT Label: Ground truth label of the voxel (used for logging scheduler performances, not training)
             - Confidence: Confidence score of the current label. For anchors it is always 1.0. For neighbors, it is assigned externally during validation. Used to sample labels and construct batches.
             - Is Anchor: Boolean flag indicating whether the voxel is an anchor.
@@ -312,18 +312,34 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             self._bump_sampling_version()
             print(f"Updated confidence threshold to {self.confidence_threshold}.")
 
-    def _elect_new_anchors(self):
+    def _elect_new_anchors(self, indices: np.ndarray, labels: np.ndarray):
         """
-            Elect new anchors among the neighbors that have been above the confidence threshold for enough re-evaluations. This function is called after updating confidence scores.
+            Elect new anchors among the neighbors updated during the current re-evaluation.
+            Only rows included in ``indices`` are considered, and only elected neighbors
+            receive their predicted label before being promoted to anchors.
         """
+        updated_mask = np.zeros(len(self.schedule["name_id"]), dtype=bool)
+        updated_mask[indices] = True
         candidate_mask = (
+            updated_mask &
             (self.schedule["is_anchor"] == False) &
             (self.schedule["confidence"] >= self.confidence_threshold) &
             (self.schedule["high_confidence_age"] >= self.age_for_election)
         )
 
+        candidate_indices = np.where(candidate_mask)[0]
+        if candidate_indices.size > 0:
+            predicted_labels_by_index = {
+                int(idx): int(label) for idx, label in zip(indices.tolist(), labels.tolist())
+            }
+            promoted_labels = np.array(
+                [predicted_labels_by_index[idx] for idx in candidate_indices.tolist()],
+                dtype=np.int32,
+            )
+            self.schedule["current_label"][candidate_indices] = promoted_labels
+
         self.schedule["is_anchor"][candidate_mask] = True
-        elected = int(candidate_mask.sum())
+        elected = int(candidate_indices.size)
         print(f"Elected {elected} new anchors based on current confidence threshold.")
         return elected
         
@@ -348,11 +364,15 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             Args:
                 indices: indices of the schedule to update
                 new_confidences: new confidence scores to assign to the given indices
-                current_labels: new current labels to assign to the given indices in case they get elected as anchors (i.e., they are above the confidence threshold for enough re-evaluations)
+                current_labels: model labels predicted for the given indices. These are only written to the
+                    schedule if a neighbor is elected during this update; non-anchor neighbors keep label -1.
 
         """
         self.schedule["confidence"][indices] = new_confidences
-        self.schedule["current_label"][indices] = current_labels
+
+        # Non-anchor neighbors always remain unlabeled (-1) unless they become anchors
+        non_anchor_mask = ~self.schedule["is_anchor"][indices]
+        self.schedule["current_label"][indices[non_anchor_mask]] = -1
 
         # Update high confidence age for neighbors above threshold and reset if below threshold
         for idx in indices:
@@ -362,8 +382,8 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                 else:
                     self.schedule["high_confidence_age"][idx] = 0
         
-        # Elect new anchors if they have been above threshold for enough validations
-        self._elect_new_anchors()
+        # Check if any neighbors can be elected as new anchors
+        self._elect_new_anchors(indices=indices, labels=current_labels)
         self._bump_sampling_version()
 
     def patch_at(self, img_stack, z, y, x):

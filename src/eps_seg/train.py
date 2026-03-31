@@ -5,7 +5,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
-from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback, OptimizerStateTransferCallback
+from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback, OptimizerStateTransferCallback, PseudoLabelReevaluationCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import wandb
@@ -25,6 +25,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
 
     if train_config.train_fully_supervised:
         print("Training in fully supervised mode...")
+        model.update_mode("supervised")
 
         if train_config.supervised_seed is not None:
             print(f"Setting random seed to {train_config.supervised_seed} for supervised training...")
@@ -88,7 +89,7 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                 wandb.finish()
     else:
         print("Starting semisupervised training...")
-
+        model.update_mode("semisupervised")
         # Set random seed for reproducibility if provided
         if train_config.semisupervised_seed is not None:
             print(f"Setting random seed to {train_config.semisupervised_seed} for semisupervised training...")
@@ -115,6 +116,13 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                 save_dir=exp_config.get_log_dir(),
             )
 
+        semisupervised_early_stopping = EarlyStoppingWithPatiencePropagation(
+            monitor="val/total_loss_epoch",
+            patience=train_config.early_stopping_patience,
+            mode="min",
+            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius
+        )
+
         semisupervised_trainer = L.Trainer(
             devices="auto",
             strategy=strategy,
@@ -130,12 +138,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                     # ),
                     # SemiSupervisedModeCallback(), # Switches model to semisupervised mode at the start of training
                     semisupervised_modelcheckpoint,
-                    EarlyStoppingWithPatiencePropagation(
-                            monitor="val/total_loss_epoch",
-                            patience=train_config.early_stopping_patience,
-                            mode="min",
-                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
-                        ),
+                    semisupervised_early_stopping,
+                    PseudoLabelReevaluationCallback(semisupervised_early_stopping),
                     LearningRateMonitor(logging_interval='epoch'),
                     ThresholdSchedulerCallback(),
                     RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),

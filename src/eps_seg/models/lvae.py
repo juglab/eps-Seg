@@ -4,7 +4,9 @@ from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
 from typing import Literal
 import torch 
+import numpy as np
 from torchmetrics.classification import F1Score
+from torch.utils.data import DataLoader, Subset
 
 
 class LVAEModel(L.LightningModule):
@@ -91,38 +93,61 @@ class LVAEModel(L.LightningModule):
         self.log(f"seen_samples", float(self.seen_samples), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
         self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
 
-        # TODO: Logging pseudo-label stats 
-
         if step == "train":
-            print("Logg")
-            self.log(f"pseudo_labels/anchors_perc", batch["is_anchor"].sum() / batch["is_anchor"].shape[0], on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            
-        # if outputs.get("pseudo_labels_stats") is not None and segments is not None:
-        #     pl = outputs["pseudo_labels"]
-        #     pl_stats = outputs["pseudo_labels_stats"]
-        #     nbr_msk = pl_stats["neighbor_mask"]
-        #     pl_ass_msk = pl_stats["assigned_pseudo_labels_mask"]
+            self._log_pseudo_label_stats(outputs, batch, batch_size)
 
-        #     center_coords = [(self.cfg.img_shape[i] - 1) // 2 for i in range(len(self.cfg.img_shape))]
-        #     gt_pseudo_labels = segments[:, 0, *center_coords]
+    def _log_pseudo_label_stats(self, outputs: dict, batch: dict, batch_size: int):
+        pseudo_labels = outputs.get("pseudo_labels")
+        gt = batch.get("gt")
+        is_anchor = batch.get("is_anchor")
+        schedule_labels = batch.get("label")
 
-        #     correct_pseudo_labels = (gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk])
-        #     n_tp_pseudo_labels = correct_pseudo_labels.sum() / pl_ass_msk.sum() if pl_ass_msk.sum() > 0 else 0
+        if pseudo_labels is None or gt is None or is_anchor is None or schedule_labels is None:
+            return
 
-        #     self.log(f"{step}_pseudo_labels/assigned_neighbors_perc", pl_stats["n_assigned"] / pl_stats["n_neighbors"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        #     self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy", n_tp_pseudo_labels, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        #     for label_cls in range(self.cfg.n_components):
-        #         n_assigned_pl_class = (pl[pl_ass_msk] == label_cls).sum()
-        #         n_tp_pseudo_labels_class = ((gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk]) & (gt_pseudo_labels[pl_ass_msk] == label_cls)).sum() / n_assigned_pl_class if n_assigned_pl_class > 0 else 0
-        #         self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        is_anchor = is_anchor.bool()
+        neighbor_mask = ~is_anchor
+        unlabeled_neighbor_mask = neighbor_mask & (schedule_labels == -1)
+        assigned_neighbor_mask = unlabeled_neighbor_mask & (pseudo_labels != -1)
+        anchor_like_mask = pseudo_labels != -1
 
-        #     for l, conf in enumerate(pl_stats["pseudo_labels_confidences"]):
-        #         # How confident each layer is in assigning pseudo-labels to neighbors in general
-        #         self.log(f"{step}_pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        #         self.log(f"{step}_pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/current_threshold", float(self.current_threshold), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/current_radius", float(self.current_radius), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/anchors_perc", is_anchor.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/neighbors_perc", neighbor_mask.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/unlabeled_neighbors_perc", unlabeled_neighbor_mask.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/labeled_samples_perc", anchor_like_mask.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
+        n_neighbors = neighbor_mask.sum()
+        n_unlabeled_neighbors = unlabeled_neighbor_mask.sum()
+        n_assigned = assigned_neighbor_mask.sum()
+        zero = torch.tensor(0.0, device=self.device)
 
+        assigned_among_neighbors = (
+            n_assigned.float() / n_neighbors.clamp(min=1).float() if n_neighbors.item() > 0 else zero
+        )
+        assigned_among_unlabeled = (
+            n_assigned.float() / n_unlabeled_neighbors.clamp(min=1).float()
+            if n_unlabeled_neighbors.item() > 0
+            else zero
+        )
 
+        self.log("pseudo_labels/assigned_neighbors_perc", assigned_among_neighbors, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        self.log("pseudo_labels/assigned_unlabeled_neighbors_perc", assigned_among_unlabeled, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+        assigned_accuracy = (
+            (pseudo_labels[assigned_neighbor_mask] == gt[assigned_neighbor_mask]).float().mean()
+            if n_assigned.item() > 0
+            else zero
+        )
+        self.log("pseudo_labels/assigned_accuracy", assigned_accuracy, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+
+        if n_assigned.item() > 0:
+            for label_cls in range(self.cfg.n_components):
+                class_mask = assigned_neighbor_mask & (gt == label_cls)
+                if class_mask.any():
+                    class_accuracy = (pseudo_labels[class_mask] == gt[class_mask]).float().mean()
+                    self.log(f"pseudo_labels/assigned_accuracy_class_{label_cls}", class_accuracy, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
 
     def compute_total_loss(self, outputs: dict):
         return (
@@ -231,8 +256,61 @@ class LVAEModel(L.LightningModule):
         self.validation_dice_score.reset()
 
     def re_evaluate_pseudo_labels(self):
-        # TODO: Implement method to re-evaluate pseudo-labels in the dataloader
-        pass
+        datamodule = self.trainer.datamodule
+        train_dataset = getattr(datamodule, "train_dataset", None)
+        if train_dataset is None or not hasattr(train_dataset, "schedule"):
+            print("Skipping pseudo-label reevaluation: training dataset has no persistent schedule.")
+            return
+
+        neighbor_indices = np.where(~train_dataset.schedule["is_anchor"])[0]
+        if neighbor_indices.size == 0:
+            print("Skipping pseudo-label reevaluation: no neighbors available in the training schedule.")
+            return
+
+        reevaluation_loader = DataLoader(
+            Subset(train_dataset, neighbor_indices.tolist()),
+            batch_size=self.train_cfg.test_batch_size,
+            shuffle=False,
+        )
+
+        was_training = self.training
+        self.eval()
+
+        all_schedule_indices = []
+        all_confidences = []
+        all_labels = []
+
+        with torch.inference_mode():
+            # This is to use the same precision as validation 
+            with self.trainer.precision_plugin.forward_context():
+                for batch in reevaluation_loader:
+                    x = batch["patch"].to(self.device)
+                    outputs = self.forward(
+                        x,
+                        y=None,
+                        validation_mode=False,
+                        confidence_threshold=self.current_threshold,
+                    )
+                    probs = outputs["class_probabilities"]
+                    confidences, predicted_labels = probs.max(dim=-1)
+
+                    all_schedule_indices.append(batch["schedule_idx"].cpu())
+                    all_confidences.append(confidences.cpu())
+                    all_labels.append(predicted_labels.cpu())
+
+        if was_training:
+            self.train()
+
+        schedule_indices = torch.cat(all_schedule_indices).numpy()
+        new_confidences = torch.cat(all_confidences).numpy().astype(np.float32)
+        current_labels = torch.cat(all_labels).numpy().astype(np.int32)
+
+        train_dataset.update_confidence(
+            indices=schedule_indices,
+            new_confidences=new_confidences,
+            current_labels=current_labels,
+        )
+        print(f"Re-evaluated pseudo-labels for {len(schedule_indices)} scheduled neighbors.")
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),
@@ -249,7 +327,10 @@ class LVAEModel(L.LightningModule):
             },
         }
 
-    
+    def update_mode(self, mode: Literal["supervised", "semisupervised"]):
+        print(f"Updating model training mode to: {mode}")
+        self.current_training_mode = mode
+        self.model.update_mode(mode)
 
     def configure_callbacks(self):
         return super().configure_callbacks()

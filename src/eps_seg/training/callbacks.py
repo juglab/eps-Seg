@@ -1,5 +1,6 @@
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint
 import shutil
 import os
 from pathlib import Path
@@ -124,12 +125,24 @@ class OptimizerStateTransferCallback(L.Callback):
 
 class ThresholdSchedulerCallback(L.Callback):
     """
-        At the end of each epoch, increase the threshold by max_threshold.
+        Move the training confidence threshold towards the configured max 
+        threshold. This supports both increasing and decreasing schedules.
     """
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
         if pl_module.current_training_mode == "semisupervised":
-            pl_module.current_threshold = min(pl_module.current_threshold + pl_module.train_cfg.threshold_increment, pl_module.train_cfg.max_threshold)
+            target_threshold = pl_module.train_cfg.max_threshold
+            step = abs(pl_module.train_cfg.threshold_increment)
+
+            if step > 0:
+                if pl_module.current_threshold > target_threshold:
+                    new_threshold = max(pl_module.current_threshold - step, target_threshold)
+                else:
+                    new_threshold = min(pl_module.current_threshold + step, target_threshold)
+
+                if new_threshold != pl_module.current_threshold:
+                    trainer.datamodule.set_confidence_threshold(new_threshold)
+                    pl_module.current_threshold = new_threshold
         pl_module.log("train/threshold", pl_module.current_threshold, prog_bar=True, on_epoch=True)
 
 class RadiusSchedulerCallback(L.Callback):
@@ -167,3 +180,30 @@ class RadiusSchedulerCallback(L.Callback):
                     pl_module.current_radius = new_radius
                 pl_module.current_radius_patience = 0
         pl_module.log("train/radius", pl_module.current_radius, prog_bar=True, on_epoch=True)
+
+
+class PseudoLabelReevaluationCallback(L.Callback):
+    """
+        Re-evaluate neighbor confidences whenever validation improves during
+        semisupervised training.
+    """
+
+    def __init__(self, early_stopping_callback: EarlyStoppingWithPatiencePropagation):
+        super().__init__()
+        self.early_stopping_callback = early_stopping_callback
+        self._last_trigger_epoch: Optional[int] = None
+
+    def on_validation_end(self, trainer, pl_module):
+        super().on_validation_end(trainer, pl_module)
+        if trainer.sanity_checking or pl_module.current_training_mode != "semisupervised":
+            return
+
+        if self.early_stopping_callback.wait_count != 0:
+            return
+
+        if self._last_trigger_epoch == trainer.current_epoch:
+            return
+
+        self._last_trigger_epoch = trainer.current_epoch
+        print("Validation improved. Re-evaluating pseudo-labels...")
+        pl_module.re_evaluate_pseudo_labels()

@@ -273,14 +273,13 @@ class LadderVAE(nn.Module):
 
         if self.training_mode == "semisupervised" and self.training:
             # get pseudo-labels
-            pseudo_labels, pseudo_labels_stats = self.get_pseudo_labels(
+            pseudo_labels = self.get_pseudo_labels(
                 td_data["posterior"],
                 y,
                 threshold=confidence_threshold,
             )
         else:
             pseudo_labels = y
-            pseudo_labels_stats = None
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)
@@ -331,7 +330,6 @@ class LadderVAE(nn.Module):
             "class_probabilities": probabilities,
             "layers_logits": td_data["class_logits"],
             "pseudo_labels": pseudo_labels,
-            "pseudo_labels_stats": pseudo_labels_stats,
         }
         return output
 
@@ -581,7 +579,6 @@ class LadderVAE(nn.Module):
         selected_labels = label[anchors].long()
         per_layer_pseudo = []
         per_layer_probs = []
-        confidences = []  # Used for logging 
 
         for posterior in posteriors:
             mu = posterior.mean
@@ -629,7 +626,6 @@ class LadderVAE(nn.Module):
             pseudo[non_anchors & (layer_conf <= threshold)] = -1
 
             per_layer_pseudo.append(pseudo)
-            confidences.append(probs)
 
         votes = torch.stack(per_layer_pseudo, dim=0)  # (L, B)
         expert_mask = votes != -1
@@ -644,26 +640,7 @@ class LadderVAE(nn.Module):
         final_pseudo[assignable] = moe_label[assignable]
         final_pseudo[anchors] = selected_labels
 
-        # Collect statistics for debugging
-
-        neighbor_mask = torch.ones_like(final_pseudo, dtype=torch.bool)
-        neighbor_mask[anchors] = False # Remove anchor points from the mask
-        n_neighbors = neighbor_mask.sum()
-        
-        assigned_pseudo_labels = neighbor_mask & (final_pseudo != -1)
-        n_assigned = assigned_pseudo_labels.sum()
-
-        stats = {
-                 "per_layer_pseudo_labels": per_layer_pseudo,
-                 "pseudo_labels_confidences": confidences,
-                 "anchors_indices": anchors,
-                 "n_neighbors": n_neighbors,
-                 "n_assigned": n_assigned,
-                 "neighbor_mask": neighbor_mask,
-                 "assigned_pseudo_labels_mask": assigned_pseudo_labels,
-                 }
-
-        return final_pseudo, stats
+        return final_pseudo
 
     def consolidation_prob(self, all_class_logits, mode="SMV"):
 
