@@ -70,7 +70,8 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
                                             patience=train_config.early_stopping_patience,
                                             mode="min",
                                             check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
-                                        )
+                                        ),
+                                        RadiusSchedulerCallback(radius_increment_patience=train_config.radius_increment_patience),
                                     ],
                             precision = "16-mixed" if train_config.amp else 32,
                             gradient_clip_val=train_config.max_grad_norm, 
