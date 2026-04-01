@@ -152,7 +152,8 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self._sample_anchors()
         self._print_schedule_report()
         print(f"Sampling initial neighbors with radius={self.radius}...")
-        self._sample_neighbors()
+        if self.radius > 0:
+            self._sample_neighbors()
         self._print_schedule_report()
         self._bump_sampling_version()
 
