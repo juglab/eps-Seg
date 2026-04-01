@@ -438,12 +438,12 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "label": label, 
             "gt": gt, 
             "coords": torch.tensor(coords).long(),
-            "schedule_idx": torch.tensor(schedule_idx).long(),
-            "is_anchor": torch.tensor(is_anchor).bool(), 
-            "anchor_id": torch.tensor(anchor_id).long(),
-            "radius": torch.tensor(radius).float(),
+            "schedule_idx": torch.tensor(int(schedule_idx)).long(),
+            "is_anchor": torch.tensor(bool(is_anchor), dtype=torch.bool), 
+            "anchor_id": torch.tensor(int(anchor_id)).long(),
+            "radius": torch.tensor(float(radius)).float(),
             "segmentation": segmentation,
-            "confidence": torch.tensor(self.schedule["confidence"][idx]).float(),
+            "confidence": torch.tensor(float(self.schedule["confidence"][idx])).float(),
         }
 
 

@@ -37,56 +37,56 @@ def train(exp_config: ExperimentConfig, skip_supervised: bool = False, skip_semi
             model(torch.zeros(size=(1,) + (model_config.color_channels,) + tuple(model_config.img_shape), device=model.device), validation_mode=False)
             model.train()
         
-            supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
-            supervised_modelcheckpoint = ModelCheckpoint(
-                monitor="val/CE_epoch",
-                dirpath=supervised_best_ckpt_path.parent,
-                filename=supervised_best_ckpt_path.stem,
-                mode="min",
-                save_last=True,
+        supervised_best_ckpt_path = exp_config.best_checkpoint_path(mode="supervised")
+        supervised_modelcheckpoint = ModelCheckpoint(
+            monitor="val/CE_epoch",
+            dirpath=supervised_best_ckpt_path.parent,
+            filename=supervised_best_ckpt_path.stem,
+            mode="min",
+            save_last=True,
+        )
+
+        if train_config.use_wandb:
+            supervised_logger = WandbLogger(
+                name=f"{exp_config.experiment_name}_supervised",
+                project=exp_config.project_name,
+                save_dir=exp_config.get_log_dir(),
             )
+        else:
+            supervised_logger = TensorBoardLogger(
+                name=f"{exp_config.experiment_name}_supervised",
+                save_dir=exp_config.get_log_dir(),
+            )
+        
+        supervised_trainer = L.Trainer(
+                            devices="auto",
+                            strategy=strategy,
+                            logger=supervised_logger,
+                            max_epochs=train_config.max_epochs,
+                            callbacks=[
+                                        supervised_modelcheckpoint,
+                                        EarlyStoppingWithPatiencePropagation(
+                                            monitor="val/total_loss_epoch",
+                                            patience=train_config.early_stopping_patience,
+                                            mode="min",
+                                            check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
+                                        )
+                                    ],
+                            precision = "16-mixed" if train_config.amp else 32,
+                            gradient_clip_val=train_config.max_grad_norm, 
+                            log_every_n_steps=train_config.log_every_n_steps,
+                            deterministic=train_config.deterministic,
+                            use_distributed_sampler=False, # We have our own distributed sampler
+                            accumulate_grad_batches=train_config.accumulate_grad_batches,
+                            # fast_dev_run=True,
+                            )
+        
+        supervised_trainer.fit(model, datamodule=dm)
 
-            if train_config.use_wandb:
-                supervised_logger = WandbLogger(
-                    name=f"{exp_config.experiment_name}_supervised",
-                    project=exp_config.project_name,
-                    save_dir=exp_config.get_log_dir(),
-                )
-            else:
-                supervised_logger = TensorBoardLogger(
-                    name=f"{exp_config.experiment_name}_supervised",
-                    save_dir=exp_config.get_log_dir(),
-                )
-            
-            supervised_trainer = L.Trainer(
-                                devices="auto",
-                                strategy=strategy,
-                                logger=supervised_logger,
-                                max_epochs=train_config.max_epochs,
-                                callbacks=[
-                                            supervised_modelcheckpoint,
-                                            EarlyStoppingWithPatiencePropagation(
-                                                monitor="val/total_loss_epoch",
-                                                patience=train_config.early_stopping_patience,
-                                                mode="min",
-                                                check_on_train_epoch_end=False, # Avoid checking on train epoch end to prevent double increment of radius 
-                                            )
-                                        ],
-                                precision = "16-mixed" if train_config.amp else 32,
-                                gradient_clip_val=train_config.max_grad_norm, 
-                                log_every_n_steps=train_config.log_every_n_steps,
-                                deterministic=train_config.deterministic,
-                                use_distributed_sampler=False, # We have our own distributed sampler
-                                accumulate_grad_batches=train_config.accumulate_grad_batches,
-                                # fast_dev_run=True,
-                                )
-            
-            supervised_trainer.fit(model, datamodule=dm)
-
-            print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
-            # Finish the wandb run to avoid next run to log into the same run
-            if train_config.use_wandb:
-                wandb.finish()
+        print("Supervised training complete. Best model at:", supervised_modelcheckpoint.best_model_path)
+        # Finish the wandb run to avoid next run to log into the same run
+        if train_config.use_wandb:
+            wandb.finish()
     else:
         print("Starting semisupervised training...")
         model.update_mode("semisupervised")
