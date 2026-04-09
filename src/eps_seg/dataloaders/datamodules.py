@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 from eps_seg.dataloaders.datasets import SemisupervisedDataset, PredictionDataset, PseudoLabelDataset
 from eps_seg.config.train import TrainConfig
 from torch.utils.data import DataLoader
-from eps_seg.dataloaders.samplers import BalancedAnchorLabelBatchSampler, ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
+from eps_seg.dataloaders.samplers import BalancedScheduledBatchSampler, ModeAwareBalancedAnchorBatchSampler, PseudoEpochDistributedParallelBatchSampler
 from eps_seg.dataloaders.utils import flex_collate
 from sklearn.model_selection import StratifiedKFold
 import warnings
@@ -26,10 +26,12 @@ class EPSSegDataModule(L.LightningDataModule):
             - _load_
     """
 
-    def __init__(self, cfg: BaseEPSDatasetConfig, train_cfg: TrainConfig):
+    def __init__(self, cfg: BaseEPSDatasetConfig, train_cfg: TrainConfig, scheduler_path: Optional[Path] = None, scheduler_stage_index: int = 0):
         super().__init__()
         self.cfg = cfg
         self.train_cfg = train_cfg
+        self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
+        self.scheduler_stage_index = scheduler_stage_index
         self.cache_dir = cfg.get_cache_folder()
 
         self.data = {}
@@ -87,9 +89,10 @@ class EPSSegDataModule(L.LightningDataModule):
     
     def train_dataloader(self):
   
-        train_sampler = BalancedAnchorLabelBatchSampler(
+        train_sampler = BalancedScheduledBatchSampler(
             self.train_dataset,
             batch_size=self.train_cfg.batch_size,
+            min_initial_label_fraction=self.train_cfg.min_initial_label_fraction,
             shuffle=True,
             seed=self.cfg.seed,
         )
@@ -140,29 +143,6 @@ class EPSSegDataModule(L.LightningDataModule):
             batch_size=self.train_cfg.test_batch_size,
             shuffle=False,
         )
-
-    def set_mode(self, mode: str):
-        """Switch between supervised and semisupervised modes."""
-        print(f"Switching datamodule mode to {mode}...")
-        if hasattr(self.train_dataset, "set_mode"):
-            self.train_dataset.set_mode(mode)
-
-    def set_radius(self, radius: float):
-        """Set the radius for semisupervised sampling."""
-        print(f"Setting semisupervised sampling radius to {radius}...")
-        self.train_dataset.set_radius(radius)
-
-    def set_confidence_threshold(self, threshold: float):
-        """Set the confidence threshold used by the training sampler."""
-        print(f"Setting training confidence threshold to {threshold}...")
-        if hasattr(self.train_dataset, "set_confidence_threshold"):
-            self.train_dataset.set_confidence_threshold(threshold)
-
-    def increase_radius(self):
-        """Increase the radius used for semisupervised sampling."""
-        print("Increasing semisupervised sampling radius...")
-        if hasattr(self.train_dataset, "increase_radius"):
-            self.train_dataset.increase_radius()
 
     def _compute_statistics(
         self, images: Dict[str, np.ndarray], train_idx: Dict[str, np.ndarray]
@@ -329,13 +309,12 @@ class EPSSegDataModule(L.LightningDataModule):
                 label_size=1,
                 n_classes=self.cfg.n_classes,
                 ignore_lbl=-1,
-                radius=self.train_cfg.initial_radius,
                 dim=self.cfg.dim,
                 seed=self.cfg.seed,
-                n_neighbors=self.cfg.n_neighbors,
                 samples_per_class=self.cfg.samples_per_class_training,
-                confidence_threshold=self.train_cfg.initial_threshold,
-                age_for_election=self.train_cfg.pseudolabel_age_for_election,
+                scheduler_path=self.scheduler_path,
+                stage_index=self.scheduler_stage_index,
+                confidence_threshold=self.train_cfg.pseudolabel_confidence_threshold,
             )
         if stage in ["fit", "validate"]:
             print(f"Setting up validation dataset with {self.cfg.samples_per_class_validation} samples per class...")

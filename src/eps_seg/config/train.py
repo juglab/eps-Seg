@@ -1,6 +1,5 @@
-from dataclasses import dataclass
 from typing import Optional, Union, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import Field, model_validator
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
 from eps_seg.config.models import BaseEPSModelConfig, LVAEConfig
@@ -30,26 +29,32 @@ class TrainConfig(BaseEPSConfig):
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
     log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
-    initial_threshold: float = Field(default=1.0, description="Initial confidence threshold for training in semisupervised mode")
-    max_threshold: float = Field(default=0.70, description="Terminal confidence threshold for training in semisupervised mode")
-    threshold_increment: float = Field(default=0.01, description="Step size for confidence threshold updates")
-    threshold_decrement_patience: int = Field(default=5, description="Number of epochs without improvement before decreasing the confidence threshold in semisupervised mode")
-    initial_radius: int = Field(default=3, description="Initial radius for training in semisupervised mode")
-    max_radius: int = Field(default=7, description="Maximum radius for training in semisupervised mode")
-    radius_increment_patience: int = Field(default=20, description="Number of epochs without improvement before increasing radius in semisupervised mode")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
-    pseudolabel_age_for_election: int = Field(default=10, description="Number of re-evaluations of a pseudolabel's confidence before it is considered for election as an anchor.")
     train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
+    pseudolabel_confidence_threshold: float = Field(default=0.75, description="Minimum confidence required to accept a newly sampled pseudo-label.")
+    pseudolabels_per_extension: int = Field(default=1024, description="Number of pseudo-labels to add whenever the scheduler is extended.")
+    max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
+    min_initial_label_fraction: float = Field(default=0.25, description="Minimum fraction of each training batch that must come from the initial GT-labelled pool.")
+    auto_resume: bool = Field(default=True, description="Automatically resume from the latest completed staged checkpoint if present.")
+    initial_threshold: float = Field(default=1.0, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    max_threshold: float = Field(default=0.70, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    threshold_increment: float = Field(default=0.01, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    threshold_decrement_patience: int = Field(default=5, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    initial_radius: int = Field(default=3, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    max_radius: int = Field(default=7, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    radius_increment_patience: int = Field(default=20, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+    pseudolabel_age_for_election: int = Field(default=10, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
 
     @model_validator(mode="after")
-    def disable_threshold_schedule_for_fully_supervised(self):
-        """
-            In fully supervised training, the confidence threshold is set to 0 so the sampler always returns all available neighbors for the current radius.
-        """
-        if self.train_fully_supervised:
-            self.initial_threshold = 0.0
-            self.threshold_increment = 0.0
-            self.max_threshold = 0.0
+    def validate_staged_training(self):
+        if not 0.0 <= self.min_initial_label_fraction <= 1.0:
+            raise ValueError("min_initial_label_fraction must be between 0 and 1.")
+        if self.pseudolabel_confidence_threshold < 0.0 or self.pseudolabel_confidence_threshold > 1.0:
+            raise ValueError("pseudolabel_confidence_threshold must be between 0 and 1.")
+        if self.pseudolabels_per_extension < 0:
+            raise ValueError("pseudolabels_per_extension must be >= 0.")
+        if self.max_extensions < 0:
+            raise ValueError("max_extensions must be >= 0.")
         return self
 
 
@@ -135,6 +140,14 @@ class ExperimentConfig(BaseEPSConfig):
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
 
         return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"best_{mode}.ckpt"
+
+    def stage_checkpoint_path(self, mode: Literal["supervised", "semisupervised"], stage_idx: int, kind: Literal["best", "last"]) -> Path:
+        train_cfg, _, _ = self.get_configs()
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}_K{stage_idx}.ckpt"
+
+    def stage_scheduler_path(self, stage_idx: int) -> Path:
+        train_cfg, _, _ = self.get_configs()
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"scheduler_K{stage_idx}.npz"
     
     def get_log_dir(self) -> Path:
         """Return the directory path for saving logs."""

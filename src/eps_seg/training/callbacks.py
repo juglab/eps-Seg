@@ -1,50 +1,123 @@
 import lightning as L
-from lightning.pytorch.callbacks import EarlyStopping
-from lightning.pytorch.callbacks import ModelCheckpoint
-import shutil
-import os
 from pathlib import Path
 from typing import Optional
+
 import torch
-
-class EarlyStoppingWithPatiencePropagation(EarlyStopping):
-    """
-        Custom EarlyStopping that propagates the patience counter to the model.
-    """
-    def on_validation_end(self, trainer, pl_module):
-        super().on_validation_end(trainer, pl_module)
-        if pl_module.current_training_mode == "semisupervised":
-            if self.wait_count > 0:
-                pl_module.current_radius_patience += 1
-                pl_module.current_threshold_patience += 1
-            else:
-                pl_module.current_radius_patience = 0
-                pl_module.current_threshold_patience = 0
-                
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx = 0):
-        if pl_module.current_training_mode == "semisupervised":
-            pl_module.log("val/radius_increase_patience", pl_module.current_radius_patience, prog_bar=True, on_epoch=True, sync_dist=True)
-            pl_module.log("val/threshold_decrease_patience", pl_module.current_threshold_patience, prog_bar=True, on_epoch=True, sync_dist=True)
-            pl_module.log("val/early_stopping_patience", self.wait_count, prog_bar=True, on_epoch=True, sync_dist=True)
-
-        return super().on_validation_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
 
-class SemiSupervisedModeCallback(L.Callback):
+def extract_model_checkpoint_best_score(
+    checkpoint_path: str | Path,
+    monitor: str = "val/CE_epoch",
+    mode: str = "min",
+) -> float:
     """
-        When training starts, switch the model to semi-supervised mode.
-        This is to allow Lightning to load the complete model state (including optimizer states and global step)
-        and change mode as soon as training starts.
+        Read the best monitored score stored by Lightning's ModelCheckpoint.
     """
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found while reading best score: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    callbacks_state = checkpoint.get("callbacks", {})
+
+    for callback_key, callback_state in callbacks_state.items():
+        if not isinstance(callback_state, dict):
+            continue
+        if not callback_key.startswith("ModelCheckpoint"):
+            continue
+        if f"'monitor': '{monitor}'" not in callback_key:
+            continue
+        if f"'mode': '{mode}'" not in callback_key:
+            continue
+
+        best_score = callback_state.get("best_model_score")
+        if best_score is None:
+            raise RuntimeError(
+                f"Checkpoint {ckpt_path} contains ModelCheckpoint state for {monitor} "
+                "but no best_model_score."
+            )
+        if hasattr(best_score, "item"):
+            return float(best_score.item())
+        return float(best_score)
+
+    raise RuntimeError(
+        f"Could not find ModelCheckpoint state for monitor={monitor!r}, mode={mode!r} "
+        f"in checkpoint {ckpt_path}."
+    )
+
+
+class StageMetricCarryoverCallback(L.Callback):
+    """
+        Seed the current stage callbacks with the previous stage best score so
+        checkpointing behaves like a continuation rather than a fresh run.
+    """
+
+    def __init__(
+        self,
+        reference_checkpoint_path: str | Path,
+        carried_best_path: str | Path,
+        monitor: str = "val/CE_epoch",
+        mode: str = "min",
+    ):
+        super().__init__()
+        self.reference_checkpoint_path = Path(reference_checkpoint_path)
+        self.carried_best_path = Path(carried_best_path)
+        self.monitor = monitor
+        self.mode = mode
+        self._has_seeded = False
+
+    def _find_model_checkpoint(self, trainer) -> ModelCheckpoint:
+        for callback in trainer.callbacks:
+            if isinstance(callback, ModelCheckpoint) and callback.monitor == self.monitor and callback.mode == self.mode:
+                return callback
+        raise RuntimeError(
+            f"Could not find ModelCheckpoint callback for monitor={self.monitor!r}, mode={self.mode!r}."
+        )
+
+    def _find_early_stopping(self, trainer) -> EarlyStopping | None:
+        for callback in trainer.callbacks:
+            if isinstance(callback, EarlyStopping) and callback.monitor == self.monitor and callback.mode == self.mode:
+                return callback
+        return None
+
     def on_fit_start(self, trainer, pl_module):
-        if pl_module.current_training_mode == "supervised":
-            pl_module.update_mode("semisupervised")
-            pl_module.trainer.datamodule.set_mode("semisupervised")
+        if self._has_seeded:
+            return super().on_fit_start(trainer, pl_module)
+
+        reference_score = extract_model_checkpoint_best_score(
+            checkpoint_path=self.reference_checkpoint_path,
+            monitor=self.monitor,
+            mode=self.mode,
+        )
+        score_tensor = torch.tensor(reference_score, dtype=torch.float32)
+
+        checkpoint_callback = self._find_model_checkpoint(trainer)
+        checkpoint_callback.best_model_score = score_tensor
+        checkpoint_callback.best_model_path = str(self.carried_best_path)
+        checkpoint_callback.current_score = score_tensor
+        checkpoint_callback.kth_best_model_path = str(self.carried_best_path)
+        checkpoint_callback.kth_value = score_tensor
+        checkpoint_callback.best_k_models = {str(self.carried_best_path): score_tensor}
+
+        early_stopping_callback = self._find_early_stopping(trainer)
+        if early_stopping_callback is not None:
+            early_stopping_callback.best_score = score_tensor
+            early_stopping_callback.wait_count = 0
+
+        print(
+            f"StageMetricCarryoverCallback: seeded callbacks from {self.reference_checkpoint_path} "
+            f"with best score {reference_score:.6f}."
+        )
+        self._has_seeded = True
         return super().on_fit_start(trainer, pl_module)
+
 
 class OptimizerStateTransferCallback(L.Callback):
     """
-        Restore optimization state from a source checkpoint without restoring trainer loop/callback state.
+        Restore the optimizer, LR scheduler, precision state, and selected
+        module buffers from a previous stage checkpoint without restoring the
+        entire Lightning loop state.
     """
 
     def __init__(
@@ -53,6 +126,7 @@ class OptimizerStateTransferCallback(L.Callback):
         restore_optimizer: bool = True,
         restore_lr_scheduler: bool = True,
         restore_precision: bool = True,
+        restore_module_buffers: bool = True,
         strict_counts: bool = True,
     ):
         super().__init__()
@@ -60,6 +134,7 @@ class OptimizerStateTransferCallback(L.Callback):
         self.restore_optimizer = restore_optimizer
         self.restore_lr_scheduler = restore_lr_scheduler
         self.restore_precision = restore_precision
+        self.restore_module_buffers = restore_module_buffers
         self.strict_counts = strict_counts
         self._has_restored = False
 
@@ -80,6 +155,13 @@ class OptimizerStateTransferCallback(L.Callback):
 
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         print(f"OptimizerStateTransferCallback: loading training state from {ckpt_path}")
+
+        if self.restore_module_buffers:
+            state_dict = checkpoint.get("state_dict", {})
+            for key in ("seen_samples",):
+                if key in state_dict and hasattr(pl_module, key):
+                    getattr(pl_module, key).copy_(state_dict[key].to(getattr(pl_module, key).device))
+                    print(f"OptimizerStateTransferCallback: restored module buffer '{key}'.")
 
         if self.restore_optimizer:
             optimizer_states: Optional[list] = checkpoint.get("optimizer_states")
@@ -125,90 +207,3 @@ class OptimizerStateTransferCallback(L.Callback):
 
         self._has_restored = True
         return super().on_fit_start(trainer, pl_module)
-
-class ThresholdSchedulerCallback(L.Callback):
-    """
-        Decrease the training confidence threshold only after a configurable
-        number of validation epochs without improvement.
-    """
-    def on_validation_epoch_end(self, trainer, pl_module):
-        super().on_validation_epoch_end(trainer, pl_module)
-        if pl_module.current_training_mode == "semisupervised":
-            target_threshold = pl_module.train_cfg.max_threshold
-            step = abs(pl_module.train_cfg.threshold_increment)
-            patience = pl_module.train_cfg.threshold_decrement_patience
-
-            if step > 0 and patience > 0 and pl_module.current_threshold_patience >= patience:
-                if pl_module.current_threshold > target_threshold:
-                    new_threshold = max(pl_module.current_threshold - step, target_threshold)
-                else:
-                    new_threshold = min(pl_module.current_threshold + step, target_threshold)
-
-                if new_threshold != pl_module.current_threshold:
-                    trainer.datamodule.set_confidence_threshold(new_threshold)
-                    pl_module.current_threshold = new_threshold
-                pl_module.current_threshold_patience = 0
-        pl_module.log("train/threshold", pl_module.current_threshold, prog_bar=True, on_epoch=True)
-
-class RadiusSchedulerCallback(L.Callback):
-    """
-        At the end of each epoch, if no improvement has been seen for radius_increment_patience epochs,
-        increase the radius by 1, up to max_radius.
-
-        Args:
-            radius_increment_patience (int): Number of epochs with no improvement to wait before increasing radius
-            best_ckpt_path (str): If provided, copies this checkpoint to a new file with the current radius in the filename whenever the radius is increased.
-    """
-    
-    def __init__(self, radius_increment_patience: int, best_ckpt_path: str = None):
-        super().__init__()
-        self.radius_increment_patience = radius_increment_patience
-        self.best_ckpt_path = best_ckpt_path
-    
-    def _backup_checkpoint(self, pl_module):
-        if self.best_ckpt_path is not None:
-            
-            radius = pl_module.current_radius
-            new_ckpt_path = f"{os.path.splitext(self.best_ckpt_path)[0]}_radius{radius}.ckpt"
-            shutil.copyfile(self.best_ckpt_path, new_ckpt_path)
-            print(f"Radius increased to {radius}. Backed up best checkpoint to {new_ckpt_path}.")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        super().on_validation_epoch_end(trainer, pl_module)
-        if pl_module.current_training_mode == "semisupervised":
-            if self.radius_increment_patience > 0 and pl_module.current_radius_patience >= self.radius_increment_patience:
-                new_radius = min(pl_module.current_radius + 1, pl_module.train_cfg.max_radius)
-                if new_radius > pl_module.current_radius:
-                    self._backup_checkpoint(pl_module)
-                    # Increase radius
-                    pl_module.trainer.datamodule.set_radius(new_radius)
-                    pl_module.current_radius = new_radius
-                pl_module.current_radius_patience = 0
-        pl_module.log("train/radius", pl_module.current_radius, prog_bar=True, on_epoch=True)
-
-
-class PseudoLabelReevaluationCallback(L.Callback):
-    """
-        Re-evaluate neighbor confidences whenever validation improves during
-        semisupervised training.
-    """
-
-    def __init__(self, early_stopping_callback: EarlyStoppingWithPatiencePropagation):
-        super().__init__()
-        self.early_stopping_callback = early_stopping_callback
-        self._last_trigger_epoch: Optional[int] = None
-
-    def on_validation_end(self, trainer, pl_module):
-        super().on_validation_end(trainer, pl_module)
-        if trainer.sanity_checking or pl_module.current_training_mode != "semisupervised":
-            return
-
-        if self.early_stopping_callback.wait_count != 0:
-            return
-
-        if self._last_trigger_epoch == trainer.current_epoch:
-            return
-
-        self._last_trigger_epoch = trainer.current_epoch
-        print("Validation improved. Re-evaluating pseudo-labels...")
-        pl_module.re_evaluate_pseudo_labels()

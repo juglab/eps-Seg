@@ -1,6 +1,7 @@
 import random
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Tuple, Union
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,156 +28,94 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         n_classes=4,
         ignore_lbl=-1,
         indices_dict=None,
-        radius=5,
         dim=2,
         seed=42,
-        n_neighbors=1,
         samples_per_class: Dict[int, int] | None = None,
-        confidence_threshold: float = 1.0,
-        age_for_election: int = 5,
+        scheduler_path=None,
+        stage_index: int = 0,
+        confidence_threshold: float = 0.75,
     ):
         """
-        Dataset that holds a table of anchors and neighbors.
+        Dataset that stores the full staged scheduler used by the refactored
+        training loop.
 
-        The schedule has this form:
+        The scheduler is a flat table with one row per scheduled voxel:
 
-        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Is Anchor | Anchor ID | Radius from Anchor | High Confidence Age |
+        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Label Source | Stage Index |
 
-        Where:
-            - Coords: coordinates of the anchor pixel/voxel
-            - Current Label: Training label currently assigned to the voxel. If the voxel is an anchor, this is the anchor label used for training. If the voxel is a neighbor, it stays at -1 until the neighbor is promoted to an anchor.
-            - GT Label: Ground truth label of the voxel (used for logging scheduler performances, not training)
-            - Confidence: Confidence score of the current label. For anchors it is always 1.0. For neighbors, it is assigned externally during validation. Used to sample labels and construct batches.
-            - Is Anchor: Boolean flag indicating whether the voxel is an anchor.
-            - Anchor ID: ID of the anchor voxel if the current voxel is a neighbor.
-            - Radius from Anchor: Distance from the anchor voxel if the current voxel is a neighbor.
-            - High Confidence Age: Number of validations with confidence above the threshold for a pseudo-labeled neighbor.
-            
-        The dataset has also two parameters to control the sampling of anchors and neighbors:
-            - threshold: confidence threshold to sample neighbors. Only neighbors with confidence score above or equal to the threshold are returned during training.
-            - radius: maximum distance in pixels to sample neighbors from the anchor. Only neighbors within this radius are returned during training.
-
-        This class work by keeping a pool of anchors and neighbors. Anchors are sampled at initialization and remain fixed during training. 
-        Neighbors are sampled at initialization based on the initial radius and then re-sampled (added) when the radius is updated after validation.
-
-        Confidence scores of neighbors are updated externally during validation (i.e., after a new best model is found). 
-
-        Sample returned during training are kept in an internal buffer that is updated upon changing the confidence threshold.
-        In addition, when a neighbor's confidence score is above the threshold for a certain number of re-evaluations, it is elected as a new anchor and treated as such
-        (i.e., it can have new neighbors sampled around it).
-
-        Args:
-            images: dict of np.ndarrays
-                Key: image name,
-                Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
-            labels: dict of np.ndarrays
-                Key: image name,
-                Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
-            patch_size: int (Default: 64)
-                Spatial size of the extracted patches
-            label_size: int (Default: 1)
-                Spatial size of the label patch (must be <= patch_size//2)
-            n_classes: int (Default: 4)
-                Number of semantic classes in the labels (including background)
-            ignore_lbl: int (Default: -1)
-                Label value to ignore when sampling anchors and neighbors
-            indices_dict: dict (Default: None)
-                Key: image name,
-                Value: list of z indices to sample from for that image
-            radius: int (Default: 5)
-                Maximum distance in pixels to sample neighbors from the anchor
-            dim: int (Default: 2)
-                Whether to sample 2D or 3D patches (must be 2 or 3)
-            seed: int (Default: 42)
-                Random seed for reproducible neighbor sampling         
-            n_neighbors: int (Default: 1)
-                Number of neighbors to sample around each anchor.
-            samples_per_class: dict (Default: None)
-                Optional per-class override for number of anchors to sample from each class.
-                Key: class label (int), Value: number of anchors to sample (int).
-                 If not provided, defaults to 1 anchor per class.
-            confidence_threshold: float (Default: 1.0)
-                Initial confidence threshold to return samples during training. Only neighbors with confidence score above or equal to the threshold are returned during training.
-            age_for_election: int (Default: 5)
-                Minimum number of re-evaluations with confidence above threshold for a pseudo-labeled neighbor to be elected as an anchor.
-        
+        Stage 0 is sampled from GT labels according to
+        ``samples_per_class``. Later stages are created by appending
+        pseudo-labels through ``add_pseudolabels_for_stage`` and by saving the
+        scheduler to a ``.npz`` file so training can resume from disk.
         """
         self.images = images
         self.labels = labels
         self.indices_dict = indices_dict or {}
         self.patch_size = patch_size
-        
         self.label_size = label_size
-
-        # Offset between the center of the patch and the beginning of the label patch.
         self.offset = self.patch_size // 2 - self.label_size
         self.ignore_lbl = ignore_lbl
         self.n_classes = n_classes
         self.unique_labels = np.array(range(n_classes))
-        self.radius = radius
-        
-        # Helper to map between stack names and integer IDs used in the schedule table
+        self.dim = dim
+        self.seed = seed
+        self.rng = random.Random(self.seed)
+        self.samples_per_class = samples_per_class or {}
+        self.default_samples_per_class: int = 1
+        self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
+        self.stage_index = int(stage_index)
+        self.confidence_threshold = float(confidence_threshold)
+        self.sampling_version = 0
+        self.slice_sampling_table = [
+            (name, int(z))
+            for name, z_indices in self.indices_dict.items()
+            for z in z_indices
+        ]
+
         self.stack_names = list(self.images.keys())
         self.name_to_id = {name: i for i, name in enumerate(self.stack_names)}
         self.id_to_name = {i: name for i, name in enumerate(self.stack_names)}
-
-        self.n_neighbors = n_neighbors
-        self.seed = seed
-        self.rng = random.Random(self.seed)
-
-        self.samples_per_class = samples_per_class
-        self.default_samples_per_class: int = 1
-        self.dim = dim
-        
-        self.confidence_threshold = confidence_threshold
-        self.age_for_election = age_for_election
-        # Used to track changes in the schedule pool and signal samplers to update their cached valid samples.
-        self.sampling_version = 0 
-
-        # The schedule contains the pool of anchors and neighbors we can sample from
-        # Anchors are fixed and sampled at initialization
-        # Neigbors are sampled when hyperparameters are updated after validation
-        self.schedule = {
-            "name_id": np.empty((0,), dtype=np.int32), # [N] integer ID (in self.stack_names) of the stack the voxel belongs to
-            "coords": np.empty((0, 3), dtype=np.int32), # [N, 3] coordinates of the voxel (z,y,x)
-            "current_label": np.empty((0,), dtype=np.int32), # [N] most recent label assigned to the voxel. 
-            "gt_label": np.empty((0,), dtype=np.int32), # [N] ground truth label of the voxel
-            "confidence": np.empty((0,), dtype=np.float32), # [N] confidence score of the current label. 
-            "is_anchor": np.empty((0,), dtype=bool), # [N] whether the voxel is an anchor
-            "anchor_id": np.empty((0,), dtype=np.int32), # [N] ID of the anchor the voxel is associated with
-            "radius": np.empty((0,), dtype=np.float32), # [N] radius of this voxel from its anchor (0 for anchors)
-            "high_confidence_age": np.empty((0,), dtype=np.int32), # [N] number of re-evaluations with high confidence (confidence >= threshold). Used to elect pseudo-labels as anchors.
+        self.label_source_names = {
+            0: "gt_initial",
+            1: "pseudo",
         }
 
-        print(f"Sampling new anchors...")
-        self._sample_anchors()
-        self._print_schedule_report()
-        print(f"Sampling initial neighbors with radius={self.radius}...")
-        if self.radius > 0:
-            self._sample_neighbors()
-        self._print_schedule_report()
-        self._bump_sampling_version()
+        self.schedule = {
+            "name_id": np.empty((0,), dtype=np.int32),
+            "coords": np.empty((0, 3), dtype=np.int32),
+            "current_label": np.empty((0,), dtype=np.int32),
+            "gt_label": np.empty((0,), dtype=np.int32),
+            "confidence": np.empty((0,), dtype=np.float32),
+            "label_source": np.empty((0,), dtype=np.int32),
+            "stage_index": np.empty((0,), dtype=np.int32),
+        }
+
+        if self.scheduler_path is not None and self.scheduler_path.exists():
+            print(f"Loading scheduler from {self.scheduler_path}...")
+            self.load_scheduler_npz(self.scheduler_path)
+        else:
+            print("Sampling stage-0 labelled scheduler...")
+            self._sample_initial_supervised_samples()
+            self._print_schedule_report()
+            self._bump_sampling_version()
 
     def _bump_sampling_version(self):
-        """Increase version to signal sampler that the pool of available samples has changed."""
+        """Increase version to signal sampler that the schedule has changed."""
         self.sampling_version += 1
 
-    def _add_to_schedule(self, name_id, coords, current_label, gt_label, confidence, is_anchor, anchor_id, radius):
-        """Helper function to add new entries to the schedule."""
-        
+    def _add_to_schedule(self, name_id, coords, current_label, gt_label, confidence, label_source, stage_index):
+        """Append one row to the staged scheduler."""
         self.schedule["name_id"] = np.append(self.schedule["name_id"], np.array([name_id], dtype=np.int32))
         self.schedule["coords"] = np.append(self.schedule["coords"], [coords], axis=0)
         self.schedule["current_label"] = np.append(self.schedule["current_label"], np.array([current_label], dtype=np.int32))
         self.schedule["gt_label"] = np.append(self.schedule["gt_label"], np.array([gt_label], dtype=np.int32))
         self.schedule["confidence"] = np.append(self.schedule["confidence"], np.array([confidence], dtype=np.float32))
-        self.schedule["is_anchor"] = np.append(self.schedule["is_anchor"], np.array([is_anchor], dtype=bool))
-        self.schedule["anchor_id"] = np.append(self.schedule["anchor_id"], np.array([anchor_id], dtype=np.int32))
-        self.schedule["radius"] = np.append(self.schedule["radius"], np.array([radius], dtype=np.float32))
-        self.schedule["high_confidence_age"] = np.append(self.schedule["high_confidence_age"], np.array([0], dtype=np.int32))
+        self.schedule["label_source"] = np.append(self.schedule["label_source"], np.array([label_source], dtype=np.int32))
+        self.schedule["stage_index"] = np.append(self.schedule["stage_index"], np.array([stage_index], dtype=np.int32))
 
-    def _sample_anchors(self):
+    def _sample_initial_supervised_samples(self):
         """
-            Sample ancors from each stack using the provided indices_dict of z indices to sample from. 
+            Sample the initial GT-labelled pool from the configured train slices.
         """
         for name, z_indices in self.indices_dict.items():
             img_stack = self.images[name]
@@ -184,208 +123,193 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             name_id = self.name_to_id[name]
             Z, H, W = img_stack.shape
 
-            coords_in_use = set(map(tuple, self.schedule["coords"]))  # to avoid sampling the same voxel multiple times
-            
-            for cz in tqdm(z_indices, desc=f"Sampling anchors for {name}"):
+            coords_in_use = set(map(tuple, self.schedule["coords"]))
+            for cz in tqdm(z_indices, desc=f"Sampling stage-0 labels for {name}"):
                 for lbl in self.unique_labels:
-                    for cy, cx in self._sample_anchors_from_slice(z_slice=lbl_stack[cz], 
-                                                                class_label=lbl, 
-                                                                num_samples=self.samples_per_class.get(lbl, self.default_samples_per_class)):
-                        if not self._is_valid_coord(name, cz, cy, cx, Z, H, W):
+                    n_samples = self.samples_per_class.get(int(lbl), self.default_samples_per_class)
+                    for cy, cx in self._sample_coordinates_from_slice(lbl_stack[cz], int(lbl), n_samples):
+                        if not self._is_valid_coord(name, int(cz), int(cy), int(cx), Z, H, W):
                             continue
-                        if (cz, cy, cx) in coords_in_use:
-                            print(f"Warning: coordinate {(cz, cy, cx)} already in use. Skipping this anchor.")
+                        if (int(cz), int(cy), int(cx)) in coords_in_use:
                             continue
-                        coords_in_use.add((cz, cy, cx))
-                        gt_label = lbl_stack[cz, cy, cx]
+                        coords_in_use.add((int(cz), int(cy), int(cx)))
+                        gt_label = int(lbl_stack[cz, cy, cx])
                         self._add_to_schedule(
                             name_id=name_id,
-                            coords=(cz, cy, cx),
+                            coords=(int(cz), int(cy), int(cx)),
                             current_label=gt_label,
                             gt_label=gt_label,
                             confidence=1.0,
-                            is_anchor=True,
-                            anchor_id=len(self.schedule["name_id"]), 
-                            radius=0.0,
+                            label_source=0,
+                            stage_index=0,
                         )
 
-    def _sample_anchors_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
-        """
-            Sample a given number of anchors from a slice for a specific class label.
-        """
+    def _sample_coordinates_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
+        """Sample coordinates from a single slice for one class."""
         label_coords = np.argwhere(z_slice == class_label)
         if len(label_coords) < num_samples:
-            # Some slices does not represent all classes
             return []
-        
         idx = self.rng.sample(range(len(label_coords)), num_samples)
         sampled = label_coords[idx]
-        return [(int(y), int(x)) for y, x in sampled]       
+        return [(int(y), int(x)) for y, x in sampled]
 
     def _is_valid_coord(self, name, z, y, x, Z, H, W):
-        """Return whether a coordinate can be used as an anchor/neighbor center."""
-        valid = (
-            self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
-        )
-
+        """Return whether a coordinate can be used as a scheduled center."""
+        valid = self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         if self.dim == 3:
             valid = valid and (self.offset <= z < Z - self.offset - 1)
-
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
-
-        # TODO: Implement mask consistency
-
         return valid and in_cell
 
-    def _sample_neighbors(self, 
-                          max_retries: int = 100
-                          ):
-        """
-            Sample n_neighbors for each anchor in the schedule based on the current radius setting.
-            This function is called upon change of maximum sampling radius.
-
-            Args:
-                max_retries: maximum number of retries to find a valid neighbor for each anchor. 
-        """
-
-        total_new_neighbors = 0
-        used_coords = set(map(tuple, self.schedule["coords"]))  # to avoid sampling the same voxel multiple times
-        anchors = np.where(self.schedule["is_anchor"])[0]
-        for anchor_idx in tqdm(anchors, desc="Sampling neighbors"):
-            anchor_name_id = self.schedule["name_id"][anchor_idx]
-            anchor_coords = self.schedule["coords"][anchor_idx]
-
-            current_neighbor_count = 0
-            tries = 0
-
-            while current_neighbor_count < self.n_neighbors and tries < max_retries:
-                tries += 1
-
-                dz = self.rng.randint(-self.radius, self.radius) if self.dim == 3 else 0
-                dy = self.rng.randint(-self.radius, self.radius)
-                dx = self.rng.randint(-self.radius, self.radius)
-                new_neighbor_coords = anchor_coords + np.array([dz, dy, dx])
-
-                is_center = (dz == 0 and dy == 0 and dx == 0)
-                outside_sphere = (dz**2 + dy**2 + dx**2 > self.radius**2)
-                already_used = tuple(new_neighbor_coords) in used_coords
-                if is_center or outside_sphere or already_used:
-                    continue
-
-                Z, H, W = self.images[self.id_to_name[anchor_name_id]].shape
-
-                if self._is_valid_coord(
-                    name=self.id_to_name[anchor_name_id],
-                    z=new_neighbor_coords[0],
-                    y=new_neighbor_coords[1],
-                    x=new_neighbor_coords[2],
-                    Z=Z,
-                    H=H,
-                    W=W,
-                ):
-                    gt_label = self.labels[self.id_to_name[anchor_name_id]][
-                        new_neighbor_coords[0], new_neighbor_coords[1], new_neighbor_coords[2]
-                    ]
-                    self._add_to_schedule(
-                        name_id=anchor_name_id,
-                        coords=new_neighbor_coords,
-                        current_label=-1,  # Unlabeled neighbor
-                        gt_label=gt_label,
-                        confidence=0.0,
-                        is_anchor=False,
-                        anchor_id=anchor_idx,
-                        radius=np.linalg.norm(new_neighbor_coords - anchor_coords),
-                    )
-                    used_coords.add(tuple(new_neighbor_coords))
-                    current_neighbor_count += 1
-                    total_new_neighbors += 1
-            
-        print(f"Sampled {total_new_neighbors} new neighbors for {len(anchors)} anchors.")
-
     def __len__(self):
-        """Return the total number of rows in the persistent schedule."""
         return len(self.schedule["name_id"])
 
-    def set_confidence_threshold(self, new_threshold: float):
-        """Update the confidence threshold used by samplers to select trainable rows."""
-        if new_threshold != self.confidence_threshold:
-            self.confidence_threshold = new_threshold
-            self._bump_sampling_version()
-            print(f"Updated confidence threshold to {self.confidence_threshold}.")
+    def get_initial_label_mask(self) -> np.ndarray:
+        return self.schedule["label_source"] == 0
 
-    def _elect_new_anchors(self, indices: np.ndarray, labels: np.ndarray):
+    def _scheduled_coordinate_set(self) -> set[tuple[str, int, int, int]]:
+        return {
+            (self.id_to_name[int(name_id)], int(z), int(y), int(x))
+            for name_id, (z, y, x) in zip(self.schedule["name_id"], self.schedule["coords"])
+        }
+
+    def _sample_random_candidate(self, forbidden_coords: set[tuple[str, int, int, int]], max_tries: int = 1024):
         """
-            Elect new anchors among the neighbors updated during the current re-evaluation.
-            Only rows included in ``indices`` are considered, and only elected neighbors
-            receive their predicted label before being promoted to anchors.
+            Sample one candidate lazily by first sampling a train slice uniformly
+            and then sampling a valid voxel uniformly within that slice.
         """
-        updated_mask = np.zeros(len(self.schedule["name_id"]), dtype=bool)
-        updated_mask[indices] = True
-        candidate_mask = (
-            updated_mask &
-            (self.schedule["is_anchor"] == False) &
-            (self.schedule["confidence"] >= self.confidence_threshold) &
-            (self.schedule["high_confidence_age"] >= self.age_for_election)
+        if len(self.slice_sampling_table) == 0:
+            return None
+
+        for _ in range(max_tries):
+            name, z = self.rng.choice(self.slice_sampling_table)
+            valid_positions = np.argwhere(self.labels[name][z] != self.ignore_lbl)
+            if len(valid_positions) == 0:
+                continue
+            y, x = valid_positions[self.rng.randrange(len(valid_positions))]
+            y = int(y)
+            x = int(x)
+            Z, H, W = self.images[name].shape
+            if not self._is_valid_coord(name, z, y, x, Z, H, W):
+                continue
+            coord = (name, int(z), y, x)
+            if coord in forbidden_coords:
+                continue
+            return coord
+        return None
+
+    def _sample_candidate_batch(self, forbidden_coords: set[tuple[str, int, int, int]], batch_size: int):
+        """
+            Sample a batch of unique candidate coordinates without materializing
+            the full unscheduled voxel set in memory.
+        """
+        coords_batch = []
+        local_forbidden = set(forbidden_coords)
+        for _ in range(batch_size):
+            candidate = self._sample_random_candidate(local_forbidden)
+            if candidate is None:
+                break
+            coords_batch.append(candidate)
+            local_forbidden.add(candidate)
+        return coords_batch
+
+    def build_candidate_batch(self, coords_batch: list[tuple[str, int, int, int]]) -> dict:
+        """
+            Materialize a coordinate list into tensors for pseudo-label evaluation.
+        """
+        patches = []
+        gt_labels = []
+        names = []
+        coords = []
+        for name, z, y, x in coords_batch:
+            patches.append(self.patch_at(self.images[name], z, y, x))
+            gt_labels.append(int(self.labels[name][z, y, x]))
+            names.append(name)
+            coords.append((z, y, x))
+        return {
+            "patch": torch.stack(patches, dim=0),
+            "gt": torch.tensor(gt_labels).long(),
+            "coords": torch.tensor(coords).long(),
+            "name": names,
+        }
+
+    def add_pseudolabels_for_stage(self, stage_index: int, n_new_samples: int, evaluator, evaluation_batch_size: int) -> int:
+        """
+            Extend the scheduler with uniformly sampled pseudo-labels.
+
+            The evaluator must accept a batch dict returned by
+            ``build_candidate_batch`` and return ``(predicted_labels, confidences)``.
+        """
+        if n_new_samples <= 0:
+            return 0
+
+        forbidden_coords = self._scheduled_coordinate_set()
+        accepted = 0
+        while accepted < n_new_samples:
+            coords_batch = self._sample_candidate_batch(forbidden_coords, evaluation_batch_size)
+            if len(coords_batch) == 0:
+                break
+            batch = self.build_candidate_batch(coords_batch)
+            predicted_labels, confidences = evaluator(batch)
+            for (name, z, y, x), pred_label, confidence, gt_label in zip(
+                coords_batch,
+                predicted_labels,
+                confidences,
+                batch["gt"].tolist(),
+            ):
+                if float(confidence) < self.confidence_threshold:
+                    continue
+                self._add_to_schedule(
+                    name_id=self.name_to_id[name],
+                    coords=(z, y, x),
+                    current_label=int(pred_label),
+                    gt_label=int(gt_label),
+                    confidence=float(confidence),
+                    label_source=1,
+                    stage_index=int(stage_index),
+                )
+                forbidden_coords.add((name, z, y, x))
+                accepted += 1
+                if accepted >= n_new_samples:
+                    break
+
+        self.stage_index = max(self.stage_index, int(stage_index))
+        self._bump_sampling_version()
+        self._print_schedule_report()
+        return accepted
+
+    def save_scheduler_npz(self, path):
+        """
+            Save the staged scheduler to a simple ``.npz`` file.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            name_id=self.schedule["name_id"],
+            coords=self.schedule["coords"],
+            current_label=self.schedule["current_label"],
+            gt_label=self.schedule["gt_label"],
+            confidence=self.schedule["confidence"],
+            label_source=self.schedule["label_source"],
+            stage_index=self.schedule["stage_index"],
+            metadata=np.array(
+                [self.seed, self.stage_index, len(self.schedule["name_id"])],
+                dtype=np.int32,
+            ),
         )
 
-        candidate_indices = np.where(candidate_mask)[0]
-        if candidate_indices.size > 0:
-            predicted_labels_by_index = {
-                int(idx): int(label) for idx, label in zip(indices.tolist(), labels.tolist())
-            }
-            promoted_labels = np.array(
-                [predicted_labels_by_index[idx] for idx in candidate_indices.tolist()],
-                dtype=np.int32,
-            )
-            self.schedule["current_label"][candidate_indices] = promoted_labels
-
-        self.schedule["is_anchor"][candidate_mask] = True
-        elected = int(candidate_indices.size)
-        print(f"Elected {elected} new anchors based on current confidence threshold.")
-        return elected
-        
-    def set_radius(self, new_radius: float):
+    def load_scheduler_npz(self, path):
         """
-            Update the sampling radius and add new neighbors for all anchors based on the new radius.
+            Load a staged scheduler from a ``.npz`` file.
         """
-
-        if self.radius != new_radius:
-            self.radius = new_radius
-            print(f"Updated sampling radius to {self.radius}. Adding new neighbors to schedule...")
-            self._sample_neighbors()
-            self._print_schedule_report()
-            self._bump_sampling_version()
-    
-    # TODO: Implement a mechanism for the re-evaluation phase to iterate over the neighbors to update their confidence.
-    def update_confidence(self, indices: np.ndarray, new_confidences: np.ndarray, current_labels: np.ndarray):
-        """
-            Update the confidence scores of the samples at the given indices.
-            This function is called externally during re-evaluation of pseudo-labels.
-
-            Args:
-                indices: indices of the schedule to update
-                new_confidences: new confidence scores to assign to the given indices
-                current_labels: model labels predicted for the given indices. These are only written to the
-                    schedule if a neighbor is elected during this update; non-anchor neighbors keep label -1.
-
-        """
-        self.schedule["confidence"][indices] = new_confidences
-
-        # Non-anchor neighbors always remain unlabeled (-1) unless they become anchors
-        non_anchor_mask = ~self.schedule["is_anchor"][indices]
-        self.schedule["current_label"][indices[non_anchor_mask]] = -1
-
-        # Update high confidence age for neighbors above threshold and reset if below threshold
-        for idx in indices:
-            if not self.schedule["is_anchor"][idx]:
-                if self.schedule["confidence"][idx] >= self.confidence_threshold:
-                    self.schedule["high_confidence_age"][idx] += 1
-                else:
-                    self.schedule["high_confidence_age"][idx] = 0
-        
-        # Check if any neighbors can be elected as new anchors
-        self._elect_new_anchors(indices=indices, labels=current_labels)
-        self._bump_sampling_version()
+        npz = np.load(path)
+        for key in self.schedule:
+            self.schedule[key] = np.array(npz[key])
+        if "metadata" in npz:
+            metadata = np.array(npz["metadata"]).astype(np.int32)
+            if metadata.size >= 2:
+                self.stage_index = int(metadata[1])
 
     def patch_at(self, img_stack, z, y, x):
         """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
@@ -395,54 +319,45 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                 y - self.offset : y + self.offset + 2,
                 x - self.offset : x + self.offset + 2,
             ]
-            return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
-        else:  # 3D
-            p = img_stack[
-                z - self.offset : z + self.offset + 2,
-                y - self.offset : y + self.offset + 2,
-                x - self.offset : x + self.offset + 2,
-            ]
-            return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
+            return torch.from_numpy(p).unsqueeze(0)
+        p = img_stack[
+            z - self.offset : z + self.offset + 2,
+            y - self.offset : y + self.offset + 2,
+            x - self.offset : x + self.offset + 2,
+        ]
+        return torch.from_numpy(p).unsqueeze(0)
 
     def _print_schedule_report(self):
-        """Helper function to print statistics about the current schedule."""
+        """Print stage/source/class composition for the current scheduler."""
         sch = {k: v for k, v in self.schedule.items()}
         sch["z"] = self.schedule["coords"][:, 0]
         sch["y"] = self.schedule["coords"][:, 1]
         sch["x"] = self.schedule["coords"][:, 2]
         del sch["coords"]
-
         spd = pd.DataFrame(sch)
         spd["name_id"] = spd["name_id"].apply(lambda x: self.id_to_name[x])
-    
-        print(spd.groupby(["is_anchor", "name_id"])["gt_label"].value_counts().unstack(fill_value=0))
+        spd["label_source"] = spd["label_source"].apply(lambda x: self.label_source_names.get(int(x), f"source_{x}"))
+        print(spd.groupby(["stage_index", "label_source", "name_id"])["current_label"].value_counts().unstack(fill_value=0))
 
     def __getitem__(self, idx):
-        """Return one training sample from the schedule by its absolute schedule index."""
+        """Return one scheduled sample by its absolute scheduler index."""
         schedule_idx = idx
         name_id = self.schedule["name_id"][idx]
         coords = self.schedule["coords"][idx]
         current_label = self.schedule["current_label"][idx]
         gt_label = self.schedule["gt_label"][idx]
-        is_anchor = self.schedule["is_anchor"][idx]
-        anchor_id = self.schedule["anchor_id"][idx]
-        radius = self.schedule["radius"][idx]
         name = self.id_to_name[name_id]
-
         patch = self.patch_at(self.images[name], coords[0], coords[1], coords[2])
-        label = torch.tensor(current_label).long() 
-        gt = torch.tensor(gt_label).long()
         segmentation = self.patch_at(self.labels[name], coords[0], coords[1], coords[2])
         return {
             "name": name,
-            "patch": patch, 
-            "label": label, 
-            "gt": gt, 
+            "patch": patch,
+            "label": torch.tensor(current_label).long(),
+            "gt": torch.tensor(gt_label).long(),
             "coords": torch.tensor(coords).long(),
             "schedule_idx": torch.tensor(int(schedule_idx)).long(),
-            "is_anchor": torch.tensor(bool(is_anchor), dtype=torch.bool), 
-            "anchor_id": torch.tensor(int(anchor_id)).long(),
-            "radius": torch.tensor(float(radius)).float(),
+            "is_initial_label": torch.tensor(bool(self.schedule["label_source"][idx] == 0), dtype=torch.bool),
+            "stage_index": torch.tensor(int(self.schedule["stage_index"][idx])).long(),
             "segmentation": segmentation,
             "confidence": torch.tensor(float(self.schedule["confidence"][idx])).float(),
         }
