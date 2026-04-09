@@ -138,24 +138,29 @@ class BalancedScheduledBatchSampler(BatchSampler):
     def _build_pools(self, schedule_indices):
         """Group scheduler indices by their current label."""
         pools = {}
-        for schedule_idx in schedule_indices:
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        for active_idx in schedule_indices:
+            schedule_idx = int(active_schedule_indices[active_idx])
             label = int(self.dataset.schedule["current_label"][schedule_idx])
-            pools.setdefault(label, []).append(int(schedule_idx))
+            pools.setdefault(label, []).append(int(active_idx))
         return pools
 
     def _build_stage_label_pools(self, schedule_indices):
         """Group scheduler indices first by stage and then by current label."""
         pools = {}
-        for schedule_idx in schedule_indices:
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        for active_idx in schedule_indices:
+            schedule_idx = int(active_schedule_indices[active_idx])
             stage = int(self.dataset.schedule["stage_index"][schedule_idx])
             label = int(self.dataset.schedule["current_label"][schedule_idx])
-            pools.setdefault(stage, {}).setdefault(label, []).append(int(schedule_idx))
+            pools.setdefault(stage, {}).setdefault(label, []).append(int(active_idx))
         return pools
 
     def _rebuild_pools(self):
         """Rebuild all cached pools from the current scheduler state."""
-        schedule_indices = np.arange(len(self.dataset.schedule["name_id"]))
-        initial_mask = self.dataset.get_initial_label_mask()
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        schedule_indices = np.arange(len(active_schedule_indices))
+        initial_mask = self.dataset.get_initial_label_mask()[active_schedule_indices]
 
         self.full_pools = self._build_pools(schedule_indices.tolist())
         self.stage_label_pools = self._build_stage_label_pools(schedule_indices.tolist())

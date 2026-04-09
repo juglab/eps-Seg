@@ -147,6 +147,7 @@ def train_one_stage(
         mode=mode,
         weights_checkpoint_path=weights_checkpoint_path,
     )
+    model.current_stage_idx = stage_idx
 
     best_ckpt_path = exp_config.stage_checkpoint_path(mode, stage_idx, "best")
     last_ckpt_path = exp_config.stage_checkpoint_path(mode, stage_idx, "last")
@@ -242,11 +243,12 @@ def evaluate_scheduler_extension(
     next_stage_idx: int,
 ) -> Path | None:
     """
-        Build the scheduler for the next stage by extending the current one.
+        Build the scheduler for the next stage by re-evaluating active
+        pseudo-labels, pruning when requested, and then extending the active
+        pseudo-label pool to the target size for the next stage.
 
-        The current best semisupervised model is used to score the newly sampled
-        candidate voxels. Only pseudo-labels above the configured confidence
-        threshold are accepted.
+        The current best semisupervised model is used both to score the already
+        active pseudo-labels and to score newly sampled candidate voxels.
 
         Returns:
             Path | None:
@@ -279,17 +281,30 @@ def evaluate_scheduler_extension(
         model.model.data_mean = torch.as_tensor(mean, device=device)
         model.model.data_std = torch.as_tensor(std, device=device)
 
+    # Re-evaluate active pseudo-labels and prune if requested before adding new ones.
+    active_pseudolabels_before = dm.train_dataset.count_active_pseudolabels()
+    disabled_count = dm.train_dataset.reevaluate_pseudolabels_for_stage(
+        next_stage_idx=next_stage_idx,
+        evaluator=model.evaluate_candidate_batch,
+        evaluation_batch_size=train_cfg.test_batch_size,
+        keep_threshold=train_cfg.pseudolabel_keep_threshold,
+        pruning_patience=train_cfg.pseudolabel_pruning_patience,
+        enable_pruning=train_cfg.enable_pseudolabel_pruning,
+    )
+    target_active_pseudolabels = active_pseudolabels_before + train_cfg.pseudolabels_per_extension
     accepted = dm.train_dataset.add_pseudolabels_for_stage(
         stage_index=next_stage_idx,
-        n_new_samples=train_cfg.pseudolabels_per_extension,
+        target_active_pseudolabels=target_active_pseudolabels,
         evaluator=model.evaluate_candidate_batch,
         evaluation_batch_size=train_cfg.test_batch_size,
     )
 
-    if accepted < train_cfg.pseudolabels_per_extension:
+    active_pseudolabels_after = dm.train_dataset.count_active_pseudolabels()
+    if active_pseudolabels_after < target_active_pseudolabels:
         print(
             f"Scheduler extension stopped at stage K{next_stage_idx}: "
-            f"accepted {accepted}/{train_cfg.pseudolabels_per_extension} pseudo-labels."
+            f"disabled {disabled_count} pseudo-labels, accepted {accepted} new pseudo-labels, "
+            f"and reached {active_pseudolabels_after}/{target_active_pseudolabels} active pseudo-labels."
         )
         del dm
         del model

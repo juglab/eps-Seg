@@ -2,8 +2,8 @@ import lightning as L
 from eps_seg.modules.lvae import LadderVAE
 from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
+from eps_seg.training.logger import log_epoch_dice_scores, log_lvae_step, log_scheduler_stats, log_trainer_state
 from typing import Literal
-import numpy as np
 import torch 
 from torchmetrics.classification import F1Score
 
@@ -32,6 +32,8 @@ class LVAEModel(L.LightningModule):
         self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
         self.test_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
         self.current_true_epoch = 0
+        self.current_stage_idx = -1
+        self.best_val_dice_score_mean = float("-inf")
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
@@ -64,62 +66,8 @@ class LVAEModel(L.LightningModule):
             print("Using existing data statistics from checkpoint.")
         print("Seen samples:", self.seen_samples.item())
 
-    def log_step(self, 
-                 outputs: dict, 
-                 step: Literal["train", "val", "test"], 
-                 batch: dict):
-        batch_size = batch["patch"].size(0)
-
-        # Logging Loss Terms
-        self.log(f"{step}/IP", outputs["inpainting_loss"] * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(f"{step}/IP_unweighted", outputs["inpainting_loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        
-        for loss_term_name, weigth in zip(["kl", "cl", "ce"], [self.train_cfg.beta, self.train_cfg.gamma, 1.0]):
-            # Average loss term over all layers
-            self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name] * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            # Log every layer loss term
-            
-        for l, val in enumerate(outputs["kl_per_layer"]):
-            self.log(f"{step}/KL_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            self.log(f"{step}/KL_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-
-        # Logging x axis for graphs
-        self.log(f"seen_samples", float(self.seen_samples), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
-        self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
-
-        if step == "train":
-            self._log_pseudo_label_stats(outputs, batch, batch_size)
-
-    def _log_pseudo_label_stats(self, outputs: dict, batch: dict, batch_size: int):
-        gt = batch.get("gt")
-        is_initial_label = batch.get("is_initial_label")
-        schedule_labels = batch.get("label")
-
-        if gt is None or is_initial_label is None or schedule_labels is None:
-            return
-
-        is_initial_label = is_initial_label.bool()
-        pseudo_mask = ~is_initial_label
-        self.log("scheduler/initial_label_perc", is_initial_label.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log("scheduler/pseudo_label_perc", pseudo_mask.float().mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(
-            "scheduler/label_accuracy",
-            (schedule_labels == gt).float().mean(),
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch_size,
-        )
-        if pseudo_mask.any():
-            self.log(
-                "scheduler/pseudo_label_accuracy",
-                (schedule_labels[pseudo_mask] == gt[pseudo_mask]).float().mean(),
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=batch_size,
-            )
+    def log_step(self, outputs: dict, step: Literal["train", "val", "test"], batch: dict):
+        log_lvae_step(self, outputs, step, batch)
 
     def compute_total_loss(self, outputs: dict):
         return (
@@ -154,7 +102,7 @@ class LVAEModel(L.LightningModule):
 
         self.seen_samples += batch_size * self.trainer.world_size
         self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
-        self.log_step(outputs, "train", batch={**batch, "label": y})
+        self.log_step(outputs, "train", batch)
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -174,7 +122,7 @@ class LVAEModel(L.LightningModule):
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
 
-        self.log_step(outputs, "val", batch={"patch": x, "label": y})
+        self.log_step(outputs, "val", {"patch": x, "label": y})
         
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -224,22 +172,16 @@ class LVAEModel(L.LightningModule):
         return outputs
 
     def on_train_epoch_end(self):
-        if self.trainer.is_global_zero:
-            # We are node 0 device 0
-            dice_loss_per_class = self.train_dice_score.compute()
-            for class_idx, dice_score in enumerate(dice_loss_per_class):
-                self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
-            self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
-        self.train_dice_score.reset()
+        log_epoch_dice_scores(self, "train", self.train_dice_score, mean_prog_bar=False)
+
+    def on_train_epoch_start(self):
+        log_trainer_state(self)
+        log_scheduler_stats(self)
 
     def on_validation_epoch_end(self):
+        log_epoch_dice_scores(self, "val", self.validation_dice_score, mean_prog_bar=True)
         if self.trainer.is_global_zero:
-            # We are node 0 device 0
-            dice_loss_per_class = self.validation_dice_score.compute()
-            for class_idx, dice_score in enumerate(dice_loss_per_class):
-                self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
-            self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
-        self.validation_dice_score.reset()
+            log_trainer_state(self)
 
     def evaluate_candidate_batch(self, batch: dict):
         """

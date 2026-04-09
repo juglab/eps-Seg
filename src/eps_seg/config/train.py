@@ -32,7 +32,10 @@ class TrainConfig(BaseEPSConfig):
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
     train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
     pseudolabel_confidence_threshold: float = Field(default=0.75, description="Minimum confidence required to accept a newly sampled pseudo-label.")
-    pseudolabels_per_extension: int = Field(default=1024, description="Number of pseudo-labels to add whenever the scheduler is extended.")
+    pseudolabels_per_extension: int = Field(default=10000, description="Number of pseudo-labels to add whenever the scheduler is extended.")
+    enable_pseudolabel_pruning: bool = Field(default=False, description="Whether to disable active pseudo-labels that repeatedly fail re-evaluation at stage transitions.")
+    pseudolabel_keep_threshold: float = Field(default=0.75, description="Minimum confidence required to keep an active pseudo-label enabled during stage re-evaluation.")
+    pseudolabel_pruning_patience: int = Field(default=1, description="Number of consecutive failed stage re-evaluations before a pseudo-label is disabled.")
     max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
     min_initial_label_fraction: float = Field(default=0.25, description="Minimum fraction of each training batch that must come from the initial GT-labelled pool.")
     auto_resume: bool = Field(default=True, description="Automatically resume from the latest completed staged checkpoint if present.")
@@ -51,8 +54,12 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("min_initial_label_fraction must be between 0 and 1.")
         if self.pseudolabel_confidence_threshold < 0.0 or self.pseudolabel_confidence_threshold > 1.0:
             raise ValueError("pseudolabel_confidence_threshold must be between 0 and 1.")
+        if self.pseudolabel_keep_threshold < 0.0 or self.pseudolabel_keep_threshold > 1.0:
+            raise ValueError("pseudolabel_keep_threshold must be between 0 and 1.")
         if self.pseudolabels_per_extension < 0:
             raise ValueError("pseudolabels_per_extension must be >= 0.")
+        if self.pseudolabel_pruning_patience < 1:
+            raise ValueError("pseudolabel_pruning_patience must be >= 1.")
         if self.max_extensions < 0:
             raise ValueError("max_extensions must be >= 0.")
         return self

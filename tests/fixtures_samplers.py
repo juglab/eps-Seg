@@ -23,6 +23,11 @@ class DummyPseudoLabelDataset:
     def get_initial_label_mask(self):
         return self.schedule["label_source"] == 0
 
+    def get_active_schedule_indices(self):
+        if "is_enabled" not in self.schedule:
+            return np.arange(len(self.schedule["name_id"]), dtype=np.int32)
+        return np.where(self.schedule["is_enabled"])[0].astype(np.int32)
+
 
 class VersionedBatchSampler:
     """
@@ -67,6 +72,11 @@ def build_dummy_schedule(stage_label_counts):
     confidence = []
     label_source = []
     stage_index = []
+    is_enabled = []
+    stage_disabled = []
+    consecutive_keep_failures = []
+    last_predicted_label = []
+    last_confidence = []
 
     coord_counter = 0
     for stage, label_counts in sorted(stage_label_counts.items()):
@@ -79,6 +89,11 @@ def build_dummy_schedule(stage_label_counts):
                 confidence.append(1.0 if stage == 0 else 0.9)
                 label_source.append(0 if stage == 0 else 1)
                 stage_index.append(stage)
+                is_enabled.append(True)
+                stage_disabled.append(-1)
+                consecutive_keep_failures.append(0)
+                last_predicted_label.append(label)
+                last_confidence.append(1.0 if stage == 0 else 0.9)
                 coord_counter += 1
 
     return {
@@ -89,6 +104,11 @@ def build_dummy_schedule(stage_label_counts):
         "confidence": np.asarray(confidence, dtype=np.float32),
         "label_source": np.asarray(label_source, dtype=np.int32),
         "stage_index": np.asarray(stage_index, dtype=np.int32),
+        "is_enabled": np.asarray(is_enabled, dtype=np.bool_),
+        "stage_disabled": np.asarray(stage_disabled, dtype=np.int32),
+        "consecutive_keep_failures": np.asarray(consecutive_keep_failures, dtype=np.int32),
+        "last_predicted_label": np.asarray(last_predicted_label, dtype=np.int32),
+        "last_confidence": np.asarray(last_confidence, dtype=np.float32),
     }
 
 

@@ -41,7 +41,9 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
 
         The scheduler is a flat table with one row per scheduled voxel:
 
-        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Label Source | Stage Index |
+        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Label Source |
+        | Stage Added | Is Enabled | Stage Disabled | Consecutive Keep Failures |
+        | Last Predicted Label | Last Confidence |
 
         Stage 0 is sampled from GT labels according to
         ``samples_per_class``. Later stages are created by appending
@@ -88,6 +90,11 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "confidence": np.empty((0,), dtype=np.float32),
             "label_source": np.empty((0,), dtype=np.int32),
             "stage_index": np.empty((0,), dtype=np.int32),
+            "is_enabled": np.empty((0,), dtype=np.bool_),
+            "stage_disabled": np.empty((0,), dtype=np.int32),
+            "consecutive_keep_failures": np.empty((0,), dtype=np.int32),
+            "last_predicted_label": np.empty((0,), dtype=np.int32),
+            "last_confidence": np.empty((0,), dtype=np.float32),
         }
 
         if self.scheduler_path is not None and self.scheduler_path.exists():
@@ -103,8 +110,26 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         """Increase version to signal sampler that the schedule has changed."""
         self.sampling_version += 1
 
-    def _add_to_schedule(self, name_id, coords, current_label, gt_label, confidence, label_source, stage_index):
+    def _add_to_schedule(
+        self,
+        name_id,
+        coords,
+        current_label,
+        gt_label,
+        confidence,
+        label_source,
+        stage_index,
+        is_enabled=True,
+        stage_disabled=-1,
+        consecutive_keep_failures=0,
+        last_predicted_label=None,
+        last_confidence=None,
+    ):
         """Append one row to the staged scheduler."""
+        if last_predicted_label is None:
+            last_predicted_label = current_label
+        if last_confidence is None:
+            last_confidence = confidence
         self.schedule["name_id"] = np.append(self.schedule["name_id"], np.array([name_id], dtype=np.int32))
         self.schedule["coords"] = np.append(self.schedule["coords"], [coords], axis=0)
         self.schedule["current_label"] = np.append(self.schedule["current_label"], np.array([current_label], dtype=np.int32))
@@ -112,6 +137,20 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self.schedule["confidence"] = np.append(self.schedule["confidence"], np.array([confidence], dtype=np.float32))
         self.schedule["label_source"] = np.append(self.schedule["label_source"], np.array([label_source], dtype=np.int32))
         self.schedule["stage_index"] = np.append(self.schedule["stage_index"], np.array([stage_index], dtype=np.int32))
+        self.schedule["is_enabled"] = np.append(self.schedule["is_enabled"], np.array([is_enabled], dtype=np.bool_))
+        self.schedule["stage_disabled"] = np.append(self.schedule["stage_disabled"], np.array([stage_disabled], dtype=np.int32))
+        self.schedule["consecutive_keep_failures"] = np.append(
+            self.schedule["consecutive_keep_failures"],
+            np.array([consecutive_keep_failures], dtype=np.int32),
+        )
+        self.schedule["last_predicted_label"] = np.append(
+            self.schedule["last_predicted_label"],
+            np.array([last_predicted_label], dtype=np.int32),
+        )
+        self.schedule["last_confidence"] = np.append(
+            self.schedule["last_confidence"],
+            np.array([last_confidence], dtype=np.float32),
+        )
 
     def _sample_initial_supervised_samples(self):
         """
@@ -142,6 +181,11 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                             confidence=1.0,
                             label_source=0,
                             stage_index=0,
+                            is_enabled=True,
+                            stage_disabled=-1,
+                            consecutive_keep_failures=0,
+                            last_predicted_label=gt_label,
+                            last_confidence=1.0,
                         )
 
     def _sample_coordinates_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
@@ -162,15 +206,31 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return valid and in_cell
 
     def __len__(self):
-        return len(self.schedule["name_id"])
+        return len(self.get_active_schedule_indices())
 
     def get_initial_label_mask(self) -> np.ndarray:
         return self.schedule["label_source"] == 0
 
-    def _scheduled_coordinate_set(self) -> set[tuple[str, int, int, int]]:
+    def get_active_schedule_indices(self) -> np.ndarray:
+        """Return absolute scheduler row indices that are currently enabled."""
+        if "is_enabled" not in self.schedule:
+            return np.arange(len(self.schedule["name_id"]), dtype=np.int32)
+        return np.where(self.schedule["is_enabled"])[0].astype(np.int32)
+
+    def get_active_pseudolabel_indices(self) -> np.ndarray:
+        """Return enabled pseudo-label row indices."""
+        pseudo_mask = self.schedule["label_source"] == 1
+        return np.where(self.schedule["is_enabled"] & pseudo_mask)[0].astype(np.int32)
+
+    def count_active_pseudolabels(self) -> int:
+        """Return the number of enabled pseudo-label rows."""
+        return int(len(self.get_active_pseudolabel_indices()))
+
+    def _scheduled_coordinate_set(self, active_only: bool = True) -> set[tuple[str, int, int, int]]:
+        schedule_indices = self.get_active_schedule_indices() if active_only else np.arange(len(self.schedule["name_id"]))
         return {
             (self.id_to_name[int(name_id)], int(z), int(y), int(x))
-            for name_id, (z, y, x) in zip(self.schedule["name_id"], self.schedule["coords"])
+            for name_id, (z, y, x) in zip(self.schedule["name_id"][schedule_indices], self.schedule["coords"][schedule_indices])
         }
 
     def _sample_random_candidate(self, forbidden_coords: set[tuple[str, int, int, int]], max_tries: int = 1024):
@@ -213,6 +273,32 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             local_forbidden.add(candidate)
         return coords_batch
 
+    def _weighted_class_targets(self, total_items: int) -> dict[int, int]:
+        """Split a target number of pseudo-label admissions across classes."""
+        class_weights = {
+            int(label): float(self.samples_per_class.get(int(label), self.default_samples_per_class))
+            for label in self.unique_labels
+        }
+        total_weight = float(sum(max(weight, 0.0) for weight in class_weights.values()))
+        if total_items <= 0:
+            return {label: 0 for label in class_weights}
+        if total_weight <= 0.0:
+            base = total_items // len(class_weights)
+            rem = total_items % len(class_weights)
+            targets = {label: base for label in class_weights}
+            for label in list(class_weights.keys())[:rem]:
+                targets[label] += 1
+            return targets
+
+        raw_targets = {label: total_items * max(weight, 0.0) / total_weight for label, weight in class_weights.items()}
+        targets = {label: int(np.floor(raw_targets[label])) for label in class_weights}
+        remainder = total_items - sum(targets.values())
+        if remainder > 0:
+            ranked_labels = sorted(class_weights.keys(), key=lambda label: (raw_targets[label] - targets[label], -label), reverse=True)
+            for label in ranked_labels[:remainder]:
+                targets[label] += 1
+        return targets
+
     def build_candidate_batch(self, coords_batch: list[tuple[str, int, int, int]]) -> dict:
         """
             Materialize a coordinate list into tensors for pseudo-label evaluation.
@@ -233,50 +319,143 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "name": names,
         }
 
-    def add_pseudolabels_for_stage(self, stage_index: int, n_new_samples: int, evaluator, evaluation_batch_size: int) -> int:
+    def build_scheduler_batch(self, schedule_indices: list[int]) -> dict:
+        """Materialize existing scheduler rows into a batch for re-evaluation."""
+        patches = []
+        gt_labels = []
+        names = []
+        coords = []
+        current_labels = []
+        for schedule_idx in schedule_indices:
+            name_id = int(self.schedule["name_id"][schedule_idx])
+            name = self.id_to_name[name_id]
+            z, y, x = map(int, self.schedule["coords"][schedule_idx])
+            patches.append(self.patch_at(self.images[name], z, y, x))
+            gt_labels.append(int(self.schedule["gt_label"][schedule_idx]))
+            names.append(name)
+            coords.append((z, y, x))
+            current_labels.append(int(self.schedule["current_label"][schedule_idx]))
+        return {
+            "patch": torch.stack(patches, dim=0),
+            "gt": torch.tensor(gt_labels).long(),
+            "coords": torch.tensor(coords).long(),
+            "name": names,
+            "label": torch.tensor(current_labels).long(),
+            "schedule_idx": torch.tensor(schedule_indices).long(),
+        }
+
+    def add_pseudolabels_for_stage(self, stage_index: int, target_active_pseudolabels: int, evaluator, evaluation_batch_size: int) -> int:
         """
-            Extend the scheduler with uniformly sampled pseudo-labels.
+            Extend the scheduler until the active pseudo-label pool reaches the
+            requested target size.
 
             The evaluator must accept a batch dict returned by
             ``build_candidate_batch`` and return ``(predicted_labels, confidences)``.
         """
-        if n_new_samples <= 0:
+        current_active_pseudolabels = self.count_active_pseudolabels()
+        if target_active_pseudolabels <= current_active_pseudolabels:
             return 0
 
-        forbidden_coords = self._scheduled_coordinate_set()
+        forbidden_coords = self._scheduled_coordinate_set(active_only=True)
+        target_new_pseudolabels = int(target_active_pseudolabels - current_active_pseudolabels)
+        class_targets = self._weighted_class_targets(target_new_pseudolabels)
+        accepted_per_class = {label: 0 for label in class_targets}
         accepted = 0
-        while accepted < n_new_samples:
+        no_progress_rounds = 0
+        max_no_progress_rounds = 32
+        while self.count_active_pseudolabels() < target_active_pseudolabels and no_progress_rounds < max_no_progress_rounds:
             coords_batch = self._sample_candidate_batch(forbidden_coords, evaluation_batch_size)
             if len(coords_batch) == 0:
                 break
             batch = self.build_candidate_batch(coords_batch)
             predicted_labels, confidences = evaluator(batch)
+            accepted_this_round = 0
             for (name, z, y, x), pred_label, confidence, gt_label in zip(
                 coords_batch,
                 predicted_labels,
                 confidences,
                 batch["gt"].tolist(),
             ):
+                pred_label = int(pred_label)
                 if float(confidence) < self.confidence_threshold:
+                    continue
+                if accepted_per_class.get(pred_label, 0) >= class_targets.get(pred_label, 0):
                     continue
                 self._add_to_schedule(
                     name_id=self.name_to_id[name],
                     coords=(z, y, x),
-                    current_label=int(pred_label),
+                    current_label=pred_label,
                     gt_label=int(gt_label),
                     confidence=float(confidence),
                     label_source=1,
                     stage_index=int(stage_index),
+                    is_enabled=True,
+                    stage_disabled=-1,
+                    consecutive_keep_failures=0,
+                    last_predicted_label=pred_label,
+                    last_confidence=float(confidence),
                 )
                 forbidden_coords.add((name, z, y, x))
+                accepted_per_class[pred_label] = accepted_per_class.get(pred_label, 0) + 1
                 accepted += 1
-                if accepted >= n_new_samples:
+                accepted_this_round += 1
+                if self.count_active_pseudolabels() >= target_active_pseudolabels:
                     break
+                if all(accepted_per_class[label] >= class_targets[label] for label in class_targets):
+                    break
+            no_progress_rounds = 0 if accepted_this_round > 0 else no_progress_rounds + 1
 
         self.stage_index = max(self.stage_index, int(stage_index))
         self._bump_sampling_version()
         self._print_schedule_report()
         return accepted
+
+    def reevaluate_pseudolabels_for_stage(
+        self,
+        next_stage_idx: int,
+        evaluator,
+        evaluation_batch_size: int,
+        keep_threshold: float,
+        pruning_patience: int,
+        enable_pruning: bool,
+    ) -> int:
+        """
+            Re-evaluate active pseudo-labels and disable rows that repeatedly
+            fail the keep rule.
+        """
+        pseudo_indices = self.get_active_pseudolabel_indices().tolist()
+        if len(pseudo_indices) == 0:
+            return 0
+
+        disabled_count = 0
+        for batch_start in range(0, len(pseudo_indices), evaluation_batch_size):
+            batch_indices = pseudo_indices[batch_start : batch_start + evaluation_batch_size]
+            batch = self.build_scheduler_batch(batch_indices)
+            predicted_labels, confidences = evaluator(batch)
+
+            for schedule_idx, pred_label, confidence in zip(batch_indices, predicted_labels, confidences):
+                pred_label = int(pred_label)
+                confidence = float(confidence)
+                self.schedule["last_predicted_label"][schedule_idx] = pred_label
+                self.schedule["last_confidence"][schedule_idx] = confidence
+
+                keep_row = pred_label == int(self.schedule["current_label"][schedule_idx]) and confidence >= keep_threshold
+                if keep_row:
+                    self.schedule["consecutive_keep_failures"][schedule_idx] = 0
+                    continue
+
+                self.schedule["consecutive_keep_failures"][schedule_idx] += 1
+                if (
+                    enable_pruning
+                    and int(self.schedule["consecutive_keep_failures"][schedule_idx]) >= int(pruning_patience)
+                ):
+                    self.schedule["is_enabled"][schedule_idx] = False
+                    self.schedule["stage_disabled"][schedule_idx] = int(next_stage_idx)
+                    disabled_count += 1
+
+        if len(pseudo_indices) > 0:
+            self._bump_sampling_version()
+        return disabled_count
 
     def save_scheduler_npz(self, path):
         """
@@ -293,6 +472,11 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             confidence=self.schedule["confidence"],
             label_source=self.schedule["label_source"],
             stage_index=self.schedule["stage_index"],
+            is_enabled=self.schedule["is_enabled"],
+            stage_disabled=self.schedule["stage_disabled"],
+            consecutive_keep_failures=self.schedule["consecutive_keep_failures"],
+            last_predicted_label=self.schedule["last_predicted_label"],
+            last_confidence=self.schedule["last_confidence"],
             metadata=np.array(
                 [self.seed, self.stage_index, len(self.schedule["name_id"])],
                 dtype=np.int32,
@@ -305,11 +489,29 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         """
         npz = np.load(path)
         for key in self.schedule:
-            self.schedule[key] = np.array(npz[key])
+            if key in npz:
+                self.schedule[key] = np.array(npz[key])
+            else:
+                self.schedule[key] = self._default_scheduler_field(key, len(np.array(npz["name_id"])))
         if "metadata" in npz:
             metadata = np.array(npz["metadata"]).astype(np.int32)
             if metadata.size >= 2:
                 self.stage_index = int(metadata[1])
+        self._bump_sampling_version()
+
+    def _default_scheduler_field(self, key: str, n_rows: int) -> np.ndarray:
+        """Build default values for scheduler fields missing in older files."""
+        if key == "is_enabled":
+            return np.ones((n_rows,), dtype=np.bool_)
+        if key == "stage_disabled":
+            return np.full((n_rows,), -1, dtype=np.int32)
+        if key == "consecutive_keep_failures":
+            return np.zeros((n_rows,), dtype=np.int32)
+        if key == "last_predicted_label":
+            return self.schedule["current_label"].copy()
+        if key == "last_confidence":
+            return self.schedule["confidence"].copy()
+        raise KeyError(f"Unsupported missing scheduler field: {key}")
 
     def patch_at(self, img_stack, z, y, x):
         """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
@@ -337,15 +539,16 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         spd = pd.DataFrame(sch)
         spd["name_id"] = spd["name_id"].apply(lambda x: self.id_to_name[x])
         spd["label_source"] = spd["label_source"].apply(lambda x: self.label_source_names.get(int(x), f"source_{x}"))
-        print(spd.groupby(["stage_index", "label_source", "name_id"])["current_label"].value_counts().unstack(fill_value=0))
+        spd["is_enabled"] = spd["is_enabled"].astype(bool)
+        print(spd.groupby(["stage_index", "label_source", "is_enabled", "name_id"])["current_label"].value_counts().unstack(fill_value=0))
 
     def __getitem__(self, idx):
         """Return one scheduled sample by its absolute scheduler index."""
-        schedule_idx = idx
-        name_id = self.schedule["name_id"][idx]
-        coords = self.schedule["coords"][idx]
-        current_label = self.schedule["current_label"][idx]
-        gt_label = self.schedule["gt_label"][idx]
+        schedule_idx = int(self.get_active_schedule_indices()[idx])
+        coords = self.schedule["coords"][schedule_idx]
+        current_label = self.schedule["current_label"][schedule_idx]
+        gt_label = self.schedule["gt_label"][schedule_idx]
+        name_id = self.schedule["name_id"][schedule_idx]
         name = self.id_to_name[name_id]
         patch = self.patch_at(self.images[name], coords[0], coords[1], coords[2])
         segmentation = self.patch_at(self.labels[name], coords[0], coords[1], coords[2])
@@ -356,10 +559,10 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "gt": torch.tensor(gt_label).long(),
             "coords": torch.tensor(coords).long(),
             "schedule_idx": torch.tensor(int(schedule_idx)).long(),
-            "is_initial_label": torch.tensor(bool(self.schedule["label_source"][idx] == 0), dtype=torch.bool),
-            "stage_index": torch.tensor(int(self.schedule["stage_index"][idx])).long(),
+            "is_initial_label": torch.tensor(bool(self.schedule["label_source"][schedule_idx] == 0), dtype=torch.bool),
+            "stage_index": torch.tensor(int(self.schedule["stage_index"][schedule_idx])).long(),
             "segmentation": segmentation,
-            "confidence": torch.tensor(float(self.schedule["confidence"][idx])).float(),
+            "confidence": torch.tensor(float(self.schedule["confidence"][schedule_idx])).float(),
         }
 
 
