@@ -80,10 +80,18 @@ def log_scheduler_stats(module):
     active_samples = int(enabled_mask.sum())
     disabled_samples = int(total_samples - active_samples)
     avg_active_confidence = float(schedule["confidence"][enabled_mask].mean()) if active_samples > 0 else 0.0
+    active_pseudo_mask = enabled_mask & (schedule["label_source"] == 1)
+    active_pseudo_count = int(active_pseudo_mask.sum())
     module.log("scheduler/active_samples", float(active_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/disabled_samples", float(disabled_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/total_samples", float(total_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/avg_active_confidence", avg_active_confidence, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+    for class_idx in range(int(module.cfg.n_components)):
+        if active_pseudo_count == 0:
+            class_fraction = 0.0
+        else:
+            class_fraction = float((schedule["gt_label"][active_pseudo_mask] == class_idx).mean())
+        module.log(f"scheduler/pseudolabel_gt_class_{class_idx}_fraction", class_fraction, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
 
 def log_trainer_state(module):
