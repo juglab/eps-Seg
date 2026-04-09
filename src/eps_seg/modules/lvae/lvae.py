@@ -241,7 +241,10 @@ class LadderVAE(nn.Module):
             x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
             y: Optional labels tensor
             validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
-            confidence_threshold: Confidence threshold for assigning pseudo-labels
+            confidence_threshold: Confidence threshold for assigning pseudo-labels.
+                During semisupervised training the staged scheduler already
+                decides which samples enter the batch, so every unlabeled input
+                in the batch is pseudo-labeled regardless of this threshold.
         """
 
         # Defaults
@@ -272,7 +275,8 @@ class LadderVAE(nn.Module):
         )
 
         if self.training_mode == "semisupervised" and self.training:
-            # get pseudo-labels
+            # During semisupervised training every unlabeled row in the batch is
+            # pseudo-labeled. Scheduler admission is handled outside the model.
             pseudo_labels = self.get_pseudo_labels(
                 td_data["posterior"],
                 y,
@@ -574,6 +578,15 @@ class LadderVAE(nn.Module):
         label,
         threshold=0.99,
     ):
+        """
+        Assign pseudo-labels to all unlabeled batch rows from the current batch
+        anchors.
+
+        The ``threshold`` argument is kept for interface compatibility, but the
+        staged training loop now relies on the external scheduler to decide
+        which samples are admitted to training. Once a sample is in the batch,
+        the model assigns it a pseudo-label even if confidence is low.
+        """
         anchors = torch.where(label != -1)[0]
 
         selected_labels = label[anchors].long()
@@ -619,11 +632,8 @@ class LadderVAE(nn.Module):
 
             probs = F.softmax(logits, dim=1)
             per_layer_probs.append(probs)
-            layer_conf, pseudo = probs.max(dim=1)
+            _, pseudo = probs.max(dim=1)
             pseudo = pseudo.long()
-            non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
-            non_anchors[anchors] = False
-            pseudo[non_anchors & (layer_conf <= threshold)] = -1
 
             per_layer_pseudo.append(pseudo)
 
@@ -633,10 +643,10 @@ class LadderVAE(nn.Module):
         masked_probs = probs * expert_mask.unsqueeze(-1)
         n_valid_experts = expert_mask.sum(dim=0)
         moe_probs = masked_probs.sum(dim=0) / n_valid_experts.clamp(min=1).unsqueeze(1)
-        moe_conf, moe_label = moe_probs.max(dim=1)
+        _, moe_label = moe_probs.max(dim=1)
 
         final_pseudo = torch.full_like(label, -1, dtype=torch.long)
-        assignable = (n_valid_experts > 0) & (moe_conf > threshold)
+        assignable = n_valid_experts > 0
         final_pseudo[assignable] = moe_label[assignable]
         final_pseudo[anchors] = selected_labels
 
