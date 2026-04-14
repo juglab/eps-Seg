@@ -6,6 +6,7 @@ from eps_seg.training.logger import log_epoch_dice_scores, log_lvae_step, log_sc
 from typing import Literal
 import torch 
 from torchmetrics.classification import F1Score
+import numpy as np
 
 
 class LVAEModel(L.LightningModule):
