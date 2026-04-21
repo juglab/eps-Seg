@@ -45,14 +45,7 @@ class SemisupervisedDataset(Dataset):
         self.default_samples_per_class: int = 1
         self.dim = dim
         self.groups = self._prepare_metadata()
-        self.n_label_per_class = {
-            c: len([g for g in self.groups if g["labels"][0] == c])
-            for c in range(self.n_classes)
-        }
-        self.anchor_indices_by_label = {
-            c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c]
-            for c in range(self.n_classes)
-        }
+        self._refresh_group_index_cache()
         self._report_dataset_summary()
 
     def set_mode(self, mode: str):
@@ -61,16 +54,19 @@ class SemisupervisedDataset(Dataset):
             raise ValueError("stage must be 'supervised' or 'semisupervised'")
         self.mode = mode
         self.groups = self._prepare_metadata()
+        self._refresh_group_index_cache()
 
     def set_radius(self, radius: int):
         if self.radius != radius:
             self.radius = radius
             self.groups = self._modify_metadata()
+            self._refresh_group_index_cache()
 
     def increase_radius(self):
         """Increase the radius for neighbor sampling."""
         self.radius += 1
         self.groups = self._modify_metadata()
+        self._refresh_group_index_cache()
 
     def _is_valid_coord(
         self,
@@ -270,7 +266,7 @@ class SemisupervisedDataset(Dataset):
     def _modify_metadata(self) -> List[dict]:
         """Recompute metadata after changing radius."""
         if self.anchor_records:
-            return self._prepare_metadata_from_anchors()
+            return self._modify_cached_anchor_metadata()
 
         for g in self.groups:
             name = g["name"]
@@ -308,6 +304,98 @@ class SemisupervisedDataset(Dataset):
                 )
                 g["coords"] = modified_group["coords"]
                 g["labels"] = modified_group["labels"]
+
+        self._report_class_counts(self.groups)
+        return self.groups
+
+    def _modify_cached_anchor_metadata(self) -> List[dict]:
+        """
+        Recompute neighbors for cached-anchor groups while keeping the 
+        data stucture consistent.
+
+        Neighbors are sampled up to n_neighbors, and if not enough valid 
+        neighbors can be found, the oldest neighbors replaced by the new
+        ones (FIFO policy).
+        
+        """
+        for g in self.groups:
+            name = g["name"]
+            cz, cy, cx = map(int, g["coords"][0])
+            z_start = g.get("z_start")
+            z_stop = g.get("z_stop")
+            img = self.images[name]
+            lbl = self.labels[name]
+            Z, H, W = img.shape
+
+            if self.mode == "supervised":
+                g["coords"] = [(cz, cy, cx)]
+                g["labels"] = [int(g["labels"][0])]
+                continue
+
+            current_neighbor_coords = [tuple(map(int, coord)) for coord in g["coords"][1:]]
+            current_neighbor_labels = [int(label) for label in g["labels"][1:]]
+
+            used_coords = {(cz, cy, cx), *current_neighbor_coords}
+            neighbors = self._sample_neighbors(
+                name=name,
+                cz=cz,
+                cy=cy,
+                cx=cx,
+                Z=Z,
+                H=H,
+                W=W,
+                used_coords=used_coords,
+                lbl=lbl,
+                z_start=z_start,
+                z_stop=z_stop,
+                k=self.n_neighbors,
+                max_tries=100,
+            )
+
+            if len(neighbors) == self.n_neighbors:
+                # Replace all neighbors with the newly sampled ones, keeping the same anchor and group index.
+                modified_group = self._make_group_record(
+                    name=name,
+                    cz=cz,
+                    cy=cy,
+                    cx=cx,
+                    c=int(g["labels"][0]),
+                    neighbors=neighbors,
+                    substack_id=g.get("substack_id"),
+                    z_start=z_start,
+                    z_stop=z_stop,
+                    coord_id=g.get("coord_id"),
+                )
+                g["coords"] = modified_group["coords"]
+                g["labels"] = modified_group["labels"]
+                continue
+            elif len(neighbors) > 0:
+                # If we can't find enough neighbors, keep as many of the newly sampled ones as possible,
+                # and fill the rest with the old neighbors (if any).
+                # FIFO Policy: drop the oldest neighbors, which are likely to be closer to anchor
+                new_neighbors = [
+                    (
+                        int(neighbor["z"]),
+                        int(neighbor["y"]),
+                        int(neighbor["x"]),
+                        int(neighbor["label"]),
+                    )
+                    for neighbor in neighbors
+                ]
+                n_replace = min(len(new_neighbors), len(current_neighbor_coords))
+                kept_coords = current_neighbor_coords[n_replace:]
+                kept_labels = current_neighbor_labels[n_replace:]
+
+                updated_coords = kept_coords + [
+                    (z, y, x) for z, y, x, _ in new_neighbors[:n_replace]
+                ]
+                updated_labels = kept_labels + [
+                    label for _, _, _, label in new_neighbors[:n_replace]
+                ]
+
+                if len(updated_coords) == self.n_neighbors:
+                    g["coords"] = [(cz, cy, cx)] + updated_coords
+                    g["labels"] = [int(g["labels"][0])] + updated_labels
 
         self._report_class_counts(self.groups)
         return self.groups
@@ -419,6 +507,17 @@ class SemisupervisedDataset(Dataset):
         centers = [g["labels"][0] for g in groups]
         neighbors = [lab for g in groups for lab in g["labels"][1:]]
         print(self._format_class_balance_table(centers, neighbors))
+
+    def _refresh_group_index_cache(self) -> None:
+        """Refresh cached class counts and per-class anchor indices after group updates."""
+        self.n_label_per_class = {
+            c: len([g for g in self.groups if g["labels"][0] == c])
+            for c in range(self.n_classes)
+        }
+        self.anchor_indices_by_label = {
+            c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c]
+            for c in range(self.n_classes)
+        }
 
     def _report_dataset_summary(self) -> None:
         anchor_mode = "cached anchors" if self.anchor_records else "sampled indices"
