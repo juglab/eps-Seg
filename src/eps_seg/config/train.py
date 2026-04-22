@@ -1,4 +1,4 @@
-from typing import Optional, Union, Literal
+from typing import Any, Dict, Optional, Union, Literal
 from pydantic import Field, model_validator
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
@@ -32,7 +32,7 @@ class TrainConfig(BaseEPSConfig):
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
     train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
     pseudolabel_confidence_threshold: float = Field(default=0.75, description="Minimum confidence required to accept a newly sampled pseudo-label.")
-    pseudolabels_per_extension: int = Field(default=10000, description="Number of pseudo-labels to add whenever the scheduler is extended.")
+    pseudolabels_per_extension: int = Field(default=100000, description="Number of pseudo-labels to add whenever the scheduler is extended.")
     enable_pseudolabel_pruning: bool = Field(default=False, description="Whether to disable active pseudo-labels that repeatedly fail re-evaluation at stage transitions.")
     pseudolabel_keep_threshold: float = Field(default=0.75, description="Minimum confidence required to keep an active pseudo-label enabled during stage re-evaluation.")
     pseudolabel_pruning_patience: int = Field(default=1, description="Number of consecutive failed stage re-evaluations before a pseudo-label is disabled.")
@@ -70,6 +70,10 @@ class ExperimentConfig(BaseEPSConfig):
     project_name: str = Field(default="eps-seg-default-project", description="Name of the project, e.g. used in WandB logging")
     train_cfg_path: str = Field(default=None, description="Path to the training configuration YAML file. Can be either absolute or relative to the experiment config file")
     dataset_cfg_path: str = Field(description="Path to the dataset configuration YAML file. Can be either absolute or relative to the experiment config file")
+    dataset_overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional dataset configuration overrides applied after loading the dataset YAML. Useful for fold-specific experiment files.",
+    )
     model_cfg_path: str = Field(default=None, description="Path to the model configuration YAML file. Can be either absolute or relative to the experiment config file")
 
     def get_configs(self) -> tuple[TrainConfig, BaseEPSDatasetConfig, BaseEPSConfig]:
@@ -93,6 +97,19 @@ class ExperimentConfig(BaseEPSConfig):
         if not dataset_cfg_path.is_absolute():
             dataset_cfg_path = Path(self.config_yaml_path).parent / dataset_cfg_path
         dataset_cfg = BaseEPSDatasetConfig.from_yaml(dataset_cfg_path)
+        if self.dataset_overrides:
+            merged_dataset_cfg = {
+                **dataset_cfg.model_dump(exclude={"config_yaml_path"}),
+                **self.dataset_overrides,
+            }
+            dataset_cfg = type(dataset_cfg)(**merged_dataset_cfg)
+            dataset_cfg.config_yaml_path = dataset_cfg_path
+            print(
+                f"Loaded dataset config from {dataset_cfg_path} "
+                f"with overrides {self.dataset_overrides}"
+            )
+        else:
+            print(f"Loaded dataset config from {dataset_cfg_path}")
 
         if self.model_cfg_path:
             model_cfg_path = Path(self.model_cfg_path)

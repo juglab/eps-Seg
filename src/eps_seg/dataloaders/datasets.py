@@ -1,24 +1,16 @@
 import random
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Tuple, Union
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
-from tqdm import tqdm
-
-from typing import Dict
-import random
-import numpy as np
-import torch
-import pandas as pd
 from tqdm import tqdm
 
 
 class PseudoLabelDataset(torch.utils.data.Dataset):
-
     def __init__(
         self,
         images,
@@ -30,29 +22,26 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         indices_dict=None,
         dim=2,
         seed=42,
-        samples_per_class: Dict[int, int] | None = None,
+        samples_per_class: Optional[Dict[int, int]] = None,
         scheduler_path=None,
         stage_index: int = 0,
         confidence_threshold: float = 0.75,
+        anchor_records: Optional[List[Dict[str, int]]] = None,
+        train_substacks: Optional[List[Dict[str, int]]] = None,
     ):
         """
-        Dataset that stores the full staged scheduler used by the refactored
+        Dataset storing the full staged scheduler used by the refactored
         training loop.
 
-        The scheduler is a flat table with one row per scheduled voxel:
-
-        | Name ID | Coords (z,y,x) | Current Label | GT Label | Confidence | Label Source |
-        | Stage Added | Is Enabled | Stage Disabled | Consecutive Keep Failures |
-        | Last Predicted Label | Last Confidence |
-
-        Stage 0 is sampled from GT labels according to
-        ``samples_per_class``. Later stages are created by appending
-        pseudo-labels through ``add_pseudolabels_for_stage`` and by saving the
-        scheduler to a ``.npz`` file so training can resume from disk.
+        Stage-0 rows can be initialized either from canonical cached anchor
+        records (cache v2 path) or from legacy per-slice sampling
+        ``indices_dict`` (backward compatibility path).
         """
         self.images = images
         self.labels = labels
         self.indices_dict = indices_dict or {}
+        self.anchor_records = anchor_records or []
+        self.train_substacks = train_substacks or []
         self.patch_size = patch_size
         self.label_size = label_size
         self.offset = self.patch_size // 2 - self.label_size
@@ -63,24 +52,17 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self.seed = seed
         self.rng = random.Random(self.seed)
         self.samples_per_class = samples_per_class or {}
-        self.default_samples_per_class: int = 1
+        self.default_samples_per_class = 1
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
         self.stage_index = int(stage_index)
         self.confidence_threshold = float(confidence_threshold)
         self.sampling_version = 0
-        self.slice_sampling_table = [
-            (name, int(z))
-            for name, z_indices in self.indices_dict.items()
-            for z in z_indices
-        ]
 
         self.stack_names = list(self.images.keys())
         self.name_to_id = {name: i for i, name in enumerate(self.stack_names)}
         self.id_to_name = {i: name for i, name in enumerate(self.stack_names)}
-        self.label_source_names = {
-            0: "gt_initial",
-            1: "pseudo",
-        }
+        self.label_source_names = {0: "gt_initial", 1: "pseudo"}
+        self.slice_sampling_table = self._build_slice_sampling_table()
 
         self.schedule = {
             "name_id": np.empty((0,), dtype=np.int32),
@@ -101,13 +83,29 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             print(f"Loading scheduler from {self.scheduler_path}...")
             self.load_scheduler_npz(self.scheduler_path)
         else:
-            print("Sampling stage-0 labelled scheduler...")
-            self._sample_initial_supervised_samples()
+            print("Initializing stage-0 labelled scheduler...")
+            if self.anchor_records:
+                self._load_initial_supervised_records()
+            else:
+                self._sample_initial_supervised_samples()
             self._print_schedule_report()
             self._bump_sampling_version()
 
+    def _build_slice_sampling_table(self) -> List[Tuple[str, int]]:
+        if self.train_substacks:
+            table = []
+            for substack in self.train_substacks:
+                name = substack["stack_name"]
+                for z in range(int(substack["z_start"]), int(substack["z_stop"])):
+                    table.append((name, int(z)))
+            return table
+        return [
+            (name, int(z))
+            for name, z_indices in self.indices_dict.items()
+            for z in z_indices
+        ]
+
     def _bump_sampling_version(self):
-        """Increase version to signal sampler that the schedule has changed."""
         self.sampling_version += 1
 
     def _add_to_schedule(
@@ -125,7 +123,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         last_predicted_label=None,
         last_confidence=None,
     ):
-        """Append one row to the staged scheduler."""
         if last_predicted_label is None:
             last_predicted_label = current_label
         if last_confidence is None:
@@ -152,16 +149,54 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             np.array([last_confidence], dtype=np.float32),
         )
 
+    def _load_initial_supervised_records(self):
+        coords_in_use = set()
+        sorted_records = sorted(
+            self.anchor_records,
+            key=lambda record: (
+                int(record.get("coord_id", 10**9)),
+                str(record["stack_name"]),
+                int(record["z"]),
+                int(record["y"]),
+                int(record["x"]),
+            ),
+        )
+        for record in sorted_records:
+            name = record["stack_name"]
+            z = int(record["z"])
+            y = int(record["y"])
+            x = int(record["x"])
+            coord_key = (name, z, y, x)
+            if coord_key in coords_in_use:
+                continue
+
+            Z, H, W = self.images[name].shape
+            if not self._is_valid_coord(name, z, y, x, Z, H, W):
+                continue
+
+            coords_in_use.add(coord_key)
+            gt_label = int(record.get("gt_label", self.labels[name][z, y, x]))
+            self._add_to_schedule(
+                name_id=self.name_to_id[name],
+                coords=(z, y, x),
+                current_label=gt_label,
+                gt_label=gt_label,
+                confidence=1.0,
+                label_source=0,
+                stage_index=0,
+                is_enabled=True,
+                stage_disabled=-1,
+                consecutive_keep_failures=0,
+                last_predicted_label=gt_label,
+                last_confidence=1.0,
+            )
+
     def _sample_initial_supervised_samples(self):
-        """
-            Sample the initial GT-labelled pool from the configured train slices.
-        """
         for name, z_indices in self.indices_dict.items():
             img_stack = self.images[name]
             lbl_stack = self.labels[name]
             name_id = self.name_to_id[name]
             Z, H, W = img_stack.shape
-
             coords_in_use = set(map(tuple, self.schedule["coords"]))
             for cz in tqdm(z_indices, desc=f"Sampling stage-0 labels for {name}"):
                 for lbl in self.unique_labels:
@@ -189,7 +224,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                         )
 
     def _sample_coordinates_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
-        """Sample coordinates from a single slice for one class."""
         label_coords = np.argwhere(z_slice == class_label)
         if len(label_coords) < num_samples:
             return []
@@ -198,7 +232,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return [(int(y), int(x)) for y, x in sampled]
 
     def _is_valid_coord(self, name, z, y, x, Z, H, W):
-        """Return whether a coordinate can be used as a scheduled center."""
         valid = self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         if self.dim == 3:
             valid = valid and (self.offset <= z < Z - self.offset - 1)
@@ -212,35 +245,30 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return self.schedule["label_source"] == 0
 
     def get_active_schedule_indices(self) -> np.ndarray:
-        """Return absolute scheduler row indices that are currently enabled."""
         if "is_enabled" not in self.schedule:
             return np.arange(len(self.schedule["name_id"]), dtype=np.int32)
         return np.where(self.schedule["is_enabled"])[0].astype(np.int32)
 
     def get_active_pseudolabel_indices(self) -> np.ndarray:
-        """Return enabled pseudo-label row indices."""
         pseudo_mask = self.schedule["label_source"] == 1
         return np.where(self.schedule["is_enabled"] & pseudo_mask)[0].astype(np.int32)
 
     def count_active_pseudolabels(self) -> int:
-        """Return the number of enabled pseudo-label rows."""
         return int(len(self.get_active_pseudolabel_indices()))
 
     def _scheduled_coordinate_set(self, active_only: bool = True) -> set[tuple[str, int, int, int]]:
         schedule_indices = self.get_active_schedule_indices() if active_only else np.arange(len(self.schedule["name_id"]))
         return {
             (self.id_to_name[int(name_id)], int(z), int(y), int(x))
-            for name_id, (z, y, x) in zip(self.schedule["name_id"][schedule_indices], self.schedule["coords"][schedule_indices])
+            for name_id, (z, y, x) in zip(
+                self.schedule["name_id"][schedule_indices],
+                self.schedule["coords"][schedule_indices],
+            )
         }
 
     def _sample_random_candidate(self, forbidden_coords: set[tuple[str, int, int, int]], max_tries: int = 1024):
-        """
-            Sample one candidate lazily by first sampling a train slice uniformly
-            and then sampling a valid voxel uniformly within that slice.
-        """
         if len(self.slice_sampling_table) == 0:
             return None
-
         for _ in range(max_tries):
             name, z = self.rng.choice(self.slice_sampling_table)
             valid_positions = np.argwhere(self.labels[name][z] != self.ignore_lbl)
@@ -250,7 +278,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             y = int(y)
             x = int(x)
             Z, H, W = self.images[name].shape
-            if not self._is_valid_coord(name, z, y, x, Z, H, W):
+            if not self._is_valid_coord(name, int(z), y, x, Z, H, W):
                 continue
             coord = (name, int(z), y, x)
             if coord in forbidden_coords:
@@ -259,10 +287,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return None
 
     def _sample_candidate_batch(self, forbidden_coords: set[tuple[str, int, int, int]], batch_size: int):
-        """
-            Sample a batch of unique candidate coordinates without materializing
-            the full unscheduled voxel set in memory.
-        """
         coords_batch = []
         local_forbidden = set(forbidden_coords)
         for _ in range(batch_size):
@@ -273,8 +297,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             local_forbidden.add(candidate)
         return coords_batch
 
-    def _weighted_class_targets(self, total_items: int) -> dict[int, int]:
-        """Split a target number of pseudo-label admissions across classes."""
+    def _weighted_class_targets(self, total_items: int) -> Dict[int, int]:
         class_weights = {
             int(label): float(self.samples_per_class.get(int(label), self.default_samples_per_class))
             for label in self.unique_labels
@@ -294,15 +317,16 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         targets = {label: int(np.floor(raw_targets[label])) for label in class_weights}
         remainder = total_items - sum(targets.values())
         if remainder > 0:
-            ranked_labels = sorted(class_weights.keys(), key=lambda label: (raw_targets[label] - targets[label], -label), reverse=True)
+            ranked_labels = sorted(
+                class_weights.keys(),
+                key=lambda label: (raw_targets[label] - targets[label], -label),
+                reverse=True,
+            )
             for label in ranked_labels[:remainder]:
                 targets[label] += 1
         return targets
 
-    def build_candidate_batch(self, coords_batch: list[tuple[str, int, int, int]]) -> dict:
-        """
-            Materialize a coordinate list into tensors for pseudo-label evaluation.
-        """
+    def build_candidate_batch(self, coords_batch: List[Tuple[str, int, int, int]]) -> dict:
         patches = []
         gt_labels = []
         names = []
@@ -319,8 +343,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "name": names,
         }
 
-    def build_scheduler_batch(self, schedule_indices: list[int]) -> dict:
-        """Materialize existing scheduler rows into a batch for re-evaluation."""
+    def build_scheduler_batch(self, schedule_indices: List[int]) -> dict:
         patches = []
         gt_labels = []
         names = []
@@ -345,13 +368,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         }
 
     def add_pseudolabels_for_stage(self, stage_index: int, target_active_pseudolabels: int, evaluator, evaluation_batch_size: int) -> int:
-        """
-            Extend the scheduler until the active pseudo-label pool reaches the
-            requested target size.
-
-            The evaluator must accept a batch dict returned by
-            ``build_candidate_batch`` and return ``(predicted_labels, confidences)``.
-        """
         current_active_pseudolabels = self.count_active_pseudolabels()
         if target_active_pseudolabels <= current_active_pseudolabels:
             return 0
@@ -379,8 +395,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                 pred_label = int(pred_label)
                 if float(confidence) < self.confidence_threshold:
                     continue
-                if accepted_per_class.get(pred_label, 0) >= class_targets.get(pred_label, 0):
-                    continue
                 self._add_to_schedule(
                     name_id=self.name_to_id[name],
                     coords=(z, y, x),
@@ -401,8 +415,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                 accepted_this_round += 1
                 if self.count_active_pseudolabels() >= target_active_pseudolabels:
                     break
-                if all(accepted_per_class[label] >= class_targets[label] for label in class_targets):
-                    break
             no_progress_rounds = 0 if accepted_this_round > 0 else no_progress_rounds + 1
 
         self.stage_index = max(self.stage_index, int(stage_index))
@@ -419,10 +431,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         pruning_patience: int,
         enable_pruning: bool,
     ) -> int:
-        """
-            Re-evaluate active pseudo-labels and disable rows that repeatedly
-            fail the keep rule.
-        """
         pseudo_indices = self.get_active_pseudolabel_indices().tolist()
         if len(pseudo_indices) == 0:
             return 0
@@ -445,10 +453,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
                     continue
 
                 self.schedule["consecutive_keep_failures"][schedule_idx] += 1
-                if (
-                    enable_pruning
-                    and int(self.schedule["consecutive_keep_failures"][schedule_idx]) >= int(pruning_patience)
-                ):
+                if enable_pruning and int(self.schedule["consecutive_keep_failures"][schedule_idx]) >= int(pruning_patience):
                     self.schedule["is_enabled"][schedule_idx] = False
                     self.schedule["stage_disabled"][schedule_idx] = int(next_stage_idx)
                     disabled_count += 1
@@ -458,9 +463,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return disabled_count
 
     def save_scheduler_npz(self, path):
-        """
-            Save the staged scheduler to a simple ``.npz`` file.
-        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
@@ -477,16 +479,10 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             consecutive_keep_failures=self.schedule["consecutive_keep_failures"],
             last_predicted_label=self.schedule["last_predicted_label"],
             last_confidence=self.schedule["last_confidence"],
-            metadata=np.array(
-                [self.seed, self.stage_index, len(self.schedule["name_id"])],
-                dtype=np.int32,
-            ),
+            metadata=np.array([self.seed, self.stage_index, len(self.schedule["name_id"])], dtype=np.int32),
         )
 
     def load_scheduler_npz(self, path):
-        """
-            Load a staged scheduler from a ``.npz`` file.
-        """
         npz = np.load(path)
         for key in self.schedule:
             if key in npz:
@@ -500,7 +496,6 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self._bump_sampling_version()
 
     def _default_scheduler_field(self, key: str, n_rows: int) -> np.ndarray:
-        """Build default values for scheduler fields missing in older files."""
         if key == "is_enabled":
             return np.ones((n_rows,), dtype=np.bool_)
         if key == "stage_disabled":
@@ -514,13 +509,8 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         raise KeyError(f"Unsupported missing scheduler field: {key}")
 
     def patch_at(self, img_stack, z, y, x):
-        """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
         if self.dim == 2:
-            p = img_stack[
-                z,
-                y - self.offset : y + self.offset + 2,
-                x - self.offset : x + self.offset + 2,
-            ]
+            p = img_stack[z, y - self.offset : y + self.offset + 2, x - self.offset : x + self.offset + 2]
             return torch.from_numpy(p).unsqueeze(0)
         p = img_stack[
             z - self.offset : z + self.offset + 2,
@@ -530,7 +520,9 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return torch.from_numpy(p).unsqueeze(0)
 
     def _print_schedule_report(self):
-        """Print stage/source/class composition for the current scheduler."""
+        if len(self.schedule["name_id"]) == 0:
+            print("Empty scheduler.")
+            return
         sch = {k: v for k, v in self.schedule.items()}
         sch["z"] = self.schedule["coords"][:, 0]
         sch["y"] = self.schedule["coords"][:, 1]
@@ -540,16 +532,19 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         spd["name_id"] = spd["name_id"].apply(lambda x: self.id_to_name[x])
         spd["label_source"] = spd["label_source"].apply(lambda x: self.label_source_names.get(int(x), f"source_{x}"))
         spd["is_enabled"] = spd["is_enabled"].astype(bool)
-        print(spd.groupby(["stage_index", "label_source", "is_enabled", "name_id"])["current_label"].value_counts().unstack(fill_value=0))
+        print(
+            spd.groupby(["stage_index", "label_source", "is_enabled", "name_id"])["current_label"]
+            .value_counts()
+            .unstack(fill_value=0)
+        )
 
     def __getitem__(self, idx):
-        """Return one scheduled sample by its absolute scheduler index."""
         schedule_idx = int(self.get_active_schedule_indices()[idx])
         coords = self.schedule["coords"][schedule_idx]
         current_label = self.schedule["current_label"][schedule_idx]
         gt_label = self.schedule["gt_label"][schedule_idx]
         name_id = self.schedule["name_id"][schedule_idx]
-        name = self.id_to_name[name_id]
+        name = self.id_to_name[int(name_id)]
         patch = self.patch_at(self.images[name], coords[0], coords[1], coords[2])
         segmentation = self.patch_at(self.labels[name], coords[0], coords[1], coords[2])
         return {
@@ -566,19 +561,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         }
 
 
-
 class SemisupervisedDataset(Dataset):
-    """Dataset for anchor-centered supervised and semisupervised patch sampling.
-
-    The dataset is built from preselected ``z`` indices per volume. For each selected
-    slice, it samples a configurable number of anchor coordinates per class and, for
-    each anchor, tries to sample ``n_neighbors`` nearby valid coordinates inside the
-    current radius.
-
-    In ``supervised`` mode, ``__getitem__`` returns only the anchor patch and label.
-    In ``semisupervised`` mode, it returns the anchor followed by its neighbors.
-    """
-
     def __init__(
         self,
         images,
@@ -638,120 +621,112 @@ class SemisupervisedDataset(Dataset):
         self.ignore_lbl = ignore_lbl
         self.n_classes = n_classes
         self.unique_labels = np.array(range(n_classes))
+        self.unique_vals = self.unique_labels
         self.mode = mode
         self.indices_dict = indices_dict or {}
+        self.anchor_records = anchor_records or []
         self.radius = radius
         self.n_neighbors = n_neighbors
         self.seed = seed
         self.rng = random.Random(self.seed)
-        # Use per-class overrides when present; otherwise fall back to one anchor per class.
-        self.samples_per_class = samples_per_class or {1: 2}
-        self.default_samples_per_class: int = 1
+        self.samples_per_class = samples_per_class or {}
+        self.default_samples_per_class = 1
         self.dim = dim
         self.groups = self._prepare_metadata()
+        self._refresh_group_index_cache()
+        self._report_dataset_summary()
 
     def set_mode(self, mode: str):
-        """Switch between supervised and semisupervised modes."""
         if mode not in ("supervised", "semisupervised"):
             raise ValueError("stage must be 'supervised' or 'semisupervised'")
         self.mode = mode
+        self.groups = self._prepare_metadata()
+        self._refresh_group_index_cache()
 
     def set_radius(self, radius: int):
-        """Update the neighbor radius and recompute neighbor metadata if needed."""
         if self.radius != radius:
             self.radius = radius
             self.groups = self._modify_metadata()
+            self._refresh_group_index_cache()
 
     def increase_radius(self):
-        """Increase the radius for neighbor sampling."""
         self.radius += 1
         self.groups = self._modify_metadata()
+        self._refresh_group_index_cache()
 
-    def _is_valid_coord(self, name, z, y, x, Z, H, W):
-        """Return whether a coordinate can be used as an anchor/neighbor center."""
-        valid = (
-            self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
-        )
-
+    def _is_valid_coord(
+        self,
+        name,
+        z,
+        y,
+        x,
+        Z,
+        H,
+        W,
+        z_start: Optional[int] = None,
+        z_stop: Optional[int] = None,
+    ):
+        valid = self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         if self.dim == 3:
             valid = valid and (self.offset <= z < Z - self.offset - 1)
-
+        if z_start is not None and z_stop is not None:
+            valid = valid and (z_start <= z < z_stop)
         in_cell = self.labels[name][z, y, x] != self.ignore_lbl
-
-        # TODO: Implement mask consistency
-
         return valid and in_cell
 
     def __len__(self):
         return len(self.groups)
 
     def patch_at(self, img_stack, z, y, x):
-        """Extract a 2D or 3D patch centered at ``(z, y, x)`` with a channel dim."""
         if self.dim == 2:
-            p = img_stack[
-                z,
-                y - self.offset : y + self.offset + 2,
-                x - self.offset : x + self.offset + 2,
-            ]
-            return torch.from_numpy(p).unsqueeze(0)  # [1, H, W]
-        else:  # 3D
-            p = img_stack[
-                z - self.offset : z + self.offset + 2,
-                y - self.offset : y + self.offset + 2,
-                x - self.offset : x + self.offset + 2,
-            ]
-            return torch.from_numpy(p).unsqueeze(0)  # [1, Z, H, W]
+            p = img_stack[z, y - self.offset : y + self.offset + 2, x - self.offset : x + self.offset + 2]
+            return torch.from_numpy(p).unsqueeze(0)
+        p = img_stack[
+            z - self.offset : z + self.offset + 2,
+            y - self.offset : y + self.offset + 2,
+            x - self.offset : x + self.offset + 2,
+        ]
+        return torch.from_numpy(p).unsqueeze(0)
 
     def __getitem__(self, idx):
-        """Return one anchor group in the format expected by the training pipeline."""
         g = self.groups[idx]
-        name, z = g["name"], int(g["z"])
+        name = g["name"]
         img_vol = self.images[name]
         lbl_vol = self.labels[name]
 
         if self.mode == "supervised":
             cz, cy, cx = map(int, g["coords"][0])
-            # Keep a leading singleton group dimension so the collate output matches
-            # the semisupervised path: [group, channel, ...].
             patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)
             segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)
             return patch, label, segment, torch.tensor(g["coords"][0])
 
-        # The first coordinate is the anchor; the remaining entries are sampled neighbors.
         coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
-        patches = torch.stack(
-            [self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords]
-        )
-        labels = torch.tensor(
-            [g["labels"][0]] + [-1] * self.n_neighbors,
-            dtype=torch.long,
-        )
-        segments = torch.stack(
-            [self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords]
-        )
+        patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])
+        labels = torch.tensor([g["labels"][0]] + [-1] * self.n_neighbors, dtype=torch.long)
+        segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])
         return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
-        """Build anchor groups once from the configured per-volume slice indices."""
-        groups: List[dict] = []
+        if self.anchor_records:
+            return self._prepare_metadata_from_anchors()
+        return self._prepare_metadata_from_indices()
 
-        for name, z_list in self.indices_dict.items():
+    def _prepare_metadata_from_indices(self) -> List[dict]:
+        groups: List[dict] = []
+        for name, z_list in tqdm(self.indices_dict.items(), desc="Preparing supervised anchors from slice indices", leave=False):
             img = self.images[name]
             lbl = self.labels[name]
             Z, H, W = img.shape
-
             used_coords = set()
             for cz in z_list:
                 stack = lbl[cz]
-
                 for c in range(self.n_classes):
                     for cy, cx in self._sample_coords_for_class(stack, c):
                         if not self._is_valid_coord(name, cz, cy, cx, Z, H, W):
                             continue
                         if (cz, cy, cx) in used_coords:
                             continue
-                        
                         used_coords.add((int(cz), cy, cx))
                         neighbors = self._sample_neighbors(
                             name=name,
@@ -763,37 +738,81 @@ class SemisupervisedDataset(Dataset):
                             W=W,
                             used_coords=used_coords,
                             lbl=lbl,
-                            k=self.n_neighbors,  # Number of neighbors to sample
+                            k=self.n_neighbors,
                             max_tries=100,
                         )
+                        if self.mode == "supervised" or len(neighbors) == self.n_neighbors:
+                            groups.append(self._make_group_record(name=name, cz=cz, cy=cy, cx=cx, c=c, neighbors=neighbors))
+        self._report_class_counts(groups)
+        return groups
 
-                        if len(neighbors) == self.n_neighbors:
-                            groups.append(
-                                self._make_group_record(
-                                    name=name,
-                                    cz=cz,
-                                    cy=cy,
-                                    cx=cx,
-                                    c=c,
-                                    neighbors=neighbors,
-                                )
-                            )
+    def _prepare_metadata_from_anchors(self) -> List[dict]:
+        groups: List[dict] = []
+        for record in tqdm(self.anchor_records, desc="Preparing cached anchor groups", leave=False):
+            name = record["stack_name"]
+            cz = int(record["z"])
+            cy = int(record["y"])
+            cx = int(record["x"])
+            c = int(record["gt_label"])
+            z_start = int(record["z_start"])
+            z_stop = int(record["z_stop"])
 
+            img = self.images[name]
+            lbl = self.labels[name]
+            Z, H, W = img.shape
+            if not self._is_valid_coord(name, cz, cy, cx, Z, H, W, z_start=z_start, z_stop=z_stop):
+                continue
+
+            used_coords = {(cz, cy, cx)}
+            neighbors: List[Dict[str, int]] = []
+            if self.mode == "semisupervised":
+                neighbors = self._sample_neighbors(
+                    name=name,
+                    cz=cz,
+                    cy=cy,
+                    cx=cx,
+                    Z=Z,
+                    H=H,
+                    W=W,
+                    used_coords=used_coords,
+                    lbl=lbl,
+                    z_start=z_start,
+                    z_stop=z_stop,
+                    k=self.n_neighbors,
+                    max_tries=100,
+                )
+                if len(neighbors) != self.n_neighbors:
+                    continue
+
+            groups.append(
+                self._make_group_record(
+                    name=name,
+                    cz=cz,
+                    cy=cy,
+                    cx=cx,
+                    c=c,
+                    neighbors=neighbors,
+                    substack_id=int(record["substack_id"]),
+                    z_start=z_start,
+                    z_stop=z_stop,
+                    coord_id=int(record["coord_id"]),
+                )
+            )
         self._report_class_counts(groups)
         return groups
 
     def _modify_metadata(self) -> List[dict]:
-        """Refresh neighbors for existing anchors after a radius change."""
+        if self.anchor_records:
+            return self._modify_cached_anchor_metadata()
 
         for g in self.groups:
-            name, z = g["name"], int(g["z"])
+            name = g["name"]
+            z = int(g["z"])
             img = self.images[name]
             lbl = self.labels[name]
             Z, H, W = img.shape
-
             used_coords = set()
             _, cy, cx = g["coords"][0]
-
             used_coords.add((int(z), cy, cx))
             neighbors = self._sample_neighbors(
                 name=name,
@@ -808,41 +827,88 @@ class SemisupervisedDataset(Dataset):
                 k=self.n_neighbors,
                 max_tries=100,
             )
-
             if len(neighbors) == self.n_neighbors:
-
-                modified_group = self._make_group_record(
-                    name=name,
-                    cz=z,
-                    cy=cy,
-                    cx=cx,
-                    c=g["labels"][0],
-                    neighbors=neighbors,
-                )
+                modified_group = self._make_group_record(name=name, cz=z, cy=cy, cx=cx, c=g["labels"][0], neighbors=neighbors)
                 g["coords"] = modified_group["coords"]
                 g["labels"] = modified_group["labels"]
 
         self._report_class_counts(self.groups)
         return self.groups
 
-    def _sample_coords_for_class(
-        self, stack: np.ndarray, c: int
-    ) -> Iterable[Tuple[int, int]]:
-        """Sample anchor centers for one class from a single 2D label slice."""
+    def _modify_cached_anchor_metadata(self) -> List[dict]:
+        for g in self.groups:
+            name = g["name"]
+            cz, cy, cx = map(int, g["coords"][0])
+            z_start = g.get("z_start")
+            z_stop = g.get("z_stop")
+            img = self.images[name]
+            lbl = self.labels[name]
+            Z, H, W = img.shape
 
-        n_needed = getattr(self, "samples_per_class", {}).get(
-            c,
-            getattr(
-                self,
-                "default_samples_per_class",
-            ),
-        )
+            if self.mode == "supervised":
+                g["coords"] = [(cz, cy, cx)]
+                g["labels"] = [int(g["labels"][0])]
+                continue
 
+            current_neighbor_coords = [tuple(map(int, coord)) for coord in g["coords"][1:]]
+            current_neighbor_labels = [int(label) for label in g["labels"][1:]]
+            used_coords = {(cz, cy, cx), *current_neighbor_coords}
+            neighbors = self._sample_neighbors(
+                name=name,
+                cz=cz,
+                cy=cy,
+                cx=cx,
+                Z=Z,
+                H=H,
+                W=W,
+                used_coords=used_coords,
+                lbl=lbl,
+                z_start=z_start,
+                z_stop=z_stop,
+                k=self.n_neighbors,
+                max_tries=100,
+            )
+
+            if len(neighbors) == self.n_neighbors:
+                modified_group = self._make_group_record(
+                    name=name,
+                    cz=cz,
+                    cy=cy,
+                    cx=cx,
+                    c=int(g["labels"][0]),
+                    neighbors=neighbors,
+                    substack_id=g.get("substack_id"),
+                    z_start=z_start,
+                    z_stop=z_stop,
+                    coord_id=g.get("coord_id"),
+                )
+                g["coords"] = modified_group["coords"]
+                g["labels"] = modified_group["labels"]
+                continue
+            if len(neighbors) > 0:
+                new_neighbors = [
+                    (int(neighbor["z"]), int(neighbor["y"]), int(neighbor["x"]), int(neighbor["label"]))
+                    for neighbor in neighbors
+                ]
+                n_replace = min(len(new_neighbors), len(current_neighbor_coords))
+                kept_coords = current_neighbor_coords[n_replace:]
+                kept_labels = current_neighbor_labels[n_replace:]
+                updated_coords = kept_coords + [(z, y, x) for z, y, x, _ in new_neighbors[:n_replace]]
+                updated_labels = kept_labels + [label for _, _, _, label in new_neighbors[:n_replace]]
+                if len(updated_coords) == self.n_neighbors:
+                    g["coords"] = [(cz, cy, cx)] + updated_coords
+                    g["labels"] = [int(g["labels"][0])] + updated_labels
+
+        self._report_class_counts(self.groups)
+        return self.groups
+
+    def _sample_coords_for_class(self, stack: np.ndarray, c: int) -> Iterable[Tuple[int, int]]:
+        n_needed = self.samples_per_class.get(c, self.default_samples_per_class)
         label_coords = np.argwhere(stack == c)
-        if len(label_coords) < n_needed:
-            return []  # not enough to sample
-
-        idx = self.rng.sample(range(len(label_coords)), n_needed)
+        if len(label_coords) == 0 or n_needed <= 0:
+            return []
+        n_take = min(len(label_coords), n_needed)
+        idx = self.rng.sample(range(len(label_coords)), n_take)
         sampled = label_coords[idx]
         return [(int(y), int(x)) for (y, x) in sampled]
 
@@ -852,37 +918,34 @@ class SemisupervisedDataset(Dataset):
         cz: int,
         cy: int,
         cx: int,
-        Z:int,
+        Z: int,
         H: int,
         W: int,
         used_coords: set,
         lbl: np.ndarray,
+        z_start: Optional[int] = None,
+        z_stop: Optional[int] = None,
         k: int = 3,
         max_tries: int = 100,
     ) -> List[Dict[str, int]]:
-        """Randomly sample up to ``k`` valid nearby coordinates within ``self.radius``."""
         neighbors: List[Dict[str, int]] = []
         tries = 0
-
         while len(neighbors) < k and tries < max_tries:
             dz = self.rng.randint(-self.radius, self.radius) if self.dim == 3 else 0
             dy = self.rng.randint(-self.radius, self.radius)
             dx = self.rng.randint(-self.radius, self.radius)
-
-            # Reject offsets outside the radius and avoid resampling the anchor itself.
-            is_center = dx == 0 and dy == 0 and dz == 0
-            if dx * dx + dy * dy + dz * dz > self.radius * self.radius or is_center:
+            if dx * dx + dy * dy + dz * dz > self.radius * self.radius:
                 tries += 1
                 continue
-
+            if dx == 0 and dy == 0 and dz == 0:
+                tries += 1
+                continue
             nz, ny, nx = cz + dz, cy + dy, cx + dx
             coord = (nz, ny, nx)
-
             if coord in used_coords:
                 tries += 1
                 continue
-
-            if self._is_valid_coord(name, nz, ny, nx, Z, H, W):
+            if self._is_valid_coord(name, nz, ny, nx, Z, H, W, z_start=z_start, z_stop=z_stop):
                 used_coords.add(coord)
                 neighbors.append(
                     {
@@ -892,9 +955,7 @@ class SemisupervisedDataset(Dataset):
                         "label": int(lbl[nz, ny, nx].item()),
                     }
                 )
-
             tries += 1
-
         return neighbors
 
     def _make_group_record(
@@ -905,112 +966,108 @@ class SemisupervisedDataset(Dataset):
         cx: int,
         c: int,
         neighbors: List[Dict[str, int]],
+        substack_id: Optional[int] = None,
+        z_start: Optional[int] = None,
+        z_stop: Optional[int] = None,
+        coord_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Create the metadata record for one anchor plus its sampled neighbors."""
         return {
             "name": name,
             "z": int(cz),
             "coords": [(int(cz), int(cy), int(cx))] + [(n["z"], n["y"], n["x"]) for n in neighbors],
             "labels": [int(c)] + [n["label"] for n in neighbors],
+            "substack_id": substack_id,
+            "z_start": z_start,
+            "z_stop": z_stop,
+            "coord_id": coord_id,
         }
 
     def _report_class_counts(self, groups: List[dict]) -> None:
-        """Print class counts for anchors and neighbors to aid dataset inspection."""
         centers = [g["labels"][0] for g in groups]
         neighbors = [lab for g in groups for lab in g["labels"][1:]]
+        print(self._format_class_balance_table(centers, neighbors))
 
-        for title, labs in (("anchors", centers), ("neighbors", neighbors)):
-            counts = Counter(labs)
-            for k in sorted(counts):
-                print(f"  Class {k} ({title}): {counts[k]} samples")
+    def _refresh_group_index_cache(self) -> None:
+        self.n_label_per_class = {c: len([g for g in self.groups if g["labels"][0] == c]) for c in range(self.n_classes)}
+        self.anchor_indices_by_label = {c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c] for c in range(self.n_classes)}
 
+    def _report_dataset_summary(self) -> None:
+        anchor_mode = "cached anchors" if self.anchor_records else "sampled indices"
+        print(
+            f"Dataset ready | mode={self.mode} | dim={self.dim}D | groups={len(self.groups)} "
+            f"| neighbors={self.n_neighbors} | source={anchor_mode}"
+        )
+
+    def _format_class_balance_table(self, centers: List[int], neighbors: List[int]) -> str:
+        anchor_counts = Counter(centers)
+        neighbor_counts = Counter(neighbors)
+        all_labels = sorted(set(anchor_counts) | set(neighbor_counts) | set(range(self.n_classes)))
+        anchor_total = sum(anchor_counts.values())
+        neighbor_total = sum(neighbor_counts.values())
+        lines = ["Class balance:", f"{'label':>7} {'anchors':>10} {'anchor_%':>10} {'neighbors':>10} {'neighbor_%':>10}"]
+        for label in all_labels:
+            anchor_count = anchor_counts.get(label, 0)
+            neighbor_count = neighbor_counts.get(label, 0)
+            anchor_pct = 100.0 * anchor_count / anchor_total if anchor_total else 0.0
+            neighbor_pct = 100.0 * neighbor_count / neighbor_total if neighbor_total else 0.0
+            lines.append(
+                f"{label:>7} {anchor_count:>10} {anchor_pct:>9.2f}% {neighbor_count:>10} {neighbor_pct:>9.2f}%"
+            )
+        lines.append(
+            f"{'total':>7} {anchor_total:>10} {100.0 if anchor_total else 0.0:>9.2f}% "
+            f"{neighbor_total:>10} {100.0 if neighbor_total else 0.0:>9.2f}%"
+        )
+        return "\n".join(lines)
 
 
 class PredictionDataset(Dataset):
-    """
-        Yields 2D or 3D patches whose center has label != -1 and full patch is inside bounds.
-        It optionally mask the image to a specific z slice for faster testing.
-
-        image: (C,Z,H,W) or (Z,1,H,W)
-
-            Args: 
-                images: dict of np.ndarrays
-                    Key: image name, 
-                    Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
-                labels: dict of np.ndarrays
-                    Key: image name,
-                    Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
-                keys: List[str] (optional)
-                    List of image names to keep ordering (if None, use keys from images dict).
-                masks: Dict[str, Union[slice, None]] (optional)
-                    Key: image name,
-                    Value: If slice, only consider this z slice for patch extraction (for faster testing).
-                    Constraint on label > -1 still apply. If None, consider all slices.
-                patch_size: int
-                    Size of the extracted patches (assumed cubic or square).
-                dim: int
-                    2 or 3 for 2D or 3D patches.
-                ignore_lbl: int
-                    Label value to ignore when extracting patches.
-    """
-
-    def __init__(self,
-                 images, 
-                 labels,
-                 keys: List[str] = None,
-                 masks: Dict[str, Union[slice, None]] = None,
-                 patch_size=64, 
-                 dim=2,
-                 ignore_lbl=-1):
+    def __init__(
+        self,
+        images,
+        labels,
+        keys: List[str] = None,
+        masks: Dict[str, Union[slice, None]] = None,
+        patch_size=64,
+        dim=2,
+        ignore_lbl=-1,
+    ):
         self.dim = dim
         self.ignore_lbl = ignore_lbl
         self.images = images
-        self.labels = labels        
+        self.labels = labels
         self.masks = masks
 
         self.ps = int(patch_size)
         assert self.ps % 2 == 0, "Patch size must be even; center is (ps/2-1, ps/2-1)."
-        self.half = self.ps // 2  # 32 for 64x64 -> center at (31,31)
-       
+        self.half = self.ps // 2
+
         self.images = self._fix_images_shape(self.images)
         self.labels = self._fix_images_shape(self.labels)
         self.masks = self._fix_mask_shape(self.masks)
-
-        # Precompute all valid centers for all images
         self.centers = []
 
         for k in (self.images.keys() if keys is None else keys):
             centers = self._get_valid_centers(
                 mask=self.masks.get(k, None) if self.masks is not None else None,
-                label=self.labels[k]
+                label=self.labels[k],
             )
             for c in centers:
-                self.centers.append((k, c[0], c[1], c[2]))  # (key, z, y, x)
+                self.centers.append((k, c[0], c[1], c[2]))
 
     def _get_valid_centers(self, mask, label):
-        """
-            Get the valid centers for each image based on the mask and label.
-            A valid center is one where:
-                - label != ignore_lbl
-                - full patch is inside bounds
-                - mask is True (if provided)
-        """
-        final_mask = (label != self.ignore_lbl)
+        final_mask = label != self.ignore_lbl
         C, Z, H, W = label.shape
-        # full patch inside bounds
-        final_mask[:, :, :, :self.half] = False
-        final_mask[:, :, :, W - self.half:] = False
-        final_mask[:, :, :self.half, :] = False
-        final_mask[:, :, H - self.half:, :] = False
+        final_mask[:, :, :, : self.half] = False
+        final_mask[:, :, :, W - self.half :] = False
+        final_mask[:, :, : self.half, :] = False
+        final_mask[:, :, H - self.half :, :] = False
         if self.dim == 3 and Z > self.half:
-            final_mask[:, :self.half, :, :] = False
-            final_mask[:, Z - self.half:, :, :] = False
-
+            final_mask[:, : self.half, :, :] = False
+            final_mask[:, Z - self.half :, :, :] = False
         if mask is not None:
             mask_array = np.zeros_like(final_mask, dtype=bool)
             mask_array[mask] = True
             final_mask = final_mask & mask_array
-
         _, zs, ys, xs = np.where(final_mask)
         centers = np.stack([zs, ys, xs], axis=1).astype(np.int32)
         return centers
@@ -1018,49 +1075,34 @@ class PredictionDataset(Dataset):
     def _fix_images_shape(self, images: dict) -> dict:
         for key, image in images.items():
             if image.ndim == 3:
-                images[key] = image[None, ...]  # add channel dim
+                images[key] = image[None, ...]
         return images
 
     def _fix_mask_shape(self, masks: dict) -> dict:
         if masks is not None:
             for key, mask in masks.items():
                 if mask is not None and len(mask) == 3:
-                    masks[key] = (slice(None),) + mask  # add channel dim
+                    masks[key] = (slice(None),) + mask
         return masks
-    
+
     def __len__(self):
         return len(self.centers)
 
-
     def __getitem__(self, idx):
-        """
-            Returns a tuple:
-            patch, center_label, coordinates of center and segment for compatibility with SemisupervisedDataset.
-        """
-        
         key, z, y, x = self.centers[idx]
-
         if self.dim == 3:
             z0, z1 = z - self.half, z + self.half
         else:
             z0, z1 = z, z + 1
-
         y0, y1 = y - self.half, y + self.half
         x0, x1 = x - self.half, x + self.half
         patch = self.images[key][:, z0:z1, y0:y1, x0:x1]
         patch = torch.from_numpy(patch).float()
-
         segment = self.labels[key][:, z0:z1, y0:y1, x0:x1]
         segment = torch.from_numpy(segment).long()
-
-
         center_label = torch.tensor(self.labels[key][:, z, y, x]).long()
-        # Drop channel dim to get [B, D, H, W] in the DataLoader batches.
-        # TODO: For multichannel this will return different shapes!
         if self.dim == 2:
-            patch = patch.squeeze(-3)  # Return [H, W] to get [B, 1, H, W] in DataLoader (?)
+            patch = patch.squeeze(-3)
             segment = segment.squeeze(-3)
-
-        # return {"patch": patch, "z": int(z), "y": int(y), "x": int(x), "center_label": center_label}
         coords = torch.stack([torch.tensor(z), torch.tensor(y), torch.tensor(x)])
         return patch, center_label, segment, coords, key
