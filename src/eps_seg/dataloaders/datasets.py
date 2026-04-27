@@ -577,6 +577,7 @@ class SemisupervisedDataset(Dataset):
         seed=42,
         n_neighbors=7,
         samples_per_class: Dict[int, int] | None = None,
+        anchor_records: Optional[List[Dict[str, int]]] = None,
     ):
         """
         
