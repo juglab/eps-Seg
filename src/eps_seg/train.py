@@ -109,6 +109,7 @@ def train_one_stage(
     scheduler_path: Path,
     weights_checkpoint_path: str | None = None,
     training_state_checkpoint_path: str | None = None,
+    force_full_gt_labels: bool = False,
 ) -> tuple[Path, Path]:
     """
         Train exactly one stage and save stage-specific ``best`` and ``last``
@@ -129,6 +130,8 @@ def train_one_stage(
                 ``(best_checkpoint_path, last_checkpoint_path)`` for this stage.
     """
     train_cfg, dataset_cfg, model_cfg = exp_config.get_configs()
+    if force_full_gt_labels and not train_cfg.train_fully_supervised:
+        train_cfg = train_cfg.model_copy(update={"train_fully_supervised": True})
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
     seed = train_cfg.supervised_seed if mode == "supervised" else train_cfg.semisupervised_seed
     if seed is not None:
@@ -406,6 +409,9 @@ def run_fully_supervised_upper_bound(exp_config: ExperimentConfig):
         This produces an upper-bound run for each available scheduler stage
         using the same selected coordinates but training on ground-truth
         labels for all scheduled samples.
+
+        Each supervised stage trains from scratch and only reuses the
+        corresponding scheduler as the dataset definition.
     """
     train_cfg, _, _ = exp_config.get_configs()
     available_stages = []
@@ -421,40 +427,77 @@ def run_fully_supervised_upper_bound(exp_config: ExperimentConfig):
     completed_stage = latest_completed_stage(exp_config, "supervised") if train_cfg.auto_resume else -1
     start_stage = completed_stage + 1
     for stage_idx in available_stages[start_stage:]:
-        if stage_idx == 0:
-            weights_checkpoint_path = None
-            training_state_checkpoint_path = None
-        else:
-            weights_checkpoint_path = str(exp_config.stage_checkpoint_path("supervised", stage_idx - 1, "best"))
-            training_state_checkpoint_path = str(exp_config.stage_checkpoint_path("supervised", stage_idx - 1, "best"))
-
         train_one_stage(
             exp_config=exp_config,
             mode="supervised",
             stage_idx=stage_idx,
             scheduler_path=exp_config.stage_scheduler_path(stage_idx),
-            weights_checkpoint_path=weights_checkpoint_path,
-            training_state_checkpoint_path=training_state_checkpoint_path,
+            weights_checkpoint_path=None,
+            training_state_checkpoint_path=None,
+            force_full_gt_labels=True,
         )
 
 
-def train(exp_config: ExperimentConfig):
+def run_fully_supervised_stage(exp_config: ExperimentConfig, stage_idx: int):
+    """
+        Train exactly one scheduler stage in fully supervised mode.
+
+        Unlike the sequential replay helper, this path is intended for job
+        arrays and stage-level parallelism. Each stage trains from scratch and
+        only reuses the corresponding scheduler as the dataset definition, so
+        all supervised jobs are independent from one another.
+    """
+    train_cfg, _, _ = exp_config.get_configs()
+    if stage_idx < 0 or stage_idx > train_cfg.max_extensions:
+        raise ValueError(
+            f"Requested fully supervised stage K{stage_idx}, but max_extensions={train_cfg.max_extensions}."
+        )
+
+    scheduler_path = exp_config.stage_scheduler_path(stage_idx)
+    if not scheduler_path.exists():
+        raise FileNotFoundError(
+            f"Scheduler for fully supervised stage K{stage_idx} not found: {scheduler_path}. "
+            "Run semisupervised training for that stage first."
+        )
+
+    supervised_best_path = exp_config.stage_checkpoint_path("supervised", stage_idx, "best")
+    supervised_last_path = exp_config.stage_checkpoint_path("supervised", stage_idx, "last")
+    if train_cfg.auto_resume and supervised_best_path.exists() and supervised_last_path.exists():
+        print(
+            f"Skipping fully supervised stage K{stage_idx} because both outputs already exist: "
+            f"{supervised_best_path} | {supervised_last_path}"
+        )
+        return
+
+    train_one_stage(
+        exp_config=exp_config,
+        mode="supervised",
+        stage_idx=stage_idx,
+        scheduler_path=scheduler_path,
+        weights_checkpoint_path=None,
+        training_state_checkpoint_path=None,
+        force_full_gt_labels=True,
+    )
+
+
+def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = None):
     """
         Main training method for the staged workflow.
 
         The same entrypoint is used for:
 
         - semisupervised staged training
-        - supervised upper-bound staged training
+        - one-stage fully supervised replay
 
-        The ``train_fully_supervised`` config flag selects which staged loop is
-        active. The ``skip_*`` flags are mainly useful for debugging.
+        By default the entrypoint runs semisupervised staged training.
+        Passing ``fully_supervised_stage`` switches to a single-stage fully
+        supervised replay job that reuses the saved scheduler and the
+        corresponding semisupervised best checkpoint for that stage.
     """
-    train_cfg, _, _ = exp_config.get_configs()
-    if not train_cfg.train_fully_supervised:
+    if fully_supervised_stage is None:
         run_semisupervised_staged_training(exp_config)
     else:
-        run_fully_supervised_upper_bound(exp_config)
+        run_fully_supervised_stage(exp_config, fully_supervised_stage)
 
 
 def main():
@@ -462,13 +505,22 @@ def main():
     parser = argparse.ArgumentParser(description="Train EPS-Seg Model")
     parser.add_argument("--exp_config", type=str, required=True, help="Path to experiment configuration YAML file")
     parser.add_argument("--env_file", type=str, default=".env", help="Path to .env file with environment variables")
+    parser.add_argument(
+        "--fully_supervised_stage",
+        type=int,
+        default=None,
+        help=(
+            "If set, train only the requested scheduler stage in fully supervised mode. "
+            "This expects the stage scheduler and semisupervised best checkpoint to already exist."
+        ),
+    )
     
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
     print("Loading environment variables from:", args.env_file)
     load_dotenv(args.env_file)
     exp_config = ExperimentConfig.from_yaml(args.exp_config)
-    train(exp_config)
+    train(exp_config, fully_supervised_stage=args.fully_supervised_stage)
 
 
 if __name__ == "__main__":
