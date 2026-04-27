@@ -2,15 +2,16 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
-
-def _get_model_checkpoint_callback(module, monitor: str = "val/CE_epoch"):
+def _get_model_checkpoint_callback(module, monitor: str | None = None):
+    monitor = monitor or getattr(getattr(module, "train_cfg", None), "monitored_metric", "val/dice_score_mean")
     for callback in module.trainer.callbacks:
         if isinstance(callback, ModelCheckpoint) and callback.monitor == monitor:
             return callback
     return None
 
 
-def _get_early_stopping_callback(module, monitor: str = "val/CE_epoch"):
+def _get_early_stopping_callback(module, monitor: str | None = None):
+    monitor = monitor or getattr(getattr(module, "train_cfg", None), "monitored_metric", "val/dice_score_mean")
     for callback in module.trainer.callbacks:
         if isinstance(callback, EarlyStopping) and callback.monitor == monitor:
             return callback
@@ -114,14 +115,10 @@ def log_trainer_state(module):
         best_score = checkpoint_callback.best_model_score
         if hasattr(best_score, "item"):
             best_score = float(best_score.item())
-        module.log("trainer/best_val_CE_epoch", float(best_score), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        module.log("trainer/best_monitored_score", float(best_score), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
 
 
 def log_epoch_dice_scores(module, split: str, dice_metric, mean_prog_bar: bool):
-    if not module.trainer.is_global_zero:
-        dice_metric.reset()
-        return
-
     dice_per_class = dice_metric.compute()
     for class_idx, dice_score in enumerate(dice_per_class):
         module.log(f"{split}/dice_score_class_{class_idx}", dice_score, prog_bar=False, sync_dist=False)

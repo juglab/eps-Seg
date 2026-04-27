@@ -27,6 +27,8 @@ class TrainConfig(BaseEPSConfig):
     alpha: float = Field(default=1.0, description="Weight for the inpainting loss")
     beta: float = Field(default=1e-2, description="Weight for the KLD loss")
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
+    monitored_metric: str = Field(default="val/dice_score_mean",description="Validation metric used for model checkpointing, early stopping, and staged best-score carry-over.",)
+    monitored_metric_mode: Literal["min", "max"] = Field(default="max", description="Optimization direction for the monitored metric. Use 'max' for scores such as Dice and 'min' for losses such as CE.",)
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
     log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
@@ -50,6 +52,8 @@ class TrainConfig(BaseEPSConfig):
 
     @model_validator(mode="after")
     def validate_staged_training(self):
+        if not self.monitored_metric:
+            raise ValueError("monitored_metric must be a non-empty string.")
         if not 0.0 <= self.min_initial_label_fraction <= 1.0:
             raise ValueError("min_initial_label_fraction must be between 0 and 1.")
         if self.pseudolabel_confidence_threshold < 0.0 or self.pseudolabel_confidence_threshold > 1.0:

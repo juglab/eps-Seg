@@ -165,10 +165,10 @@ def train_one_stage(
         shutil.copy2(previous_best_path, best_ckpt_path)
 
     best_checkpoint = ModelCheckpoint(
-        monitor="val/CE_epoch",
+        monitor=train_cfg.monitored_metric,
         dirpath=best_ckpt_path.parent,
         filename=best_ckpt_path.stem,
-        mode="min",
+        mode=train_cfg.monitored_metric_mode,
         save_top_k=1,
         save_last=False,
     )
@@ -176,9 +176,9 @@ def train_one_stage(
     callbacks = [
         best_checkpoint,
         EarlyStopping(
-            monitor="val/CE_epoch",
+            monitor=train_cfg.monitored_metric,
             patience=train_cfg.early_stopping_patience,
-            mode="min",
+            mode=train_cfg.monitored_metric_mode,
             check_on_train_epoch_end=False,
         ),
         LearningRateMonitor(logging_interval="epoch"),
@@ -202,8 +202,8 @@ def train_one_stage(
             StageMetricCarryoverCallback(
                 reference_checkpoint_path=str(weights_checkpoint_path),
                 carried_best_path=str(best_ckpt_path),
-                monitor="val/CE_epoch",
-                mode="min",
+                monitor=train_cfg.monitored_metric,
+                mode=train_cfg.monitored_metric_mode,
             )
         )
 
