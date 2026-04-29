@@ -124,7 +124,4 @@ def log_epoch_dice_scores(module, split: str, dice_metric, mean_prog_bar: bool):
         module.log(f"{split}/dice_score_class_{class_idx}", dice_score, prog_bar=False, sync_dist=False)
     dice_mean = dice_per_class.mean()
     module.log(f"{split}/dice_score_mean", dice_mean, prog_bar=mean_prog_bar, sync_dist=False)
-    if split == "val":
-        module.best_val_dice_score_mean = max(module.best_val_dice_score_mean, float(dice_mean))
-        module.log("trainer/best_val_dice_score_mean", module.best_val_dice_score_mean, prog_bar=False, sync_dist=False)
     dice_metric.reset()

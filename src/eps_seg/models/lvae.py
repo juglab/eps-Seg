@@ -55,7 +55,6 @@ class LVAEModel(L.LightningModule):
         )
         self.current_true_epoch = 0
         self.current_stage_idx = -1
-        self.best_val_dice_score_mean = float("-inf")
 
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
