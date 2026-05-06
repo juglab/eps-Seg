@@ -75,6 +75,10 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         1,
         description="Depth of contiguous z-substacks used as fold units. 1 corresponds to slice-wise folding.",
     )
+    initial_label_sampling: Optional[Literal["from_csv", "class_balanced_slice", "class_balanced_substack"]] = Field(
+        None,
+        description="Optional strategy used to build the canonical labelled universe when creating a fresh cache.",
+    )
     load_train_coords_from: Optional[str] = Field(
         None,
         description="Optional CSV file with externally sampled train coordinates. Used only when creating a fresh cache in 1-fold mode.",

@@ -117,7 +117,7 @@ class LVAEModel(L.LightningModule):
             x,
             y,
             validation_mode=False,
-            confidence_threshold=self.train_cfg.pseudolabel_confidence_threshold,
+            confidence_threshold=self.train_cfg.model_confidence_threshold,
         )
         outputs["loss"] = self.compute_total_loss(outputs)
 
@@ -139,7 +139,7 @@ class LVAEModel(L.LightningModule):
         outputs = self.forward(x, 
                              y, 
                              validation_mode=True, 
-                             confidence_threshold=self.train_cfg.pseudolabel_confidence_threshold,
+                             confidence_threshold=self.train_cfg.model_confidence_threshold,
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
 
@@ -218,7 +218,7 @@ class LVAEModel(L.LightningModule):
                     x,
                     y=None,
                     validation_mode=False,
-                    confidence_threshold=self.train_cfg.pseudolabel_confidence_threshold,
+                    confidence_threshold=self.train_cfg.model_confidence_threshold,
                 )
             probs = outputs["class_probabilities"]
             confidences, predicted_labels = probs.max(dim=-1)

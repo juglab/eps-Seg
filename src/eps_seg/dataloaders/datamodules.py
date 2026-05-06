@@ -40,7 +40,7 @@ class EPSSegDataModule(L.LightningDataModule):
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
         self.scheduler_stage_index = scheduler_stage_index
         self.cache_dir = cfg.get_cache_folder()
-        self.cache = DatasetCache(cfg)
+        self.cache = DatasetCache(cfg, train_cfg=train_cfg)
 
         self.data: Dict[str, object] = {}
 
@@ -53,17 +53,16 @@ class EPSSegDataModule(L.LightningDataModule):
         """
         Prepare data for training, validation, testing, and prediction.
         """
-        if self.cfg.enable_cache:
-            try:
-                print(f"[DataModule] Checking cache at {self.cache_dir}...")
-                self.cache.check_cache_dir()
-                print("[DataModule] Cache is valid. Reusing cached fold data.")
-            except Exception:
-                print("[DataModule] Cache is missing or incomplete. Building fold cache...")
-                self.cache.build_cache()
-                print("[DataModule] Cache build complete.")
-        else:
-            print("[DataModule] Caching is disabled. Loading original data directly.")
+        if not self.cfg.enable_cache:
+            print("[DataModule] Training cache is mandatory. Ignoring enable_cache=false and using cache-v2.")
+        try:
+            print(f"[DataModule] Checking cache at {self.cache_dir}...")
+            self.cache.check_cache_dir()
+            print("[DataModule] Cache is valid. Reusing cached fold data.")
+        except Exception:
+            print("[DataModule] Cache is missing or incomplete. Building fold cache...")
+            self.cache.build_cache()
+            print("[DataModule] Cache build complete.")
 
     def get_data_statistics(self) -> Tuple[float, float]:
         return self.data["data_mean"], self.data["data_std"]
@@ -127,10 +126,7 @@ class EPSSegDataModule(L.LightningDataModule):
         print(f"[DataModule] Setting up stage='{stage}' for fold {self.cfg.fold}/{self.cfg.max_folds - 1}...")
 
         if stage in ["fit", "validate"]:
-            if self.cfg.enable_cache:
-                data = self._load_cached_dataset_splits(split="trainval")
-            else:
-                data = self._load_original_dataset_split(split="trainval")
+            data = self._load_cached_dataset_splits(split="trainval")
         else:
             data = self._load_original_dataset_split(split=stage)
         self.data.update(data)
@@ -157,7 +153,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 train_substacks=self.data["train_substacks"],
                 scheduler_path=self.scheduler_path,
                 stage_index=self.scheduler_stage_index,
-                confidence_threshold=self.train_cfg.pseudolabel_confidence_threshold,
+                train_cfg=self.train_cfg,
             )
         if stage in ["fit", "validate"]:
             self.val_dataset = SemisupervisedDataset(

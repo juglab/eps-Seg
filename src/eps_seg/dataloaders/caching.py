@@ -10,6 +10,10 @@ from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 
 from eps_seg.config.datasets import BaseEPSDatasetConfig
+from eps_seg.config.train import InitialLabelSamplingConfig, TrainConfig
+from eps_seg.data.factory import build_initial_label_sampling_strategy
+from eps_seg.data.initial_label_sampling import InitialLabelSamplingContext
+from eps_seg.data.schedule import DataSchedule
 
 
 class DatasetCache:
@@ -18,11 +22,12 @@ class DatasetCache:
     payload loading for EPS-Seg datasets.
 
     The datamodule uses this class to keep cache-related file handling and fold
-    materialization separate from Lightning orchestration.
+    instantiation separate from Lightning orchestration.
     """
 
-    def __init__(self, cfg: BaseEPSDatasetConfig):
+    def __init__(self, cfg: BaseEPSDatasetConfig, train_cfg: Optional[TrainConfig] = None):
         self.cfg = cfg
+        self.train_cfg = train_cfg
         self.cache_dir = cfg.get_cache_folder()
         self.cache_paths = {
             "manifest": self.cache_dir / "manifest.yaml",
@@ -31,6 +36,18 @@ class DatasetCache:
             "fold_assignments": self.cache_dir / "fold_assignments.csv",
             "fold_stats": self.cache_dir / "fold_stats.csv",
         }
+
+    def effective_initial_label_sampling_name(self) -> str:
+        """
+        Return the effective initial-label sampling strategy used to build canonical coordinates.
+        """
+        if self.cfg.load_train_coords_from and self.cfg.load_val_coords_from:
+            return "from_csv"
+        if self.train_cfg is not None and self.train_cfg.initial_label_sampling is not None:
+            return self.train_cfg.initial_label_sampling.name
+        if getattr(self.cfg, "initial_label_sampling", None) is not None:
+            return self.cfg.initial_label_sampling
+        return "class_balanced_substack"
 
     def fold_dir(self, fold: int) -> Path:
         return self.cache_dir / f"fold_{fold}"
@@ -72,6 +89,18 @@ class DatasetCache:
                     f"{manifest.get(key)} != {expected_manifest.get(key)}."
                 )
 
+        if "initial_label_sampling_name" in manifest:
+            if manifest.get("initial_label_sampling_name") != expected_manifest.get("initial_label_sampling_name"):
+                raise ValueError(
+                    "Cache manifest mismatch for 'initial_label_sampling_name': "
+                    f"{manifest.get('initial_label_sampling_name')} != {expected_manifest.get('initial_label_sampling_name')}."
+                )
+        elif self.cfg.substacking > 1 and not (self.cfg.load_train_coords_from and self.cfg.load_val_coords_from):
+            raise ValueError(
+                "Legacy cache detected for substacking>1 without an initial_label_sampling_name manifest entry. "
+                "Please rebuild the cache so canonical coordinates match the current stage-0 sampling semantics."
+            )
+
         for fold in range(self.cfg.max_folds):
             for key in self.cfg.train_keys:
                 if not self.fold_normalized_path(fold, key).exists():
@@ -103,6 +132,7 @@ class DatasetCache:
             "samples_per_class": dict(self.cfg.samples_per_class or {}),
             "load_train_coords_from": self.cfg.load_train_coords_from,
             "load_val_coords_from": self.cfg.load_val_coords_from,
+            "initial_label_sampling_name": self.effective_initial_label_sampling_name(),
         }
 
     def read_manifest(self) -> dict:
@@ -268,33 +298,51 @@ class DatasetCache:
         Sample canonical GT anchors once within each substack, before any fold
         assignment takes place.
         """
-        rng = random.Random(self.cfg.seed)
-        records: List[dict] = []
-        next_coord_id = 0
+        strategy = build_initial_label_sampling_strategy(
+            cfg=InitialLabelSamplingConfig(name=self.effective_initial_label_sampling_name()),
+            has_anchor_records=False,
+            has_train_substacks=bool(substacks),
+        )
+        name_to_id = {name: idx for idx, name in enumerate(labels.keys())}
+        id_to_name = {idx: name for name, idx in name_to_id.items()}
+        context = InitialLabelSamplingContext(
+            images=labels,
+            labels=labels,
+            anchor_records=[],
+            train_substacks=substacks,
+            samples_per_class=dict(self.cfg.samples_per_class or {}),
+            unique_labels=np.array(range(self.cfg.n_classes)),
+            default_samples_per_class=1,
+            ignore_lbl=-1,
+            patch_size=self.cfg.patch_size,
+            label_size=1,
+            dim=self.cfg.dim,
+            name_to_id=name_to_id,
+        )
+        schedule = DataSchedule.empty(seed=self.cfg.seed, stage_index=0)
+        strategy.populate_schedule(schedule=schedule, context=context, rng=random.Random(self.cfg.seed))
 
-        for substack in tqdm(substacks, desc="Sampling canonical anchors", leave=False):
-            key = substack["stack_name"]
-            z_start = substack["z_start"]
-            z_stop = substack["z_stop"]
-            for z in range(z_start, z_stop):
-                stack = labels[key][z]
-                for class_idx in range(self.cfg.n_classes):
-                    sampled_coords = self.sample_coords_for_class(stack, class_idx, rng)
-                    for y, x in sampled_coords:
-                        if not self.is_valid_anchor_coord(labels, key, z, y, x):
-                            continue
-                        records.append(
-                            {
-                                "coord_id": next_coord_id,
-                                "stack_name": key,
-                                "z": int(z),
-                                "y": int(y),
-                                "x": int(x),
-                                "gt_label": int(labels[key][z, y, x]),
-                                "substack_id": int(substack["substack_id"]),
-                            }
-                        )
-                        next_coord_id += 1
+        substack_by_coord: Dict[Tuple[str, int], int] = {}
+        for substack in substacks:
+            for z in range(int(substack["z_start"]), int(substack["z_stop"])):
+                substack_by_coord[(substack["stack_name"], int(z))] = int(substack["substack_id"])
+
+        records: List[dict] = []
+        for coord_id, (name_id, (z, y, x), gt_label) in enumerate(
+            zip(schedule["name_id"], schedule["coords"], schedule["gt_label"])
+        ):
+            stack_name = id_to_name[int(name_id)]
+            records.append(
+                {
+                    "coord_id": int(coord_id),
+                    "stack_name": stack_name,
+                    "z": int(z),
+                    "y": int(y),
+                    "x": int(x),
+                    "gt_label": int(gt_label),
+                    "substack_id": int(substack_by_coord[(stack_name, int(z))]),
+                }
+            )
         return records
 
     def read_external_coords_csv(

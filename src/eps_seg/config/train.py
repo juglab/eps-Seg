@@ -1,9 +1,128 @@
-from typing import Any, Dict, Optional, Union, Literal
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional, Union
+
 from pydantic import Field, model_validator
+
 from eps_seg.config.base import BaseEPSConfig
 from eps_seg.config.datasets import BaseEPSDatasetConfig
 from eps_seg.config.models import BaseEPSModelConfig, LVAEConfig
-from pathlib import Path
+
+
+class CandidateSamplingConfig(BaseEPSConfig):
+    """Configuration for candidate voxel sampling during scheduler extension.
+
+    Args:
+        name: Name of the candidate sampling strategy.
+
+    Returns:
+        CandidateSamplingConfig: Validated candidate sampling configuration.
+    """
+
+    name: Literal["uniform_train_region", "class_weighted_train_region"] = Field(
+        default="uniform_train_region",
+        description="Candidate voxel sampling strategy used during staged scheduler extension.",
+    )
+
+
+class PseudolabelAdmissionConfig(BaseEPSConfig):
+    """Configuration for pseudo-label admission into the staged scheduler.
+
+    Args:
+        name: Name of the admission policy.
+        confidence_min: Minimum confidence required to admit a candidate.
+        confidence_max: Maximum confidence allowed to admit a candidate.
+
+    Returns:
+        PseudolabelAdmissionConfig: Validated pseudo-label admission configuration.
+    """
+
+    name: Literal["confidence_threshold"] = Field(
+        default="confidence_threshold",
+        description="Policy used to admit evaluated pseudo-label candidates into the scheduler.",
+    )
+    confidence_min: float = Field(
+        default=0.75,
+        description="Minimum confidence required to accept a newly sampled pseudo-label.",
+    )
+    confidence_max: float = Field(
+        default=1.0,
+        description="Maximum confidence allowed to accept a newly sampled pseudo-label.",
+    )
+
+    @model_validator(mode="after")
+    def validate_confidence_window(self) -> "PseudolabelAdmissionConfig":
+        """Validate the configured confidence window.
+
+        Args:
+            None
+
+        Returns:
+            PseudolabelAdmissionConfig: The validated configuration.
+        """
+
+        if not 0.0 <= self.confidence_min <= 1.0:
+            raise ValueError("pseudolabel_admission.confidence_min must be between 0 and 1.")
+        if not 0.0 <= self.confidence_max <= 1.0:
+            raise ValueError("pseudolabel_admission.confidence_max must be between 0 and 1.")
+        if self.confidence_min > self.confidence_max:
+            raise ValueError("pseudolabel_admission.confidence_min must be <= confidence_max.")
+        return self
+
+
+class PseudolabelMaintenanceConfig(BaseEPSConfig):
+    """Configuration for pseudo-label reevaluation and pruning.
+
+    Args:
+        name: Name of the maintenance policy.
+        enable_pruning: Whether failed pseudo-labels should be disabled.
+        pruning_patience: Number of failed reevaluations tolerated before disabling a row.
+
+    Returns:
+        PseudolabelMaintenanceConfig: Validated pseudo-label maintenance configuration.
+    """
+
+    name: Literal["pruning"] = Field(
+        default="pruning",
+        description="Policy used to reevaluate and optionally disable active pseudo-labels between stages.",
+    )
+    enable_pruning: bool = Field(
+        default=False,
+        description="Whether to disable active pseudo-labels that repeatedly fail re-evaluation at stage transitions.",
+    )
+    pruning_patience: int = Field(
+        default=1,
+        description="Number of consecutive failed stage re-evaluations before a pseudo-label is disabled.",
+    )
+
+    @model_validator(mode="after")
+    def validate_pruning(self) -> "PseudolabelMaintenanceConfig":
+        """Validate the configured pruning options.
+
+        Args:
+            None
+
+        Returns:
+            PseudolabelMaintenanceConfig: The validated configuration.
+        """
+
+        if self.pruning_patience < 1:
+            raise ValueError("pseudolabel_maintenance.pruning_patience must be >= 1.")
+        return self
+
+
+class InitialLabelSamplingConfig(BaseEPSConfig):
+    """Configuration for stage-0 initial labelled voxel selection.
+
+    Args:
+        name: Name of the initial label sampling strategy.
+
+    Returns:
+        InitialLabelSamplingConfig: Validated initial label sampling configuration.
+    """
+
+    name: Literal["from_csv", "class_balanced_slice", "class_balanced_substack"] = Field(
+        description="Strategy used to construct the initial labelled scheduler at stage K0.",
+    )
 
 
 class TrainConfig(BaseEPSConfig):
@@ -27,47 +146,109 @@ class TrainConfig(BaseEPSConfig):
     alpha: float = Field(default=1.0, description="Weight for the inpainting loss")
     beta: float = Field(default=1e-2, description="Weight for the KLD loss")
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
-    monitored_metric: str = Field(default="val/CE_epoch",description="Validation metric used for model checkpointing, early stopping, and staged best-score carry-over.",)
-    monitored_metric_mode: Literal["min", "max"] = Field(default="min", description="Optimization direction for the monitored metric. Use 'max' for scores such as Dice and 'min' for losses such as CE.",)
+    monitored_metric: str = Field(default="val/CE_epoch", description="Validation metric used for model checkpointing, early stopping, and staged best-score carry-over.")
+    monitored_metric_mode: Literal["min", "max"] = Field(default="min", description="Optimization direction for the monitored metric. Use 'max' for scores such as Dice and 'min' for losses such as CE.")
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
     log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
     train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
-    pseudolabel_confidence_threshold: float = Field(default=0.75, description="Minimum confidence required to accept a newly sampled pseudo-label.")
+    model_confidence_threshold: float = Field(
+        default=0.75,
+        description="Confidence threshold passed to the LVAE when it internally reasons over unlabeled samples.",
+    )
+    candidate_sampling: CandidateSamplingConfig = Field(
+        default_factory=CandidateSamplingConfig,
+        description="Candidate voxel sampling strategy used during staged scheduler extension.",
+    )
+    pseudolabel_admission: PseudolabelAdmissionConfig = Field(
+        default_factory=PseudolabelAdmissionConfig,
+        description="Pseudo-label admission policy used during staged scheduler extension.",
+    )
+    pseudolabel_maintenance: PseudolabelMaintenanceConfig = Field(
+        default_factory=PseudolabelMaintenanceConfig,
+        description="Pseudo-label maintenance policy used between stages.",
+    )
+    initial_label_sampling: Optional[InitialLabelSamplingConfig] = Field(
+        default=None,
+        description="Optional stage-0 initial-label sampling strategy. When omitted, it is inferred from the available dataset metadata.",
+    )
     pseudolabels_per_extension: int = Field(default=100000, description="Number of pseudo-labels to add whenever the scheduler is extended.")
-    enable_pseudolabel_pruning: bool = Field(default=False, description="Whether to disable active pseudo-labels that repeatedly fail re-evaluation at stage transitions.")
-    pseudolabel_keep_threshold: float = Field(default=0.75, description="Minimum confidence required to keep an active pseudo-label enabled during stage re-evaluation.")
-    pseudolabel_pruning_patience: int = Field(default=1, description="Number of consecutive failed stage re-evaluations before a pseudo-label is disabled.")
     max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
     min_initial_label_fraction: float = Field(default=0.25, description="Minimum fraction of each training batch that must come from the initial GT-labelled pool.")
     auto_resume: bool = Field(default=True, description="Automatically resume from the latest completed staged checkpoint if present.")
-    initial_threshold: float = Field(default=1.0, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    max_threshold: float = Field(default=0.70, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    threshold_increment: float = Field(default=0.01, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    threshold_decrement_patience: int = Field(default=5, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    initial_radius: int = Field(default=3, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    max_radius: int = Field(default=7, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    radius_increment_patience: int = Field(default=20, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
-    pseudolabel_age_for_election: int = Field(default=10, description="Deprecated legacy option for the previous curriculum scheduler. Ignored by staged training.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_strategy_fields(cls, data: Any) -> Any:
+        """Migrate flat legacy scheduler settings into nested strategy configs.
+
+        Args:
+            data: Raw configuration dictionary loaded from YAML.
+
+        Returns:
+            Any: Configuration dictionary with nested strategy blocks populated.
+        """
+
+        if not isinstance(data, dict):
+            return data
+
+        migrated = dict(data)
+
+        if "candidate_sampling" not in migrated:
+            migrated["candidate_sampling"] = {
+                "name": migrated.get("candidate_sampling_strategy", "uniform_train_region"),
+            }
+
+        if "pseudolabel_admission" not in migrated:
+            confidence_min = migrated.get("pseudolabel_confidence_min")
+            confidence_max = migrated.get("pseudolabel_confidence_max")
+            legacy_threshold = migrated.get("pseudolabel_confidence_threshold", 0.75)
+            legacy_policy = migrated.get("pseudolabel_admission_policy", "confidence_threshold")
+            if legacy_policy == "threshold":
+                legacy_policy = "confidence_threshold"
+            migrated["pseudolabel_admission"] = {
+                "name": legacy_policy,
+                "confidence_min": legacy_threshold if confidence_min is None else confidence_min,
+                "confidence_max": 1.0 if confidence_max is None else confidence_max,
+            }
+
+        if "pseudolabel_maintenance" not in migrated:
+            legacy_policy = migrated.get("pseudolabel_maintenance_policy", "pruning")
+            if legacy_policy == "consistency_pruning":
+                legacy_policy = "pruning"
+            migrated["pseudolabel_maintenance"] = {
+                "name": legacy_policy,
+                "enable_pruning": migrated.get("enable_pseudolabel_pruning", False),
+                "pruning_patience": migrated.get("pseudolabel_pruning_patience", 1),
+            }
+
+        if "model_confidence_threshold" not in migrated and "pseudolabel_confidence_threshold" in migrated:
+            migrated["model_confidence_threshold"] = migrated["pseudolabel_confidence_threshold"]
+
+        return migrated
 
     @model_validator(mode="after")
-    def validate_staged_training(self):
+    def validate_staged_training(self) -> "TrainConfig":
+        """Validate the staged-training configuration.
+
+        Args:
+            None
+
+        Returns:
+            TrainConfig: The validated training configuration.
+        """
+
         if not self.monitored_metric:
             raise ValueError("monitored_metric must be a non-empty string.")
         if not 0.0 <= self.min_initial_label_fraction <= 1.0:
             raise ValueError("min_initial_label_fraction must be between 0 and 1.")
-        if self.pseudolabel_confidence_threshold < 0.0 or self.pseudolabel_confidence_threshold > 1.0:
-            raise ValueError("pseudolabel_confidence_threshold must be between 0 and 1.")
-        if self.pseudolabel_keep_threshold < 0.0 or self.pseudolabel_keep_threshold > 1.0:
-            raise ValueError("pseudolabel_keep_threshold must be between 0 and 1.")
+        if not 0.0 <= self.model_confidence_threshold <= 1.0:
+            raise ValueError("model_confidence_threshold must be between 0 and 1.")
         if self.pseudolabels_per_extension < 0:
             raise ValueError("pseudolabels_per_extension must be >= 0.")
-        if self.pseudolabel_pruning_patience < 1:
-            raise ValueError("pseudolabel_pruning_patience must be >= 1.")
         if self.max_extensions < 0:
             raise ValueError("max_extensions must be >= 0.")
         return self
-
 
 
 class ExperimentConfig(BaseEPSConfig):
@@ -83,8 +264,6 @@ class ExperimentConfig(BaseEPSConfig):
     def get_configs(self) -> tuple[TrainConfig, BaseEPSDatasetConfig, BaseEPSConfig]:
         """Load and return the training, dataset, and model configurations objects from the provided paths."""
 
-        # Paths can be either absolute or relative to the experiment config file
-
         if self.train_cfg_path:
             train_cfg_path = Path(self.train_cfg_path)
             if not train_cfg_path.is_absolute():
@@ -95,7 +274,6 @@ class ExperimentConfig(BaseEPSConfig):
         else:
             train_cfg = TrainConfig()
             print("Using default training config")
-
 
         dataset_cfg_path = Path(self.dataset_cfg_path)
         if not dataset_cfg_path.is_absolute():
@@ -108,10 +286,7 @@ class ExperimentConfig(BaseEPSConfig):
             }
             dataset_cfg = type(dataset_cfg)(**merged_dataset_cfg)
             dataset_cfg.config_yaml_path = dataset_cfg_path
-            print(
-                f"Loaded dataset config from {dataset_cfg_path} "
-                f"with overrides {self.dataset_overrides}"
-            )
+            print(f"Loaded dataset config from {dataset_cfg_path} with overrides {self.dataset_overrides}")
         else:
             print(f"Loaded dataset config from {dataset_cfg_path}")
 
@@ -133,25 +308,25 @@ class ExperimentConfig(BaseEPSConfig):
         if self.config_yaml_path is None:
             raise ValueError("config_yaml_path is not set.")
         return Path(self.config_yaml_path).parent
-    
+
     @property
     def experiment_name(self) -> str:
         """Return the name of the experiment based on the config YAML file name."""
         if self.config_yaml_path is None:
             raise ValueError("config_yaml_path is not set.")
         return Path(self.config_yaml_path).stem
-    
+
     @property
     def checkpoints_dir(self) -> Path:
         """Return the directory path for saving checkpoints."""
         return self.experiment_root / "checkpoints"
-    
+
     @property
     def outputs_dir(self) -> Path:
         """Return the directory path for saving outputs."""
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
-        return self.experiment_root / "outputs" / self.experiment_name / train_cfg.model_name 
-    
+        return self.experiment_root / "outputs" / self.experiment_name / train_cfg.model_name
+
     @property
     def results_csv_path(self) -> Path:
         """Return the directory path for saving results."""
@@ -166,7 +341,6 @@ class ExperimentConfig(BaseEPSConfig):
     def best_checkpoint_path(self, mode: Literal["supervised", "semisupervised"]) -> Path:
         """Return the path to the best model checkpoint based on the training mode."""
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
-
         return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"best_{mode}.ckpt"
 
     def stage_checkpoint_path(self, mode: Literal["supervised", "semisupervised"], stage_idx: int, kind: Literal["best", "last"]) -> Path:
@@ -176,9 +350,8 @@ class ExperimentConfig(BaseEPSConfig):
     def stage_scheduler_path(self, stage_idx: int) -> Path:
         train_cfg, _, _ = self.get_configs()
         return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"scheduler_K{stage_idx}.npz"
-    
+
     def get_log_dir(self) -> Path:
         """Return the directory path for saving logs."""
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
-
         return self.logs_dir.resolve() / self.experiment_name / train_cfg.model_name

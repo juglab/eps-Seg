@@ -4,42 +4,50 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+from eps_seg.config.train import TrainConfig
+from eps_seg.data.factory import (
+    build_candidate_sampling_strategy,
+    build_pseudolabel_admission_policy,
+    build_pseudolabel_maintenance_policy,
+)
+from eps_seg.data.initial_label_sampling import FromCSVInitialLabelSamplingStrategy, InitialLabelSamplingContext
+from eps_seg.data.sampling import SamplingDomain
+from eps_seg.data.schedule import DataSchedule
+from eps_seg.data.schedule_engine import ScheduleEngine
 
 
 class PseudoLabelDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        images,
-        labels,
-        patch_size=64,
-        label_size=1,
-        n_classes=4,
-        ignore_lbl=-1,
-        indices_dict=None,
-        dim=2,
-        seed=42,
+        images: Dict[str, np.ndarray],
+        labels: Dict[str, np.ndarray],
+        patch_size: int = 64,
+        label_size: int = 1,
+        n_classes: int = 4,
+        ignore_lbl: int = -1,
+        dim: int = 2,
+        seed: int = 42,
         samples_per_class: Optional[Dict[int, int]] = None,
-        scheduler_path=None,
+        scheduler_path: Optional[Union[str, Path]] = None,
         stage_index: int = 0,
-        confidence_threshold: float = 0.75,
         anchor_records: Optional[List[Dict[str, int]]] = None,
         train_substacks: Optional[List[Dict[str, int]]] = None,
-    ):
+        train_cfg: Optional[TrainConfig] = None,
+    ) -> None:
         """
         Dataset storing the full staged scheduler used by the refactored
         training loop.
 
-        Stage-0 rows can be initialized either from canonical cached anchor
-        records (cache v2 path) or from legacy per-slice sampling
-        ``indices_dict`` (backward compatibility path).
+        Stage-0 rows are initialized from canonical cached anchor records when
+        no scheduler file is provided. Initial GT sampling happens during cache
+        creation, not during dataset construction.
         """
         self.images = images
         self.labels = labels
-        self.indices_dict = indices_dict or {}
         self.anchor_records = anchor_records or []
         self.train_substacks = train_substacks or []
         self.patch_size = patch_size
@@ -55,183 +63,107 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self.default_samples_per_class = 1
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
         self.stage_index = int(stage_index)
-        self.confidence_threshold = float(confidence_threshold)
         self.sampling_version = 0
+        self.train_cfg = train_cfg or TrainConfig()
 
         self.stack_names = list(self.images.keys())
         self.name_to_id = {name: i for i, name in enumerate(self.stack_names)}
         self.id_to_name = {i: name for i, name in enumerate(self.stack_names)}
         self.label_source_names = {0: "gt_initial", 1: "pseudo"}
-        self.slice_sampling_table = self._build_slice_sampling_table()
-
-        self.schedule = {
-            "name_id": np.empty((0,), dtype=np.int32),
-            "coords": np.empty((0, 3), dtype=np.int32),
-            "current_label": np.empty((0,), dtype=np.int32),
-            "gt_label": np.empty((0,), dtype=np.int32),
-            "confidence": np.empty((0,), dtype=np.float32),
-            "label_source": np.empty((0,), dtype=np.int32),
-            "stage_index": np.empty((0,), dtype=np.int32),
-            "is_enabled": np.empty((0,), dtype=np.bool_),
-            "stage_disabled": np.empty((0,), dtype=np.int32),
-            "consecutive_keep_failures": np.empty((0,), dtype=np.int32),
-            "last_predicted_label": np.empty((0,), dtype=np.int32),
-            "last_confidence": np.empty((0,), dtype=np.float32),
-        }
+        self._schedule = DataSchedule.empty(seed=self.seed, stage_index=self.stage_index)
+        self.initial_label_sampling_context = InitialLabelSamplingContext(
+            images=self.images,
+            labels=self.labels,
+            anchor_records=self.anchor_records,
+            train_substacks=self.train_substacks,
+            samples_per_class=self.samples_per_class,
+            unique_labels=self.unique_labels,
+            default_samples_per_class=self.default_samples_per_class,
+            ignore_lbl=self.ignore_lbl,
+            patch_size=self.patch_size,
+            label_size=self.label_size,
+            dim=self.dim,
+            name_to_id=self.name_to_id,
+        )
+        self.sampling_domain = SamplingDomain(
+            images=self.images,
+            labels=self.labels,
+            train_substacks=self.train_substacks,
+            ignore_lbl=self.ignore_lbl,
+            patch_size=self.patch_size,
+            label_size=self.label_size,
+            dim=self.dim,
+        )
+        self._build_components()
 
         if self.scheduler_path is not None and self.scheduler_path.exists():
             print(f"Loading scheduler from {self.scheduler_path}...")
-            self.load_scheduler_npz(self.scheduler_path)
+            self._load_scheduler_npz(self.scheduler_path)
         else:
             print("Initializing stage-0 labelled scheduler...")
             if self.anchor_records:
-                self._load_initial_supervised_records()
-            else:
-                self._sample_initial_supervised_samples()
+                FromCSVInitialLabelSamplingStrategy().populate_schedule(
+                    schedule=self.schedule,
+                    context=self.initial_label_sampling_context,
+                    rng=self.rng,
+                )
             self._print_schedule_report()
-            self._bump_sampling_version()
+            self.schedule.bump_version()
+            self.sampling_version = self.schedule.sampling_version
 
-    def _build_slice_sampling_table(self) -> List[Tuple[str, int]]:
-        if self.train_substacks:
-            table = []
-            for substack in self.train_substacks:
-                name = substack["stack_name"]
-                for z in range(int(substack["z_start"]), int(substack["z_stop"])):
-                    table.append((name, int(z)))
-            return table
-        return [
-            (name, int(z))
-            for name, z_indices in self.indices_dict.items()
-            for z in z_indices
-        ]
+    @property
+    def schedule(self) -> DataSchedule:
+        """
+        Return the scheduler state object backing this dataset.
 
-    def _bump_sampling_version(self):
+        Args:
+            None
+
+        Returns:
+            DataSchedule: Mutable scheduler state used by the staged pipeline.
+        """
+
+        return self._schedule
+
+    def _build_components(self) -> None:
+        """
+        Build the sampling strategy, policies, and schedule engine used by the dataset.
+
+        Args:
+            None
+
+        Returns:
+            None
+        """
+        self.candidate_sampling_strategy = build_candidate_sampling_strategy(
+            cfg=self.train_cfg.candidate_sampling,
+            domain=self.sampling_domain,
+            rng=self.rng,
+            samples_per_class=self.samples_per_class,
+        )
+        self.pseudolabel_admission_policy = build_pseudolabel_admission_policy(self.train_cfg.pseudolabel_admission)
+        self.pseudolabel_maintenance_policy = build_pseudolabel_maintenance_policy(
+            cfg=self.train_cfg.pseudolabel_maintenance,
+            admission_policy=self.pseudolabel_admission_policy,
+        )
+
+        self.schedule_engine = ScheduleEngine(
+            dataset=self,
+            schedule=self.schedule,
+            sampler=self.candidate_sampling_strategy,
+            admission_policy=self.pseudolabel_admission_policy,
+            maintenance_policy=self.pseudolabel_maintenance_policy,
+        )
+        self.slice_sampling_table = getattr(self.candidate_sampling_strategy, "slice_sampling_table", [])
+
+    def _bump_sampling_version(self) -> None:
+        """
+        Increase the dataset scheduler version after a schedule update.
+        """
         self.sampling_version += 1
+        self.schedule.sampling_version = self.sampling_version
 
-    def _add_to_schedule(
-        self,
-        name_id,
-        coords,
-        current_label,
-        gt_label,
-        confidence,
-        label_source,
-        stage_index,
-        is_enabled=True,
-        stage_disabled=-1,
-        consecutive_keep_failures=0,
-        last_predicted_label=None,
-        last_confidence=None,
-    ):
-        if last_predicted_label is None:
-            last_predicted_label = current_label
-        if last_confidence is None:
-            last_confidence = confidence
-        self.schedule["name_id"] = np.append(self.schedule["name_id"], np.array([name_id], dtype=np.int32))
-        self.schedule["coords"] = np.append(self.schedule["coords"], [coords], axis=0)
-        self.schedule["current_label"] = np.append(self.schedule["current_label"], np.array([current_label], dtype=np.int32))
-        self.schedule["gt_label"] = np.append(self.schedule["gt_label"], np.array([gt_label], dtype=np.int32))
-        self.schedule["confidence"] = np.append(self.schedule["confidence"], np.array([confidence], dtype=np.float32))
-        self.schedule["label_source"] = np.append(self.schedule["label_source"], np.array([label_source], dtype=np.int32))
-        self.schedule["stage_index"] = np.append(self.schedule["stage_index"], np.array([stage_index], dtype=np.int32))
-        self.schedule["is_enabled"] = np.append(self.schedule["is_enabled"], np.array([is_enabled], dtype=np.bool_))
-        self.schedule["stage_disabled"] = np.append(self.schedule["stage_disabled"], np.array([stage_disabled], dtype=np.int32))
-        self.schedule["consecutive_keep_failures"] = np.append(
-            self.schedule["consecutive_keep_failures"],
-            np.array([consecutive_keep_failures], dtype=np.int32),
-        )
-        self.schedule["last_predicted_label"] = np.append(
-            self.schedule["last_predicted_label"],
-            np.array([last_predicted_label], dtype=np.int32),
-        )
-        self.schedule["last_confidence"] = np.append(
-            self.schedule["last_confidence"],
-            np.array([last_confidence], dtype=np.float32),
-        )
-
-    def _load_initial_supervised_records(self):
-        coords_in_use = set()
-        sorted_records = sorted(
-            self.anchor_records,
-            key=lambda record: (
-                int(record.get("coord_id", 10**9)),
-                str(record["stack_name"]),
-                int(record["z"]),
-                int(record["y"]),
-                int(record["x"]),
-            ),
-        )
-        for record in sorted_records:
-            name = record["stack_name"]
-            z = int(record["z"])
-            y = int(record["y"])
-            x = int(record["x"])
-            coord_key = (name, z, y, x)
-            if coord_key in coords_in_use:
-                continue
-
-            Z, H, W = self.images[name].shape
-            if not self._is_valid_coord(name, z, y, x, Z, H, W):
-                continue
-
-            coords_in_use.add(coord_key)
-            gt_label = int(record.get("gt_label", self.labels[name][z, y, x]))
-            self._add_to_schedule(
-                name_id=self.name_to_id[name],
-                coords=(z, y, x),
-                current_label=gt_label,
-                gt_label=gt_label,
-                confidence=1.0,
-                label_source=0,
-                stage_index=0,
-                is_enabled=True,
-                stage_disabled=-1,
-                consecutive_keep_failures=0,
-                last_predicted_label=gt_label,
-                last_confidence=1.0,
-            )
-
-    def _sample_initial_supervised_samples(self):
-        for name, z_indices in self.indices_dict.items():
-            img_stack = self.images[name]
-            lbl_stack = self.labels[name]
-            name_id = self.name_to_id[name]
-            Z, H, W = img_stack.shape
-            coords_in_use = set(map(tuple, self.schedule["coords"]))
-            for cz in tqdm(z_indices, desc=f"Sampling stage-0 labels for {name}"):
-                for lbl in self.unique_labels:
-                    n_samples = self.samples_per_class.get(int(lbl), self.default_samples_per_class)
-                    for cy, cx in self._sample_coordinates_from_slice(lbl_stack[cz], int(lbl), n_samples):
-                        if not self._is_valid_coord(name, int(cz), int(cy), int(cx), Z, H, W):
-                            continue
-                        if (int(cz), int(cy), int(cx)) in coords_in_use:
-                            continue
-                        coords_in_use.add((int(cz), int(cy), int(cx)))
-                        gt_label = int(lbl_stack[cz, cy, cx])
-                        self._add_to_schedule(
-                            name_id=name_id,
-                            coords=(int(cz), int(cy), int(cx)),
-                            current_label=gt_label,
-                            gt_label=gt_label,
-                            confidence=1.0,
-                            label_source=0,
-                            stage_index=0,
-                            is_enabled=True,
-                            stage_disabled=-1,
-                            consecutive_keep_failures=0,
-                            last_predicted_label=gt_label,
-                            last_confidence=1.0,
-                        )
-
-    def _sample_coordinates_from_slice(self, z_slice: np.ndarray, class_label: int, num_samples: int):
-        label_coords = np.argwhere(z_slice == class_label)
-        if len(label_coords) < num_samples:
-            return []
-        idx = self.rng.sample(range(len(label_coords)), num_samples)
-        sampled = label_coords[idx]
-        return [(int(y), int(x)) for y, x in sampled]
-
-    def _is_valid_coord(self, name, z, y, x, Z, H, W):
+    def _is_valid_coord(self, name: str, z: int, y: int, x: int, Z: int, H: int, W: int) -> bool:
         valid = self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
         if self.dim == 3:
             valid = valid and (self.offset <= z < Z - self.offset - 1)
@@ -245,86 +177,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         return self.schedule["label_source"] == 0
 
     def get_active_schedule_indices(self) -> np.ndarray:
-        if "is_enabled" not in self.schedule:
-            return np.arange(len(self.schedule["name_id"]), dtype=np.int32)
-        return np.where(self.schedule["is_enabled"])[0].astype(np.int32)
-
-    def get_active_pseudolabel_indices(self) -> np.ndarray:
-        pseudo_mask = self.schedule["label_source"] == 1
-        return np.where(self.schedule["is_enabled"] & pseudo_mask)[0].astype(np.int32)
-
-    def count_active_pseudolabels(self) -> int:
-        return int(len(self.get_active_pseudolabel_indices()))
-
-    def _scheduled_coordinate_set(self, active_only: bool = True) -> set[tuple[str, int, int, int]]:
-        schedule_indices = self.get_active_schedule_indices() if active_only else np.arange(len(self.schedule["name_id"]))
-        return {
-            (self.id_to_name[int(name_id)], int(z), int(y), int(x))
-            for name_id, (z, y, x) in zip(
-                self.schedule["name_id"][schedule_indices],
-                self.schedule["coords"][schedule_indices],
-            )
-        }
-
-    def _sample_random_candidate(self, forbidden_coords: set[tuple[str, int, int, int]], max_tries: int = 1024):
-        if len(self.slice_sampling_table) == 0:
-            return None
-        for _ in range(max_tries):
-            name, z = self.rng.choice(self.slice_sampling_table)
-            valid_positions = np.argwhere(self.labels[name][z] != self.ignore_lbl)
-            if len(valid_positions) == 0:
-                continue
-            y, x = valid_positions[self.rng.randrange(len(valid_positions))]
-            y = int(y)
-            x = int(x)
-            Z, H, W = self.images[name].shape
-            if not self._is_valid_coord(name, int(z), y, x, Z, H, W):
-                continue
-            coord = (name, int(z), y, x)
-            if coord in forbidden_coords:
-                continue
-            return coord
-        return None
-
-    def _sample_candidate_batch(self, forbidden_coords: set[tuple[str, int, int, int]], batch_size: int):
-        coords_batch = []
-        local_forbidden = set(forbidden_coords)
-        for _ in range(batch_size):
-            candidate = self._sample_random_candidate(local_forbidden)
-            if candidate is None:
-                break
-            coords_batch.append(candidate)
-            local_forbidden.add(candidate)
-        return coords_batch
-
-    def _weighted_class_targets(self, total_items: int) -> Dict[int, int]:
-        class_weights = {
-            int(label): float(self.samples_per_class.get(int(label), self.default_samples_per_class))
-            for label in self.unique_labels
-        }
-        total_weight = float(sum(max(weight, 0.0) for weight in class_weights.values()))
-        if total_items <= 0:
-            return {label: 0 for label in class_weights}
-        if total_weight <= 0.0:
-            base = total_items // len(class_weights)
-            rem = total_items % len(class_weights)
-            targets = {label: base for label in class_weights}
-            for label in list(class_weights.keys())[:rem]:
-                targets[label] += 1
-            return targets
-
-        raw_targets = {label: total_items * max(weight, 0.0) / total_weight for label, weight in class_weights.items()}
-        targets = {label: int(np.floor(raw_targets[label])) for label in class_weights}
-        remainder = total_items - sum(targets.values())
-        if remainder > 0:
-            ranked_labels = sorted(
-                class_weights.keys(),
-                key=lambda label: (raw_targets[label] - targets[label], -label),
-                reverse=True,
-            )
-            for label in ranked_labels[:remainder]:
-                targets[label] += 1
-        return targets
+        return self.schedule.get_active_indices()
 
     def build_candidate_batch(self, coords_batch: List[Tuple[str, int, int, int]]) -> dict:
         patches = []
@@ -367,148 +220,23 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             "schedule_idx": torch.tensor(schedule_indices).long(),
         }
 
-    def add_pseudolabels_for_stage(self, stage_index: int, target_active_pseudolabels: int, evaluator, evaluation_batch_size: int) -> int:
-        current_active_pseudolabels = self.count_active_pseudolabels()
-        if target_active_pseudolabels <= current_active_pseudolabels:
-            return 0
+    def _load_scheduler_npz(self, path: Union[str, Path]) -> None:
+        """Load a scheduler from disk without changing its semantics.
 
-        forbidden_coords = self._scheduled_coordinate_set(active_only=True)
-        target_new_pseudolabels = int(target_active_pseudolabels - current_active_pseudolabels)
-        class_targets = self._weighted_class_targets(target_new_pseudolabels)
-        accepted_per_class = {label: 0 for label in class_targets}
-        accepted = 0
-        no_progress_rounds = 0
-        max_no_progress_rounds = 32
-        while self.count_active_pseudolabels() < target_active_pseudolabels and no_progress_rounds < max_no_progress_rounds:
-            coords_batch = self._sample_candidate_batch(forbidden_coords, evaluation_batch_size)
-            if len(coords_batch) == 0:
-                break
-            batch = self.build_candidate_batch(coords_batch)
-            predicted_labels, confidences = evaluator(batch)
-            accepted_this_round = 0
-            for (name, z, y, x), pred_label, confidence, gt_label in zip(
-                coords_batch,
-                predicted_labels,
-                confidences,
-                batch["gt"].tolist(),
-            ):
-                pred_label = int(pred_label)
-                if float(confidence) < self.confidence_threshold:
-                    continue
-                self._add_to_schedule(
-                    name_id=self.name_to_id[name],
-                    coords=(z, y, x),
-                    current_label=pred_label,
-                    gt_label=int(gt_label),
-                    confidence=float(confidence),
-                    label_source=1,
-                    stage_index=int(stage_index),
-                    is_enabled=True,
-                    stage_disabled=-1,
-                    consecutive_keep_failures=0,
-                    last_predicted_label=pred_label,
-                    last_confidence=float(confidence),
-                )
-                forbidden_coords.add((name, z, y, x))
-                accepted_per_class[pred_label] = accepted_per_class.get(pred_label, 0) + 1
-                accepted += 1
-                accepted_this_round += 1
-                if self.count_active_pseudolabels() >= target_active_pseudolabels:
-                    break
-            no_progress_rounds = 0 if accepted_this_round > 0 else no_progress_rounds + 1
+        Args:
+            path: Input path for the ``.npz`` scheduler file.
 
-        self.stage_index = max(self.stage_index, int(stage_index))
-        self._bump_sampling_version()
-        self._print_schedule_report()
-        return accepted
+        Returns:
+            None
+        """
 
-    def reevaluate_pseudolabels_for_stage(
-        self,
-        next_stage_idx: int,
-        evaluator,
-        evaluation_batch_size: int,
-        keep_threshold: float,
-        pruning_patience: int,
-        enable_pruning: bool,
-    ) -> int:
-        pseudo_indices = self.get_active_pseudolabel_indices().tolist()
-        if len(pseudo_indices) == 0:
-            return 0
+        self._schedule = DataSchedule.load_npz(Path(path))
+        self.stage_index = int(self.schedule.stage_index)
+        self._build_components()
+        self.schedule.bump_version()
+        self.sampling_version = self.schedule.sampling_version
 
-        disabled_count = 0
-        for batch_start in range(0, len(pseudo_indices), evaluation_batch_size):
-            batch_indices = pseudo_indices[batch_start : batch_start + evaluation_batch_size]
-            batch = self.build_scheduler_batch(batch_indices)
-            predicted_labels, confidences = evaluator(batch)
-
-            for schedule_idx, pred_label, confidence in zip(batch_indices, predicted_labels, confidences):
-                pred_label = int(pred_label)
-                confidence = float(confidence)
-                self.schedule["last_predicted_label"][schedule_idx] = pred_label
-                self.schedule["last_confidence"][schedule_idx] = confidence
-
-                keep_row = pred_label == int(self.schedule["current_label"][schedule_idx]) and confidence >= keep_threshold
-                if keep_row:
-                    self.schedule["consecutive_keep_failures"][schedule_idx] = 0
-                    continue
-
-                self.schedule["consecutive_keep_failures"][schedule_idx] += 1
-                if enable_pruning and int(self.schedule["consecutive_keep_failures"][schedule_idx]) >= int(pruning_patience):
-                    self.schedule["is_enabled"][schedule_idx] = False
-                    self.schedule["stage_disabled"][schedule_idx] = int(next_stage_idx)
-                    disabled_count += 1
-
-        if len(pseudo_indices) > 0:
-            self._bump_sampling_version()
-        return disabled_count
-
-    def save_scheduler_npz(self, path):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            path,
-            name_id=self.schedule["name_id"],
-            coords=self.schedule["coords"],
-            current_label=self.schedule["current_label"],
-            gt_label=self.schedule["gt_label"],
-            confidence=self.schedule["confidence"],
-            label_source=self.schedule["label_source"],
-            stage_index=self.schedule["stage_index"],
-            is_enabled=self.schedule["is_enabled"],
-            stage_disabled=self.schedule["stage_disabled"],
-            consecutive_keep_failures=self.schedule["consecutive_keep_failures"],
-            last_predicted_label=self.schedule["last_predicted_label"],
-            last_confidence=self.schedule["last_confidence"],
-            metadata=np.array([self.seed, self.stage_index, len(self.schedule["name_id"])], dtype=np.int32),
-        )
-
-    def load_scheduler_npz(self, path):
-        npz = np.load(path)
-        for key in self.schedule:
-            if key in npz:
-                self.schedule[key] = np.array(npz[key])
-            else:
-                self.schedule[key] = self._default_scheduler_field(key, len(np.array(npz["name_id"])))
-        if "metadata" in npz:
-            metadata = np.array(npz["metadata"]).astype(np.int32)
-            if metadata.size >= 2:
-                self.stage_index = int(metadata[1])
-        self._bump_sampling_version()
-
-    def _default_scheduler_field(self, key: str, n_rows: int) -> np.ndarray:
-        if key == "is_enabled":
-            return np.ones((n_rows,), dtype=np.bool_)
-        if key == "stage_disabled":
-            return np.full((n_rows,), -1, dtype=np.int32)
-        if key == "consecutive_keep_failures":
-            return np.zeros((n_rows,), dtype=np.int32)
-        if key == "last_predicted_label":
-            return self.schedule["current_label"].copy()
-        if key == "last_confidence":
-            return self.schedule["confidence"].copy()
-        raise KeyError(f"Unsupported missing scheduler field: {key}")
-
-    def patch_at(self, img_stack, z, y, x):
+    def patch_at(self, img_stack: np.ndarray, z: int, y: int, x: int) -> torch.Tensor:
         if self.dim == 2:
             p = img_stack[z, y - self.offset : y + self.offset + 2, x - self.offset : x + self.offset + 2]
             return torch.from_numpy(p).unsqueeze(0)
@@ -519,24 +247,18 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         ]
         return torch.from_numpy(p).unsqueeze(0)
 
-    def _print_schedule_report(self):
-        if len(self.schedule["name_id"]) == 0:
-            print("Empty scheduler.")
-            return
-        sch = {k: v for k, v in self.schedule.items()}
-        sch["z"] = self.schedule["coords"][:, 0]
-        sch["y"] = self.schedule["coords"][:, 1]
-        sch["x"] = self.schedule["coords"][:, 2]
-        del sch["coords"]
-        spd = pd.DataFrame(sch)
-        spd["name_id"] = spd["name_id"].apply(lambda x: self.id_to_name[x])
-        spd["label_source"] = spd["label_source"].apply(lambda x: self.label_source_names.get(int(x), f"source_{x}"))
-        spd["is_enabled"] = spd["is_enabled"].astype(bool)
-        print(
-            spd.groupby(["stage_index", "label_source", "is_enabled", "name_id"])["current_label"]
-            .value_counts()
-            .unstack(fill_value=0)
-        )
+    def _print_schedule_report(self) -> None:
+        """
+        Print a compact schedule summary grouped by stage, source, and stack.
+
+        Args:
+            None
+
+        Returns:
+            None
+        """
+
+        self.schedule.print_report(id_to_name=self.id_to_name, label_source_names=self.label_source_names)
 
     def __getitem__(self, idx):
         schedule_idx = int(self.get_active_schedule_indices()[idx])

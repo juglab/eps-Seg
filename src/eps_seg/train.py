@@ -98,7 +98,7 @@ def create_initial_scheduler(exp_config: ExperimentConfig) -> Path:
     dm = EPSSegDataModule(cfg=dataset_cfg, train_cfg=train_cfg, scheduler_path=None, scheduler_stage_index=0)
     dm.prepare_data()
     dm.setup("fit")
-    dm.train_dataset.save_scheduler_npz(scheduler_path)
+    dm.train_dataset.schedule.save_npz(scheduler_path)
     return scheduler_path
 
 
@@ -284,25 +284,32 @@ def evaluate_scheduler_extension(
         model.model.data_mean = torch.as_tensor(mean, device=device)
         model.model.data_std = torch.as_tensor(std, device=device)
 
-    # Re-evaluate active pseudo-labels and prune if requested before adding new ones.
-    active_pseudolabels_before = dm.train_dataset.count_active_pseudolabels()
-    disabled_count = dm.train_dataset.reevaluate_pseudolabels_for_stage(
+    schedule = dm.train_dataset.schedule
+    schedule_engine = dm.train_dataset.schedule_engine
+
+    active_pseudolabels_before = schedule.count_active_pseudolabels()
+    disabled_count = schedule_engine.reevaluate_schedule(
         next_stage_idx=next_stage_idx,
         evaluator=model.evaluate_candidate_batch,
         evaluation_batch_size=train_cfg.test_batch_size,
-        keep_threshold=train_cfg.pseudolabel_keep_threshold,
-        pruning_patience=train_cfg.pseudolabel_pruning_patience,
-        enable_pruning=train_cfg.enable_pseudolabel_pruning,
     )
+    if disabled_count > 0 or active_pseudolabels_before > 0:
+        schedule.bump_version()
+        dm.train_dataset.sampling_version = schedule.sampling_version
+
     target_active_pseudolabels = active_pseudolabels_before + train_cfg.pseudolabels_per_extension
-    accepted = dm.train_dataset.add_pseudolabels_for_stage(
+    accepted = schedule_engine.extend_schedule(
         stage_index=next_stage_idx,
         target_active_pseudolabels=target_active_pseudolabels,
         evaluator=model.evaluate_candidate_batch,
         evaluation_batch_size=train_cfg.test_batch_size,
     )
+    if accepted > 0:
+        schedule.bump_version()
+        dm.train_dataset.sampling_version = schedule.sampling_version
+        dm.train_dataset._print_schedule_report()
 
-    active_pseudolabels_after = dm.train_dataset.count_active_pseudolabels()
+    active_pseudolabels_after = schedule.count_active_pseudolabels()
     if active_pseudolabels_after < target_active_pseudolabels:
         print(
             f"Scheduler extension stopped at stage K{next_stage_idx}: "
@@ -317,7 +324,7 @@ def evaluate_scheduler_extension(
         return None
 
     next_scheduler_path = exp_config.stage_scheduler_path(next_stage_idx)
-    dm.train_dataset.save_scheduler_npz(next_scheduler_path)
+    schedule.save_npz(next_scheduler_path)
     del dm
     del model
     gc.collect()
