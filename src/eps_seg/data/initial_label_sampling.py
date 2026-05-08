@@ -16,7 +16,7 @@ class InitialLabelSamplingContext:
     Args:
         images: Mapping from stack name to image volume.
         labels: Mapping from stack name to label volume.
-        anchor_records: Optional canonical labelled voxels loaded from cache or CSV.
+        coordinate_records: Optional canonical labelled voxels loaded from cache or CSV.
         train_substacks: Train-region substack descriptors.
         samples_per_class: Requested number of stage-0 labels per class and slice or substack, depending on the strategy.
         unique_labels: Semantic labels available in the dataset.
@@ -33,7 +33,7 @@ class InitialLabelSamplingContext:
 
     images: Dict[str, np.ndarray]
     labels: Dict[str, np.ndarray]
-    anchor_records: List[Dict[str, int]]
+    coordinate_records: List[Dict[str, int]]
     train_substacks: List[Dict[str, int]]
     samples_per_class: Dict[int, int]
     unique_labels: np.ndarray
@@ -86,6 +86,52 @@ class InitialLabelSamplingStrategy(Protocol):
         """
 
 
+def populate_schedule_from_coordinate_records(
+    schedule: DataSchedule,
+    context: InitialLabelSamplingContext,
+) -> None:
+    """
+    Populate a stage-0 schedule from explicit canonical coordinate records.
+    """
+
+    coords_in_use: set[tuple[str, int, int, int]] = set()
+    sorted_records = sorted(
+        context.coordinate_records,
+        key=lambda record: (
+            int(record.get("coord_id", 10**9)),
+            str(record["stack_name"]),
+            int(record["z"]),
+            int(record["y"]),
+            int(record["x"]),
+        ),
+    )
+    for record in sorted_records:
+        name = record["stack_name"]
+        z = int(record["z"])
+        y = int(record["y"])
+        x = int(record["x"])
+        coord_key = (name, z, y, x)
+        if coord_key in coords_in_use or not _is_valid_coord(context=context, name=name, z=z, y=y, x=x):
+            continue
+
+        coords_in_use.add(coord_key)
+        gt_label = int(record.get("gt_label", context.labels[name][z, y, x]))
+        schedule.add_record(
+            name_id=context.name_to_id[name],
+            coords=(z, y, x),
+            current_label=gt_label,
+            gt_label=gt_label,
+            confidence=1.0,
+            label_source=0,
+            stage_index=0,
+            is_enabled=True,
+            stage_disabled=-1,
+            consecutive_keep_failures=0,
+            last_predicted_label=gt_label,
+            last_confidence=1.0,
+        )
+
+
 def _is_valid_coord(context: InitialLabelSamplingContext, name: str, z: int, y: int, x: int) -> bool:
     """Check whether a voxel center is valid for stage-0 schedule construction.
 
@@ -123,72 +169,6 @@ def _selected_slices_from_context(context: InitialLabelSamplingContext) -> dict[
         name = substack["stack_name"]
         selected.setdefault(name, []).extend(range(int(substack["z_start"]), int(substack["z_stop"])))
     return selected
-
-
-class FromCSVInitialLabelSamplingStrategy:
-    """Initialize stage-0 labels from canonical labelled-voxel records.
-
-    Args:
-        None
-
-    Returns:
-        FromCSVInitialLabelSamplingStrategy: Strategy loading the initial schedule from canonical records.
-    """
-
-    def populate_schedule(
-        self,
-        schedule: DataSchedule,
-        context: InitialLabelSamplingContext,
-        rng: random.Random,
-    ) -> None:
-        """Populate the schedule from canonical anchor records.
-
-        Args:
-            schedule: Schedule to mutate.
-            context: Immutable stage-0 sampling context.
-            rng: Unused random generator kept for interface consistency.
-
-        Returns:
-            None
-        """
-
-        del rng
-        coords_in_use: set[tuple[str, int, int, int]] = set()
-        sorted_records = sorted(
-            context.anchor_records,
-            key=lambda record: (
-                int(record.get("coord_id", 10**9)),
-                str(record["stack_name"]),
-                int(record["z"]),
-                int(record["y"]),
-                int(record["x"]),
-            ),
-        )
-        for record in sorted_records:
-            name = record["stack_name"]
-            z = int(record["z"])
-            y = int(record["y"])
-            x = int(record["x"])
-            coord_key = (name, z, y, x)
-            if coord_key in coords_in_use or not _is_valid_coord(context=context, name=name, z=z, y=y, x=x):
-                continue
-
-            coords_in_use.add(coord_key)
-            gt_label = int(record.get("gt_label", context.labels[name][z, y, x]))
-            schedule.add_record(
-                name_id=context.name_to_id[name],
-                coords=(z, y, x),
-                current_label=gt_label,
-                gt_label=gt_label,
-                confidence=1.0,
-                label_source=0,
-                stage_index=0,
-                is_enabled=True,
-                stage_disabled=-1,
-                consecutive_keep_failures=0,
-                last_predicted_label=gt_label,
-                last_confidence=1.0,
-            )
 
 
 class ClassBalancedSliceInitialLabelSamplingStrategy:

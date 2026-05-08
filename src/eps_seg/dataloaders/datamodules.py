@@ -49,6 +49,9 @@ class EPSSegDataModule(L.LightningDataModule):
         self.test_dataset = None
         self.predict_dataset = None
 
+    def _runtime_stage_seed(self) -> int:
+        return int(self.cfg.seed) + int(self.scheduler_stage_index)
+
     def prepare_data(self):
         """
         Prepare data for training, validation, testing, and prediction.
@@ -68,18 +71,20 @@ class EPSSegDataModule(L.LightningDataModule):
         return self.data["data_mean"], self.data["data_std"]
 
     def train_dataloader(self):
+        stage_seed = self._runtime_stage_seed()
         train_sampler = BalancedScheduledBatchSampler(
             self.train_dataset,
             batch_size=self.train_cfg.batch_size,
             min_initial_label_fraction=self.train_cfg.min_initial_label_fraction,
             shuffle=True,
-            seed=self.cfg.seed,
+            seed=stage_seed,
         )
 
         train_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.train_dataset,
             sampler=train_sampler,
             shuffle=False,
+            seed=stage_seed,
             batches_per_pseudoepoch=self.train_cfg.batches_per_pseudoepoch,
         )
 
@@ -94,11 +99,13 @@ class EPSSegDataModule(L.LightningDataModule):
             total_patches_per_batch=self.train_cfg.batch_size,
             shuffle=False,
             n_neighbors=self.cfg.n_neighbors,
+            seed=self.cfg.seed,
         )
         val_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.val_dataset,
             sampler=val_sampler,
             shuffle=False,
+            seed=self.cfg.seed,
         )
 
         return DataLoader(
@@ -133,8 +140,8 @@ class EPSSegDataModule(L.LightningDataModule):
 
         if stage in ["fit", "validate"]:
             print(
-                f"[DataModule] Loaded fold payload | train_anchors={len(self.data.get('train_anchor_records', []))} "
-                f"| val_anchors={len(self.data.get('val_anchor_records', []))} "
+                f"[DataModule] Loaded fold payload | train_coords={len(self.data.get('train_coordinate_records', []))} "
+                f"| val_coords={len(self.data.get('val_coordinate_records', []))} "
                 f"| mean={self.data['data_mean']:.4f} std={self.data['data_std']:.4f}"
             )
 
@@ -149,7 +156,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 dim=self.cfg.dim,
                 seed=self.cfg.seed,
                 samples_per_class=self.cfg.samples_per_class,
-                anchor_records=self.data["train_anchor_records"],
+                coordinate_records=self.data["train_coordinate_records"],
                 train_substacks=self.data["train_substacks"],
                 scheduler_path=self.scheduler_path,
                 stage_index=self.scheduler_stage_index,
@@ -168,7 +175,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 seed=self.cfg.seed,
                 samples_per_class=self.cfg.samples_per_class,
                 n_neighbors=self.cfg.n_neighbors,
-                anchor_records=self.data["val_anchor_records"],
+                coordinate_records=self.data["val_coordinate_records"],
             )
         if stage in ["test", "predict"]:
             if stage == "test":

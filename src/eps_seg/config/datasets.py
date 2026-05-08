@@ -75,7 +75,7 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         1,
         description="Depth of contiguous z-substacks used as fold units. 1 corresponds to slice-wise folding.",
     )
-    initial_label_sampling: Optional[Literal["from_csv", "class_balanced_slice", "class_balanced_substack"]] = Field(
+    initial_label_sampling: Optional[Literal["class_balanced_slice", "class_balanced_substack"]] = Field(
         None,
         description="Optional strategy used to build the canonical labelled universe when creating a fresh cache.",
     )

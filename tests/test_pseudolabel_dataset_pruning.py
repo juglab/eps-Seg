@@ -1,10 +1,12 @@
 import numpy as np
 import pytest
 
+from eps_seg.config.train import TrainConfig
+from eps_seg.data.schedule import DataSchedule
 from eps_seg.dataloaders.datasets import PseudoLabelDataset
 
 
-def make_runtime_dataset():
+def make_runtime_dataset(train_cfg: TrainConfig | None = None):
     images = {f"vol{i}": np.zeros((1, 16, 16), dtype=np.float32) for i in range(3)}
     labels = {}
     for i in range(3):
@@ -18,10 +20,14 @@ def make_runtime_dataset():
         label_size=1,
         n_classes=4,
         ignore_lbl=-1,
-        indices_dict={},
         dim=2,
         seed=0,
         samples_per_class={},
+        train_substacks=[
+            {"substack_id": i, "stack_name": f"vol{i}", "z_start": 0, "z_stop": 1, "depth": 1}
+            for i in range(3)
+        ],
+        train_cfg=train_cfg,
     )
     return dataset
 
@@ -49,21 +55,28 @@ def set_schedule(dataset, rows):
         fields["is_enabled"].append(bool(row["is_enabled"]))
         fields["last_confidence"].append(float(row["last_confidence"]))
 
-    dataset.schedule = {
-        "name_id": np.asarray(fields["name_id"], dtype=np.int32),
-        "coords": np.asarray(fields["coords"], dtype=np.int32),
-        "current_label": np.asarray(fields["current_label"], dtype=np.int32),
-        "gt_label": np.asarray(fields["gt_label"], dtype=np.int32),
-        "confidence": np.asarray(fields["confidence"], dtype=np.float32),
-        "label_source": np.asarray(fields["label_source"], dtype=np.int32),
-        "stage_index": np.asarray(fields["stage_index"], dtype=np.int32),
-        "is_enabled": np.asarray(fields["is_enabled"], dtype=np.bool_),
-        "stage_disabled": np.asarray(fields["stage_disabled"], dtype=np.int32),
-        "consecutive_keep_failures": np.asarray(fields["consecutive_keep_failures"], dtype=np.int32),
-        "last_predicted_label": np.asarray(fields["last_predicted_label"], dtype=np.int32),
-        "last_confidence": np.asarray(fields["last_confidence"], dtype=np.float32),
-    }
-    dataset._bump_sampling_version()
+    dataset._schedule = DataSchedule.from_mapping(
+        mapping={
+            "name_id": np.asarray(fields["name_id"], dtype=np.int32),
+            "coords": np.asarray(fields["coords"], dtype=np.int32),
+            "current_label": np.asarray(fields["current_label"], dtype=np.int32),
+            "gt_label": np.asarray(fields["gt_label"], dtype=np.int32),
+            "confidence": np.asarray(fields["confidence"], dtype=np.float32),
+            "label_source": np.asarray(fields["label_source"], dtype=np.int32),
+            "stage_index": np.asarray(fields["stage_index"], dtype=np.int32),
+            "is_enabled": np.asarray(fields["is_enabled"], dtype=np.bool_),
+            "stage_disabled": np.asarray(fields["stage_disabled"], dtype=np.int32),
+            "consecutive_keep_failures": np.asarray(fields["consecutive_keep_failures"], dtype=np.int32),
+            "last_predicted_label": np.asarray(fields["last_predicted_label"], dtype=np.int32),
+            "last_confidence": np.asarray(fields["last_confidence"], dtype=np.float32),
+        },
+        seed=dataset.seed,
+        stage_index=dataset.stage_index,
+        sampling_version=dataset.sampling_version,
+    )
+    dataset._build_components()
+    dataset.schedule.bump_version()
+    dataset.sampling_version = dataset.schedule.sampling_version
 
 
 def make_row(idx, *, name_id, coords, current_label, gt_label, label_source, stage_index, is_enabled=True, stage_disabled=-1, consecutive_keep_failures=0, confidence=1.0, last_predicted_label=None, last_confidence=None):
@@ -97,19 +110,18 @@ def test_gt_rows_are_never_pruned_and_pseudo_rows_disable_after_patience():
             make_row(1, name_id=1, coords=(0, 5, 5), current_label=1, gt_label=1, label_source=1, stage_index=1, confidence=0.9),
         ],
     )
+    dataset.schedule_engine.maintenance_policy.enable_pruning = True
+    dataset.schedule_engine.maintenance_policy.pruning_patience = 1
 
     def evaluator(batch):
         preds = np.array([0, 3], dtype=np.int32)
         confs = np.array([0.2, 0.2], dtype=np.float32)
         return preds, confs
 
-    disabled = dataset.reevaluate_pseudolabels_for_stage(
+    disabled = dataset.schedule_engine.reevaluate_schedule(
         next_stage_idx=2,
         evaluator=evaluator,
         evaluation_batch_size=8,
-        keep_threshold=0.75,
-        pruning_patience=1,
-        enable_pruning=True,
     )
 
     assert disabled == 1
@@ -136,17 +148,16 @@ def test_successful_reevaluation_resets_failure_counter():
             ),
         ],
     )
+    dataset.schedule_engine.maintenance_policy.enable_pruning = True
+    dataset.schedule_engine.maintenance_policy.pruning_patience = 2
 
     def evaluator(batch):
         return np.array([2], dtype=np.int32), np.array([0.95], dtype=np.float32)
 
-    disabled = dataset.reevaluate_pseudolabels_for_stage(
+    disabled = dataset.schedule_engine.reevaluate_schedule(
         next_stage_idx=2,
         evaluator=evaluator,
         evaluation_batch_size=4,
-        keep_threshold=0.75,
-        pruning_patience=2,
-        enable_pruning=True,
     )
 
     assert disabled == 0
@@ -166,6 +177,8 @@ def test_add_pseudolabels_tops_up_to_target_active_count_after_pruning():
             make_row(2, name_id=1, coords=(0, 6, 6), current_label=2, gt_label=2, label_source=1, stage_index=1, confidence=0.9),
         ],
     )
+    dataset.schedule_engine.maintenance_policy.enable_pruning = True
+    dataset.schedule_engine.maintenance_policy.pruning_patience = 1
 
     def fail_one(batch):
         preds = []
@@ -179,37 +192,33 @@ def test_add_pseudolabels_tops_up_to_target_active_count_after_pruning():
                 confs.append(0.95)
         return np.asarray(preds, dtype=np.int32), np.asarray(confs, dtype=np.float32)
 
-    dataset.reevaluate_pseudolabels_for_stage(
+    dataset.schedule_engine.reevaluate_schedule(
         next_stage_idx=2,
         evaluator=fail_one,
         evaluation_batch_size=4,
-        keep_threshold=0.75,
-        pruning_patience=1,
-        enable_pruning=True,
     )
 
-    original_sampler = dataset._sample_candidate_batch
-    original_builder = dataset.build_candidate_batch
+    original_sampler = dataset.schedule_engine.sampler
     candidate_coords = [("vol2", 0, 7, 7), ("vol1", 0, 8, 8), ("vol0", 0, 9, 9)]
 
-    def candidate_sampler(forbidden_coords, batch_size):
-        return [coord for coord in candidate_coords if coord not in forbidden_coords][:batch_size]
+    class _Sampler:
+        def sample_batch(self, forbidden_coords, batch_size):
+            return [coord for coord in candidate_coords if coord not in forbidden_coords][:batch_size]
 
     def evaluator(batch):
         return np.array([1, 2, 3], dtype=np.int32), np.array([0.95, 0.96, 0.97], dtype=np.float32)
 
-    dataset._sample_candidate_batch = candidate_sampler
-    accepted = dataset.add_pseudolabels_for_stage(
+    dataset.schedule_engine.sampler = _Sampler()
+    accepted = dataset.schedule_engine.extend_schedule(
         stage_index=2,
-        target_active_pseudolabels=4,
+        target_active_rows=4,
         evaluator=evaluator,
         evaluation_batch_size=4,
     )
-    dataset._sample_candidate_batch = original_sampler
-    dataset.build_candidate_batch = original_builder
+    dataset.schedule_engine.sampler = original_sampler
 
     assert accepted == 3
-    assert dataset.count_active_pseudolabels() == 4
+    assert dataset.schedule.count_active_pseudolabels() == 4
 
 
 def test_re_admitting_disabled_coordinate_creates_new_active_row():
@@ -234,26 +243,104 @@ def test_re_admitting_disabled_coordinate_creates_new_active_row():
         ],
     )
 
-    original_sampler = dataset._sample_candidate_batch
+    original_sampler = dataset.schedule_engine.sampler
     candidate_coords = [("vol1", 0, 5, 5)]
 
-    def candidate_sampler(forbidden_coords, batch_size):
-        return [coord for coord in candidate_coords if coord not in forbidden_coords][:batch_size]
+    class _Sampler:
+        def sample_batch(self, forbidden_coords, batch_size):
+            return [coord for coord in candidate_coords if coord not in forbidden_coords][:batch_size]
 
     def evaluator(batch):
         return np.array([1], dtype=np.int32), np.array([0.97], dtype=np.float32)
 
-    dataset._sample_candidate_batch = candidate_sampler
-    accepted = dataset.add_pseudolabels_for_stage(
+    dataset.schedule_engine.sampler = _Sampler()
+    accepted = dataset.schedule_engine.extend_schedule(
         stage_index=3,
-        target_active_pseudolabels=1,
+        target_active_rows=1,
         evaluator=evaluator,
         evaluation_batch_size=4,
     )
-    dataset._sample_candidate_batch = original_sampler
+    dataset.schedule_engine.sampler = original_sampler
 
     assert accepted == 1
     assert len(dataset.schedule["name_id"]) == 3
     assert bool(dataset.schedule["is_enabled"][1]) is False
     assert bool(dataset.schedule["is_enabled"][2]) is True
     assert tuple(dataset.schedule["coords"][1]) == tuple(dataset.schedule["coords"][2])
+
+
+def test_active_learning_extension_stores_ground_truth_with_source_two():
+    dataset = make_runtime_dataset(
+        TrainConfig(
+            training_regime="active_learning",
+            candidate_sampling={"name": "uniform_coordinate_sampling"},
+            schedule_admission={"name": "admit_all_with_gt"},
+            pseudolabel_maintenance={"name": "noop"},
+        )
+    )
+    set_schedule(
+        dataset,
+        [
+            make_row(0, name_id=0, coords=(0, 4, 4), current_label=0, gt_label=0, label_source=0, stage_index=0),
+        ],
+    )
+
+    original_sampler = dataset.schedule_engine.sampler
+    candidate_coords = [("vol1", 0, 5, 5), ("vol2", 0, 6, 6)]
+
+    class _Sampler:
+        def sample_batch(self, forbidden_coords, batch_size):
+            return [coord for coord in candidate_coords if coord not in forbidden_coords][:batch_size]
+
+    def evaluator(batch):
+        return np.array([3, 1], dtype=np.int32), np.array([0.15, 0.25], dtype=np.float32)
+
+    dataset.schedule_engine.sampler = _Sampler()
+    accepted = dataset.schedule_engine.extend_schedule(
+        stage_index=1,
+        target_active_rows=2,
+        evaluator=evaluator,
+        evaluation_batch_size=8,
+        target_label_source=2,
+    )
+    dataset.schedule_engine.sampler = original_sampler
+
+    assert accepted == 2
+    acquired_indices = dataset.schedule.get_active_label_source_indices(2)
+    assert len(acquired_indices) == 2
+    np.testing.assert_array_equal(dataset.schedule["label_source"][acquired_indices], np.array([2, 2], dtype=np.int32))
+    np.testing.assert_array_equal(
+        dataset.schedule["current_label"][acquired_indices],
+        dataset.schedule["gt_label"][acquired_indices],
+    )
+    np.testing.assert_allclose(dataset.schedule["last_confidence"][acquired_indices], np.array([0.15, 0.25], dtype=np.float32))
+
+
+def test_active_learning_noop_maintenance_keeps_acquired_rows_enabled():
+    dataset = make_runtime_dataset(
+        TrainConfig(
+            training_regime="active_learning",
+            candidate_sampling={"name": "uniform_coordinate_sampling"},
+            schedule_admission={"name": "admit_all_with_gt"},
+            pseudolabel_maintenance={"name": "noop"},
+        )
+    )
+    set_schedule(
+        dataset,
+        [
+            make_row(0, name_id=0, coords=(0, 4, 4), current_label=0, gt_label=0, label_source=0, stage_index=0),
+            make_row(1, name_id=1, coords=(0, 5, 5), current_label=1, gt_label=1, label_source=2, stage_index=1, confidence=0.7),
+        ],
+    )
+
+    disabled = dataset.schedule_engine.reevaluate_schedule(
+        next_stage_idx=2,
+        evaluator=lambda batch: (np.array([3], dtype=np.int32), np.array([0.01], dtype=np.float32)),
+        evaluation_batch_size=4,
+        target_label_source=2,
+    )
+
+    assert disabled == 0
+    acquired_idx = dataset.schedule.get_active_label_source_indices(2)
+    assert len(acquired_idx) == 1
+    assert bool(dataset.schedule["is_enabled"][acquired_idx[0]]) is True

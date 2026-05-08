@@ -8,7 +8,7 @@ import numpy as np
 from eps_seg.data.schedule import DataSchedule, EvaluatedCandidate
 
 
-class PseudolabelAdmissionPolicy(Protocol):
+class ScheduleAdmissionPolicy(Protocol):
     """
     Interface for pseudo-label admission policies.
 
@@ -16,7 +16,7 @@ class PseudolabelAdmissionPolicy(Protocol):
         None
 
     Returns:
-        PseudolabelAdmissionPolicy: Object deciding which evaluated candidates enter the schedule.
+        ScheduleAdmissionPolicy: Object deciding which evaluated candidates enter the schedule.
     """
 
     def admit(
@@ -25,7 +25,7 @@ class PseudolabelAdmissionPolicy(Protocol):
         evaluated_candidates: list[EvaluatedCandidate],
         schedule: DataSchedule,
         name_to_id: dict[str, int],
-        target_active_pseudolabels: int,
+        target_active_rows: int,
     ) -> int:
         """
         Admit evaluated candidates into the scheduler.
@@ -35,7 +35,7 @@ class PseudolabelAdmissionPolicy(Protocol):
             evaluated_candidates: Evaluated candidate voxels with predictions and confidences.
             schedule: Schedule to mutate.
             name_to_id: Mapping from stack names to integer identifiers.
-            target_active_pseudolabels: Desired number of active pseudo-labels after admission.
+            target_active_rows: Desired number of active rows after admission.
 
         Returns:
             int: Number of admitted pseudo-labels.
@@ -88,7 +88,50 @@ class PseudolabelMaintenancePolicy(Protocol):
 
 
 @dataclass
-class ConfidenceThresholdAdmissionPolicy(PseudolabelAdmissionPolicy):
+class AdmitAllWithGtAdmissionPolicy(ScheduleAdmissionPolicy):
+    """
+    Admission policy for active learning acquisitions. Every candidate is
+    admitted and stored with its ground-truth label.
+    """
+
+    label_source: int = 2
+
+    def admit(
+        self,
+        stage_index: int,
+        evaluated_candidates: list[EvaluatedCandidate],
+        schedule: DataSchedule,
+        name_to_id: dict[str, int],
+        target_active_rows: int,
+    ) -> int:
+        accepted = 0
+        for candidate in evaluated_candidates:
+            if schedule.count_active_label_source_rows(self.label_source) >= target_active_rows:
+                break
+            schedule.add_record(
+                name_id=name_to_id[candidate.stack_name],
+                coords=(candidate.z, candidate.y, candidate.x),
+                current_label=int(candidate.gt_label),
+                gt_label=int(candidate.gt_label),
+                confidence=float(candidate.confidence),
+                label_source=int(self.label_source),
+                stage_index=int(stage_index),
+                is_enabled=True,
+                stage_disabled=-1,
+                consecutive_keep_failures=0,
+                last_predicted_label=int(candidate.predicted_label),
+                last_confidence=float(candidate.confidence),
+            )
+            accepted += 1
+        return accepted
+
+    def admission_rule(self, confidence: float) -> bool:
+        del confidence
+        return True
+
+
+@dataclass
+class ConfidenceThresholdWithPlAdmissionPolicy(ScheduleAdmissionPolicy):
     """
     Confidence-window pseudo-label admission policy.
 
@@ -109,7 +152,7 @@ class ConfidenceThresholdAdmissionPolicy(PseudolabelAdmissionPolicy):
         evaluated_candidates: list[EvaluatedCandidate],
         schedule: DataSchedule,
         name_to_id: dict[str, int],
-        target_active_pseudolabels: int,
+        target_active_rows: int,
     ) -> int:
         """
         Admit all evaluated candidates whose confidence lies inside the configured confidence window.
@@ -119,7 +162,7 @@ class ConfidenceThresholdAdmissionPolicy(PseudolabelAdmissionPolicy):
             evaluated_candidates: Evaluated candidate voxels with predictions and confidences.
             schedule: Schedule to mutate.
             name_to_id: Mapping from stack names to integer identifiers.
-            target_active_pseudolabels: Desired number of active pseudo-labels after admission.
+            target_active_rows: Desired number of active rows after admission.
 
         Returns:
             int: Number of admitted pseudo-labels.
@@ -127,7 +170,7 @@ class ConfidenceThresholdAdmissionPolicy(PseudolabelAdmissionPolicy):
 
         accepted = 0
         for candidate in evaluated_candidates:
-            if schedule.count_active_pseudolabels() >= target_active_pseudolabels:
+            if schedule.count_active_label_source_rows(1) >= target_active_rows:
                 break
             if not self.admission_rule(float(candidate.confidence)):
                 continue
@@ -176,7 +219,7 @@ class PruningPolicy(PseudolabelMaintenancePolicy):
         PruningPolicy: Maintenance policy that disables rows after repeated admission-rule failures.
     """
 
-    admission_policy: PseudolabelAdmissionPolicy
+    admission_policy: ScheduleAdmissionPolicy
     pruning_patience: int
     enable_pruning: bool
 
@@ -223,3 +266,21 @@ class PruningPolicy(PseudolabelMaintenancePolicy):
                 schedule.disable_record(schedule_idx=schedule_idx, stage_disabled=int(next_stage_idx))
                 disabled_count += 1
         return disabled_count
+
+
+class NoOpMaintenancePolicy(PseudolabelMaintenancePolicy):
+    """
+    Maintenance policy that never disables rows and leaves the schedule
+    unchanged. Used by the active-learning regime by default.
+    """
+
+    def reevaluate(
+        self,
+        next_stage_idx: int,
+        batch_indices: list[int],
+        predicted_labels: np.ndarray,
+        confidences: np.ndarray,
+        schedule: DataSchedule,
+    ) -> int:
+        del next_stage_idx, batch_indices, predicted_labels, confidences, schedule
+        return 0

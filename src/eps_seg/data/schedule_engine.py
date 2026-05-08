@@ -6,7 +6,7 @@ import numpy as np
 
 from eps_seg.data.sampling import CandidateSamplingStrategy
 from eps_seg.data.schedule import DataSchedule, EvaluatedCandidate
-from eps_seg.data.schedule_policies import PseudolabelAdmissionPolicy, PseudolabelMaintenancePolicy
+from eps_seg.data.schedule_policies import PseudolabelMaintenancePolicy, ScheduleAdmissionPolicy
 
 
 class SchedulerBackedDataset(Protocol):
@@ -63,7 +63,7 @@ class ScheduleEngine:
         dataset: SchedulerBackedDataset,
         schedule: DataSchedule,
         sampler: CandidateSamplingStrategy,
-        admission_policy: PseudolabelAdmissionPolicy,
+        admission_policy: ScheduleAdmissionPolicy,
         maintenance_policy: PseudolabelMaintenancePolicy,
     ) -> None:
         self.dataset = dataset
@@ -75,24 +75,26 @@ class ScheduleEngine:
     def extend_schedule(
         self,
         stage_index: int,
-        target_active_pseudolabels: int,
+        target_active_rows: int,
         evaluation_batch_size: int,
         evaluator: Callable[[dict], tuple[np.ndarray, np.ndarray]],
+        target_label_source: int = 1,
     ) -> int:
         """
-        Extend the scheduler with newly admitted pseudo-labels.
+        Extend the scheduler with new admitted rows.
 
         Args:
-            stage_index: Stage receiving the newly admitted pseudo-labels.
-            target_active_pseudolabels: Desired number of active pseudo-labels after extension.
+            stage_index: Stage receiving the new admitted rows.
+            target_active_rows: Desired number of active rows after extension.
             evaluation_batch_size: Number of proposed candidates evaluated per round.
             evaluator: Callable returning ``(predicted_labels, confidences)`` for a candidate batch.
+            target_label_source: Label source to extend. 1 for pseudo-labels, 2 for active learning labels.
 
         Returns:
-            int: Number of admitted pseudo-labels.
+            int: Number of admitted rows.
         """
 
-        if target_active_pseudolabels <= self.schedule.count_active_pseudolabels():
+        if target_active_rows <= self.schedule.count_active_label_source_rows(target_label_source):
             return 0
 
         forbidden_coords = self.schedule.scheduled_coordinate_set(id_to_name=self.dataset.id_to_name, active_only=True)
@@ -100,7 +102,10 @@ class ScheduleEngine:
         no_progress_rounds = 0
         max_no_progress_rounds = 32
 
-        while self.schedule.count_active_pseudolabels() < target_active_pseudolabels and no_progress_rounds < max_no_progress_rounds:
+        while (
+            self.schedule.count_active_label_source_rows(target_label_source) < target_active_rows
+            and no_progress_rounds < max_no_progress_rounds
+        ):
             coords_batch = self.sampler.sample_batch(forbidden_coords=forbidden_coords, batch_size=evaluation_batch_size)
             if len(coords_batch) == 0:
                 break
@@ -130,7 +135,7 @@ class ScheduleEngine:
                 evaluated_candidates=evaluated_candidates,
                 schedule=self.schedule,
                 name_to_id=self.dataset.name_to_id,
-                target_active_pseudolabels=target_active_pseudolabels,
+                target_active_rows=target_active_rows,
             )
             accepted += accepted_this_round
 
@@ -150,6 +155,7 @@ class ScheduleEngine:
         next_stage_idx: int,
         evaluation_batch_size: int,
         evaluator: Callable[[dict], tuple[np.ndarray, np.ndarray]],
+        target_label_source: int = 1,
     ) -> int:
         """
         Reevaluate active pseudo-labels and apply the configured maintenance policy.
@@ -158,12 +164,13 @@ class ScheduleEngine:
             next_stage_idx: Stage that is about to start.
             evaluation_batch_size: Number of active pseudo-label rows reevaluated per batch.
             evaluator: Callable returning ``(predicted_labels, confidences)`` for a scheduler batch.
+            target_label_source: Label source to reevaluate. 1 for pseudo-labels, 2 for active learning labels.
 
         Returns:
             int: Number of disabled pseudo-label rows.
         """
 
-        pseudo_indices = self.schedule.get_active_pseudolabel_indices().tolist()
+        pseudo_indices = self.schedule.get_active_label_source_indices(target_label_source).tolist()
         if len(pseudo_indices) == 0:
             return 0
 

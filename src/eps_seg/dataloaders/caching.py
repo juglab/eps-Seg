@@ -291,16 +291,15 @@ class DatasetCache:
         sampled = label_coords[sampled_idx]
         return [(int(y), int(x)) for (y, x) in sampled]
 
-    def sample_canonical_anchor_records(
+    def sample_canonical_coordinate_records(
         self, labels: Dict[str, np.ndarray], substacks: List[dict]
     ) -> List[dict]:
         """
-        Sample canonical GT anchors once within each substack, before any fold
+        Sample canonical GT coordinate records once within each substack, before any fold
         assignment takes place.
         """
         strategy = build_initial_label_sampling_strategy(
             cfg=InitialLabelSamplingConfig(name=self.effective_initial_label_sampling_name()),
-            has_anchor_records=False,
             has_train_substacks=bool(substacks),
         )
         name_to_id = {name: idx for idx, name in enumerate(labels.keys())}
@@ -308,7 +307,7 @@ class DatasetCache:
         context = InitialLabelSamplingContext(
             images=labels,
             labels=labels,
-            anchor_records=[],
+            coordinate_records=[],
             train_substacks=substacks,
             samples_per_class=dict(self.cfg.samples_per_class or {}),
             unique_labels=np.array(range(self.cfg.n_classes)),
@@ -409,7 +408,7 @@ class DatasetCache:
                 )
         return rows
 
-    def load_external_anchor_records(
+    def load_external_coordinate_records(
         self,
         labels: Dict[str, np.ndarray],
     ) -> Tuple[List[dict], List[dict], List[dict]]:
@@ -490,7 +489,7 @@ class DatasetCache:
                 next_coord_id += 1
 
         if not sampled_coords:
-            raise ValueError("External coordinate import produced no canonical anchors.")
+            raise ValueError("External coordinate import produced no canonical coordinate records.")
 
         fold_assignments = [
             {
@@ -580,9 +579,9 @@ class DatasetCache:
         Compute per-fold statistics and normalized data payloads.
         """
         substacks_by_id = {substack["substack_id"]: substack for substack in substacks}
-        anchors_by_substack: Dict[int, List[dict]] = {}
+        coordinates_by_substack: Dict[int, List[dict]] = {}
         for record in sampled_coords:
-            anchors_by_substack.setdefault(record["substack_id"], []).append(record)
+            coordinates_by_substack.setdefault(record["substack_id"], []).append(record)
 
         assignments_by_fold: Dict[int, Dict[int, str]] = {}
         for row in fold_assignments:
@@ -617,31 +616,31 @@ class DatasetCache:
                 "n_val_substacks": len(val_substacks),
             }
 
-            train_anchors: List[dict] = []
-            val_anchors: List[dict] = []
+            train_records: List[dict] = []
+            val_records: List[dict] = []
             for substack_id, split in fold_map.items():
                 if split == "train":
-                    train_anchors.extend(anchors_by_substack.get(substack_id, []))
+                    train_records.extend(coordinates_by_substack.get(substack_id, []))
                 else:
-                    val_anchors.extend(anchors_by_substack.get(substack_id, []))
+                    val_records.extend(coordinates_by_substack.get(substack_id, []))
 
-            row["n_train_coords"] = len(train_anchors)
-            row["n_val_coords"] = len(val_anchors)
+            row["n_train_coords"] = len(train_records)
+            row["n_val_coords"] = len(val_records)
 
             for class_idx in range(self.cfg.n_classes):
                 row[f"train_class_{class_idx}_count"] = sum(
-                    1 for record in train_anchors if int(record["gt_label"]) == class_idx
+                    1 for record in train_records if int(record["gt_label"]) == class_idx
                 )
                 row[f"val_class_{class_idx}_count"] = sum(
-                    1 for record in val_anchors if int(record["gt_label"]) == class_idx
+                    1 for record in val_records if int(record["gt_label"]) == class_idx
                 )
 
             for key in self.cfg.train_keys:
                 row[f"train_stack_{key}_count"] = sum(
-                    1 for record in train_anchors if record["stack_name"] == key
+                    1 for record in train_records if record["stack_name"] == key
                 )
                 row[f"val_stack_{key}_count"] = sum(
-                    1 for record in val_anchors if record["stack_name"] == key
+                    1 for record in val_records if record["stack_name"] == key
                 )
 
             fold_stats_rows.append(row)
@@ -650,18 +649,18 @@ class DatasetCache:
 
     def build_trainval_cache_payload(self) -> Dict[str, object]:
         """
-        Build the canonical-anchor training/validation payload from the original dataset.
+        Build the canonical-coordinate training/validation payload from the original dataset.
         """
         images, labels = self.load_source_and_labels(self.cfg.train_keys)
         if self.cfg.load_train_coords_from and self.cfg.load_val_coords_from:
-            print("[DataModule] Importing canonical anchors from external train/val CSVs...")
-            substacks, sampled_coords, fold_assignments = self.load_external_anchor_records(
+            print("[DataModule] Importing canonical coordinate records from external train/val CSVs...")
+            substacks, sampled_coords, fold_assignments = self.load_external_coordinate_records(
                 labels
             )
         else:
-            print("[DataModule] Sampling canonical anchors from raw labels...")
+            print("[DataModule] Sampling canonical coordinate records from raw labels...")
             substacks = self.build_valid_substacks(labels)
-            sampled_coords = self.sample_canonical_anchor_records(labels, substacks)
+            sampled_coords = self.sample_canonical_coordinate_records(labels, substacks)
             fold_assignments = self.build_fold_assignments(substacks)
         fold_stats, normalized_by_fold = self.compute_fold_stats_rows(
             images=images,
@@ -687,7 +686,7 @@ class DatasetCache:
 
     def write_cached_dataset_splits(self, data_to_cache: Dict[str, object]):
         """
-        Persist the shared canonical-anchor cache to disk.
+        Persist the shared canonical-coordinate cache to disk.
         """
         assert self.cache_dir is not None, "cache_dir must be specified to cache dataset splits."
         assert Path(self.cache_dir).resolve() != Path(self.cfg.data_dir).resolve(), (
@@ -839,8 +838,8 @@ class DatasetCache:
             "trainval_labels": labels,
             "data_mean": fold_stat_row["data_mean"],
             "data_std": fold_stat_row["data_std"],
-            "train_anchor_records": train_records,
-            "val_anchor_records": val_records,
+            "train_coordinate_records": train_records,
+            "val_coordinate_records": val_records,
             "train_substacks": train_substacks,
             "val_substacks": val_substacks,
         }
@@ -863,7 +862,7 @@ class DatasetCache:
 
     def load_cached_trainval_fold(self, fold: int) -> Dict[str, object]:
         """
-        Load cached train/validation images, labels, canonical anchors, and
+        Load cached train/validation images, labels, canonical coordinate records, and
         fold statistics for the selected fold.
         """
         if not self.cache_dir.resolve().exists():

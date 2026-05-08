@@ -82,11 +82,18 @@ def log_scheduler_stats(module):
     disabled_samples = int(total_samples - active_samples)
     avg_active_confidence = float(schedule["confidence"][enabled_mask].mean()) if active_samples > 0 else 0.0
     active_pseudo_mask = enabled_mask & (schedule["label_source"] == 1)
+    active_initial_mask = enabled_mask & (schedule["label_source"] == 0)
+    active_acquired_mask = enabled_mask & (schedule["label_source"] == 2)
     active_pseudo_count = int(active_pseudo_mask.sum())
+    active_initial_count = int(active_initial_mask.sum())
+    active_acquired_count = int(active_acquired_mask.sum())
     module.log("scheduler/active_samples", float(active_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/disabled_samples", float(disabled_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/total_samples", float(total_samples), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     module.log("scheduler/avg_active_confidence", avg_active_confidence, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+    module.log("scheduler/active_initial_labels", float(active_initial_count), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+    module.log("scheduler/active_acquired_labels", float(active_acquired_count), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+    module.log("scheduler/active_pseudolabels", float(active_pseudo_count), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
     for class_idx in range(int(module.cfg.n_components)):
         if active_pseudo_count == 0:
             class_fraction = 0.0
@@ -97,6 +104,9 @@ def log_scheduler_stats(module):
 
 def log_trainer_state(module):
     module.log("trainer/current_stage", float(module.current_stage_idx), on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+    regime_name = getattr(getattr(module, "train_cfg", None), "training_regime", "semisupervised")
+    regime_to_id = {"semisupervised": 0.0, "active_learning": 1.0, "upper_bound_replay": 2.0}
+    module.log("trainer/training_regime_id", regime_to_id.get(regime_name, -1.0), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
     early_stopping_callback = _get_early_stopping_callback(module)
     if early_stopping_callback is not None:

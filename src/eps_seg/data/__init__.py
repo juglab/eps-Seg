@@ -6,17 +6,17 @@ from eps_seg.data.schedule import DataSchedule, EvaluatedCandidate
 from eps_seg.data.initial_label_sampling import (
     ClassBalancedSliceInitialLabelSamplingStrategy,
     ClassBalancedSubstackInitialLabelSamplingStrategy,
-    FromCSVInitialLabelSamplingStrategy,
     InitialLabelSamplingStrategy,
+    populate_schedule_from_coordinate_records,
 )
 from eps_seg.data.sampling import (
     CandidateSamplingStrategy,
-    ClassWeightedTrainRegionSamplingStrategy,
-    UniformTrainRegionSamplingStrategy,
+    ClassBalancedSubstackSamplingStrategy,
+    UniformCoordinateSamplingStrategy,
 )
 from eps_seg.data.schedule_policies import (
-    ConfidenceThresholdAdmissionPolicy,
-    PseudolabelAdmissionPolicy,
+    ConfidenceThresholdWithPlAdmissionPolicy,
+    ScheduleAdmissionPolicy,
     PseudolabelMaintenancePolicy,
     PruningPolicy,
 )
@@ -24,17 +24,17 @@ from eps_seg.data.schedule_engine import ScheduleEngine
 
 __all__ = [
     "CandidateSamplingStrategy",
-    "ClassWeightedTrainRegionSamplingStrategy",
+    "ClassBalancedSubstackSamplingStrategy",
     "ClassBalancedSliceInitialLabelSamplingStrategy",
     "ClassBalancedSubstackInitialLabelSamplingStrategy",
-    "ConfidenceThresholdAdmissionPolicy",
+    "ConfidenceThresholdWithPlAdmissionPolicy",
     "DataSchedule",
     "EvaluatedCandidate",
-    "FromCSVInitialLabelSamplingStrategy",
     "InitialLabelSamplingStrategy",
-    "PseudolabelAdmissionPolicy",
+    "populate_schedule_from_coordinate_records",
+    "ScheduleAdmissionPolicy",
     "PseudolabelMaintenancePolicy",
     "PruningPolicy",
     "ScheduleEngine",
-    "UniformTrainRegionSamplingStrategy",
+    "UniformCoordinateSamplingStrategy",
 ]

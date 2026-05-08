@@ -11,10 +11,13 @@ from tqdm import tqdm
 from eps_seg.config.train import TrainConfig
 from eps_seg.data.factory import (
     build_candidate_sampling_strategy,
-    build_pseudolabel_admission_policy,
+    build_schedule_admission_policy,
     build_pseudolabel_maintenance_policy,
 )
-from eps_seg.data.initial_label_sampling import FromCSVInitialLabelSamplingStrategy, InitialLabelSamplingContext
+from eps_seg.data.initial_label_sampling import (
+    InitialLabelSamplingContext,
+    populate_schedule_from_coordinate_records,
+)
 from eps_seg.data.sampling import SamplingDomain
 from eps_seg.data.schedule import DataSchedule
 from eps_seg.data.schedule_engine import ScheduleEngine
@@ -34,7 +37,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         samples_per_class: Optional[Dict[int, int]] = None,
         scheduler_path: Optional[Union[str, Path]] = None,
         stage_index: int = 0,
-        anchor_records: Optional[List[Dict[str, int]]] = None,
+        coordinate_records: Optional[List[Dict[str, int]]] = None,
         train_substacks: Optional[List[Dict[str, int]]] = None,
         train_cfg: Optional[TrainConfig] = None,
     ) -> None:
@@ -42,13 +45,52 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         Dataset storing the full staged scheduler used by the refactored
         training loop.
 
-        Stage-0 rows are initialized from canonical cached anchor records when
+        Stage-0 rows are initialized from canonical cached coordinate records when
         no scheduler file is provided. Initial GT sampling happens during cache
         creation, not during dataset construction.
+
+        Args:
+            images: dict of np.ndarrays
+                Key: image name,
+                Value: Image volume of shape (C,Z,H,W) or (Z,H,W)
+            labels: dict of np.ndarrays
+                Key: image name,
+                Value: Label volume of shape (Z,H,W) or (1,Z,H,W)
+            patch_size: int (Default: 64)
+                Spatial size of the extracted patches
+            label_size: int (Default: 1)
+                Spatial label patch size (must be <= patch_size//2)
+            n_classes: int (Default: 4)
+                Number of semantic classes in the labels (including background)
+            ignore_lbl: int (Default: -1)
+                Label value to ignore when sampling candidates
+            dim: int (Default: 2)
+                Whether to sample 2D or 3D patches (must be 2 or 3)
+            seed: int (Default: 42)
+                Random seed for reproducible candidate sampling and schedule mutations
+            samples_per_class: dict (Default: None)
+                Optional per-class override for number of candidates to sample from each class during stage-0 initialization.
+                Key: class label (int), Value: number of candidates to sample (int).
+                If not provided, defaults to 1 candidate per class.
+            scheduler_path: str or Path (Default: None)
+                Optional path to a ``.npz`` scheduler snapshot. If provided and the file exists, the scheduler will be loaded from disk instead of being initialized from the coordinate records.
+            stage_index: int (Default: 0)
+                Initial stage index for the dataset scheduler. This does not affect the loaded scheduler state if a scheduler snapshot is provided, 
+                but it does affect the random seed used for runtime candidate sampling and schedule mutations, which is computed as ``seed + stage_index``.
+            coordinate_records: list of dicts (Default: None)
+                Optional list of coordinate records for initializing the dataset.
+                Each record should be a dict with keys: "stack_name", "z", "y", "x", "gt_label", "substack_id", "z_start", "z_stop", and "coord_id".
+                If not provided, stage-0 initialization will be skipped (resulting in an empty scheduler) unless a scheduler snapshot is loaded from disk.
+            train_substacks: list of dicts (Default: None)
+                Optional list of train substacks for initializing the dataset.
+                Each record should be a dict with keys: "stack_name", "z_start", and "z_stop".
+                If not provided, stage-0 initialization will be skipped (resulting in an empty scheduler) unless a scheduler snapshot is loaded from disk.
+            train_cfg: TrainConfig (Default: None)
+                Optional training configuration for the dataset.
         """
         self.images = images
         self.labels = labels
-        self.anchor_records = anchor_records or []
+        self.coordinate_records = coordinate_records or []
         self.train_substacks = train_substacks or []
         self.patch_size = patch_size
         self.label_size = label_size
@@ -58,7 +100,8 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self.unique_labels = np.array(range(n_classes))
         self.dim = dim
         self.seed = seed
-        self.rng = random.Random(self.seed)
+        self._runtime_stage_index = int(stage_index)
+        self.rng = random.Random(self._runtime_rng_seed())
         self.samples_per_class = samples_per_class or {}
         self.default_samples_per_class = 1
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
@@ -69,12 +112,12 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         self.stack_names = list(self.images.keys())
         self.name_to_id = {name: i for i, name in enumerate(self.stack_names)}
         self.id_to_name = {i: name for i, name in enumerate(self.stack_names)}
-        self.label_source_names = {0: "gt_initial", 1: "pseudo"}
+        self.label_source_names = {0: "gt_initial", 1: "pseudo", 2: "gt_acquired"}
         self._schedule = DataSchedule.empty(seed=self.seed, stage_index=self.stage_index)
         self.initial_label_sampling_context = InitialLabelSamplingContext(
             images=self.images,
             labels=self.labels,
-            anchor_records=self.anchor_records,
+            coordinate_records=self.coordinate_records,
             train_substacks=self.train_substacks,
             samples_per_class=self.samples_per_class,
             unique_labels=self.unique_labels,
@@ -101,11 +144,10 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             self._load_scheduler_npz(self.scheduler_path)
         else:
             print("Initializing stage-0 labelled scheduler...")
-            if self.anchor_records:
-                FromCSVInitialLabelSamplingStrategy().populate_schedule(
+            if self.coordinate_records:
+                populate_schedule_from_coordinate_records(
                     schedule=self.schedule,
                     context=self.initial_label_sampling_context,
-                    rng=self.rng,
                 )
             self._print_schedule_report()
             self.schedule.bump_version()
@@ -135,23 +177,27 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         Returns:
             None
         """
+        # Runtime candidate sampling should depend on the target stage being
+        # constructed, not on the stage metadata loaded from a previous
+        # scheduler snapshot.
+        self.rng = random.Random(self._runtime_rng_seed())
         self.candidate_sampling_strategy = build_candidate_sampling_strategy(
             cfg=self.train_cfg.candidate_sampling,
             domain=self.sampling_domain,
             rng=self.rng,
-            samples_per_class=self.samples_per_class,
+            samples_per_class=self.train_cfg.extension_samples_per_class or self.samples_per_class,
         )
-        self.pseudolabel_admission_policy = build_pseudolabel_admission_policy(self.train_cfg.pseudolabel_admission)
+        self.schedule_admission_policy = build_schedule_admission_policy(self.train_cfg.schedule_admission)
         self.pseudolabel_maintenance_policy = build_pseudolabel_maintenance_policy(
             cfg=self.train_cfg.pseudolabel_maintenance,
-            admission_policy=self.pseudolabel_admission_policy,
+            admission_policy=self.schedule_admission_policy,
         )
 
         self.schedule_engine = ScheduleEngine(
             dataset=self,
             schedule=self.schedule,
             sampler=self.candidate_sampling_strategy,
-            admission_policy=self.pseudolabel_admission_policy,
+            admission_policy=self.schedule_admission_policy,
             maintenance_policy=self.pseudolabel_maintenance_policy,
         )
         self.slice_sampling_table = getattr(self.candidate_sampling_strategy, "slice_sampling_table", [])
@@ -162,6 +208,9 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
         """
         self.sampling_version += 1
         self.schedule.sampling_version = self.sampling_version
+
+    def _runtime_rng_seed(self) -> int:
+        return int(self.seed) + int(self._runtime_stage_index)
 
     def _is_valid_coord(self, name: str, z: int, y: int, x: int, Z: int, H: int, W: int) -> bool:
         valid = self.offset <= y < H - self.offset - 1 and self.offset <= x < W - self.offset - 1
@@ -299,7 +348,7 @@ class SemisupervisedDataset(Dataset):
         seed=42,
         n_neighbors=7,
         samples_per_class: Dict[int, int] | None = None,
-        anchor_records: Optional[List[Dict[str, int]]] = None,
+        coordinate_records: Optional[List[Dict[str, int]]] = None,
     ):
         """
         
@@ -315,11 +364,11 @@ class SemisupervisedDataset(Dataset):
             label_size: int (Default: 1)
                 Spatial size of the label patch (must be <= patch_size//2)
             mode: str (Default: "semisupervised")
-                Whether to return only anchors ("supervised") or anchors + neighbors ("semisupervised")
+                Whether to return only centers ("supervised") or centers + neighbors ("semisupervised")
             n_classes: int (Default: 4)
                 Number of semantic classes in the labels (including background)
             ignore_lbl: int (Default: -1)
-                Label value to ignore when sampling anchors and neighbors
+                Label value to ignore when sampling centers and neighbors
             indices_dict: dict (Default: None)
                 Key: image name,
                 Value: list of z indices to sample from for that image
@@ -331,9 +380,9 @@ class SemisupervisedDataset(Dataset):
                 Random seed for reproducible neighbor sampling         n_neighbors: int (Default: 7)
                 Number of neighbors to sample per anchor in semisupervised mode
             samples_per_class: dict (Default: None)
-                Optional per-class override for number of anchors to sample from each class.
-                Key: class label (int), Value: number of anchors to sample (int).
-                 If not provided, defaults to 1 anchor per class.
+                Optional per-class override for number of centers to sample from each class.
+                Key: class label (int), Value: number of centers to sample (int).
+                 If not provided, defaults to 1 center per class.
         
         """
         self.patch_size = patch_size
@@ -347,7 +396,7 @@ class SemisupervisedDataset(Dataset):
         self.unique_vals = self.unique_labels
         self.mode = mode
         self.indices_dict = indices_dict or {}
-        self.anchor_records = anchor_records or []
+        self.coordinate_records = coordinate_records or []
         self.radius = radius
         self.n_neighbors = n_neighbors
         self.seed = seed
@@ -431,13 +480,17 @@ class SemisupervisedDataset(Dataset):
         return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
-        if self.anchor_records:
-            return self._prepare_metadata_from_anchors()
+        if self.coordinate_records:
+            return self._prepare_metadata_from_coordinate_records()
         return self._prepare_metadata_from_indices()
 
     def _prepare_metadata_from_indices(self) -> List[dict]:
         groups: List[dict] = []
-        for name, z_list in tqdm(self.indices_dict.items(), desc="Preparing supervised anchors from slice indices", leave=False):
+        for name, z_list in tqdm(
+            self.indices_dict.items(),
+            desc="Preparing supervised centers from slice indices",
+            leave=False,
+        ):
             img = self.images[name]
             lbl = self.labels[name]
             Z, H, W = img.shape
@@ -469,9 +522,9 @@ class SemisupervisedDataset(Dataset):
         self._report_class_counts(groups)
         return groups
 
-    def _prepare_metadata_from_anchors(self) -> List[dict]:
+    def _prepare_metadata_from_coordinate_records(self) -> List[dict]:
         groups: List[dict] = []
-        for record in tqdm(self.anchor_records, desc="Preparing cached anchor groups", leave=False):
+        for record in tqdm(self.coordinate_records, desc="Preparing cached coordinate groups", leave=False):
             name = record["stack_name"]
             cz = int(record["z"])
             cy = int(record["y"])
@@ -525,8 +578,8 @@ class SemisupervisedDataset(Dataset):
         return groups
 
     def _modify_metadata(self) -> List[dict]:
-        if self.anchor_records:
-            return self._modify_cached_anchor_metadata()
+        if self.coordinate_records:
+            return self._modify_cached_coordinate_metadata()
 
         for g in self.groups:
             name = g["name"]
@@ -558,7 +611,7 @@ class SemisupervisedDataset(Dataset):
         self._report_class_counts(self.groups)
         return self.groups
 
-    def _modify_cached_anchor_metadata(self) -> List[dict]:
+    def _modify_cached_coordinate_metadata(self) -> List[dict]:
         for g in self.groups:
             name = g["name"]
             cz, cy, cx = map(int, g["coords"][0])
@@ -715,29 +768,29 @@ class SemisupervisedDataset(Dataset):
         self.anchor_indices_by_label = {c: [i for i, g in enumerate(self.groups) if g["labels"][0] == c] for c in range(self.n_classes)}
 
     def _report_dataset_summary(self) -> None:
-        anchor_mode = "cached anchors" if self.anchor_records else "sampled indices"
+        coordinate_mode = "cached coordinates" if self.coordinate_records else "sampled indices"
         print(
             f"Dataset ready | mode={self.mode} | dim={self.dim}D | groups={len(self.groups)} "
-            f"| neighbors={self.n_neighbors} | source={anchor_mode}"
+            f"| neighbors={self.n_neighbors} | source={coordinate_mode}"
         )
 
     def _format_class_balance_table(self, centers: List[int], neighbors: List[int]) -> str:
-        anchor_counts = Counter(centers)
+        center_counts = Counter(centers)
         neighbor_counts = Counter(neighbors)
-        all_labels = sorted(set(anchor_counts) | set(neighbor_counts) | set(range(self.n_classes)))
-        anchor_total = sum(anchor_counts.values())
+        all_labels = sorted(set(center_counts) | set(neighbor_counts) | set(range(self.n_classes)))
+        center_total = sum(center_counts.values())
         neighbor_total = sum(neighbor_counts.values())
-        lines = ["Class balance:", f"{'label':>7} {'anchors':>10} {'anchor_%':>10} {'neighbors':>10} {'neighbor_%':>10}"]
+        lines = ["Class balance:", f"{'label':>7} {'centers':>10} {'center_%':>10} {'neighbors':>10} {'neighbor_%':>10}"]
         for label in all_labels:
-            anchor_count = anchor_counts.get(label, 0)
+            center_count = center_counts.get(label, 0)
             neighbor_count = neighbor_counts.get(label, 0)
-            anchor_pct = 100.0 * anchor_count / anchor_total if anchor_total else 0.0
+            center_pct = 100.0 * center_count / center_total if center_total else 0.0
             neighbor_pct = 100.0 * neighbor_count / neighbor_total if neighbor_total else 0.0
             lines.append(
-                f"{label:>7} {anchor_count:>10} {anchor_pct:>9.2f}% {neighbor_count:>10} {neighbor_pct:>9.2f}%"
+                f"{label:>7} {center_count:>10} {center_pct:>9.2f}% {neighbor_count:>10} {neighbor_pct:>9.2f}%"
             )
         lines.append(
-            f"{'total':>7} {anchor_total:>10} {100.0 if anchor_total else 0.0:>9.2f}% "
+            f"{'total':>7} {center_total:>10} {100.0 if center_total else 0.0:>9.2f}% "
             f"{neighbor_total:>10} {100.0 if neighbor_total else 0.0:>9.2f}%"
         )
         return "\n".join(lines)

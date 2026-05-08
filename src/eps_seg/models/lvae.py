@@ -56,6 +56,23 @@ class LVAEModel(L.LightningModule):
         self.current_true_epoch = 0
         self.current_stage_idx = -1
 
+    def _resolve_training_targets(self, batch: dict) -> torch.Tensor:
+        """
+            Returns the appropriate training targets for the current training mode.
+        """
+        if self.train_cfg.train_fully_supervised:
+            return batch["gt"]
+        if self.current_training_mode == "semisupervised":
+            # Pseudo-labelled rows stay unlabeled during semisupervised training so
+            # the LVAE can infer pseudo-labels internally from the stage-0 labelled
+            # samples present in the same batch.
+            y = batch["label"].clone()
+            y[~batch["is_initial_label"].bool()] = -1
+            return y
+        if self.current_training_mode == "active_learning":
+            return batch["gt"]
+        return batch["label"]
+
     def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
         """
             Forward pass through the LVAE model.
@@ -100,16 +117,7 @@ class LVAEModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x = batch["patch"]
-        if self.train_cfg.train_fully_supervised:
-            y = batch["gt"]
-        elif self.current_training_mode == "semisupervised":
-            # Pseudo-labelled rows stay unlabeled during semisupervised training so
-            # the LVAE can infer pseudo-labels internally from the stage-0 labelled
-            # samples present in the same batch.
-            y = batch["label"].clone()
-            y[~batch["is_initial_label"].bool()] = -1
-        else:
-            y = batch["label"]
+        y = self._resolve_training_targets(batch)
         
         batch_size = x.shape[0]
 
@@ -241,10 +249,10 @@ class LVAEModel(L.LightningModule):
             },
         }
 
-    def update_mode(self, mode: Literal["supervised", "semisupervised"]):
+    def update_mode(self, mode: Literal["supervised", "semisupervised", "active_learning"]):
         print(f"Updating model training mode to: {mode}")
         self.current_training_mode = mode
-        self.model.update_mode(mode)
+        self.model.update_mode("supervised" if mode == "active_learning" else mode)
 
     def configure_callbacks(self):
         return super().configure_callbacks()

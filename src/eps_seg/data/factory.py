@@ -6,24 +6,25 @@ from typing import Optional
 from eps_seg.config.train import (
     CandidateSamplingConfig,
     InitialLabelSamplingConfig,
-    PseudolabelAdmissionConfig,
+    ScheduleAdmissionConfig,
     PseudolabelMaintenanceConfig,
 )
 from eps_seg.data.initial_label_sampling import (
     ClassBalancedSliceInitialLabelSamplingStrategy,
     ClassBalancedSubstackInitialLabelSamplingStrategy,
-    FromCSVInitialLabelSamplingStrategy,
     InitialLabelSamplingStrategy,
 )
 from eps_seg.data.sampling import (
     CandidateSamplingStrategy,
-    ClassWeightedTrainRegionSamplingStrategy,
+    ClassBalancedSubstackSamplingStrategy,
     SamplingDomain,
-    UniformTrainRegionSamplingStrategy,
+    UniformCoordinateSamplingStrategy,
 )
 from eps_seg.data.schedule_policies import (
-    ConfidenceThresholdAdmissionPolicy,
-    PseudolabelAdmissionPolicy,
+    ConfidenceThresholdWithPlAdmissionPolicy,
+    AdmitAllWithGtAdmissionPolicy,
+    NoOpMaintenancePolicy,
+    ScheduleAdmissionPolicy,
     PseudolabelMaintenancePolicy,
     PruningPolicy,
 )
@@ -52,32 +53,37 @@ def build_candidate_sampling_strategy(
             "Candidate sampling requires train_substacks. Build or load the cache-v2 fold payload before staged training."
         )
 
-    if cfg.name == "uniform_train_region":
-        return UniformTrainRegionSamplingStrategy(domain=domain, rng=rng)
-    if cfg.name == "class_weighted_train_region":
-        return ClassWeightedTrainRegionSamplingStrategy(domain=domain, rng=rng, samples_per_class=samples_per_class)
+    if cfg.name == "uniform_coordinate_sampling":
+        return UniformCoordinateSamplingStrategy(domain=domain, rng=rng)
+    if cfg.name == "class_balanced_substack":
+        return ClassBalancedSubstackSamplingStrategy(
+            domain=domain,
+            rng=rng,
+            samples_per_class=samples_per_class or {},
+        )
     raise ValueError(f"Unknown candidate sampling strategy: {cfg.name}")
 
 
 def build_initial_label_sampling_strategy(
     cfg: InitialLabelSamplingConfig | None,
-    has_anchor_records: bool,
     has_train_substacks: bool,
 ) -> InitialLabelSamplingStrategy:
     """Build the configured initial-label sampling strategy.
 
     Args:
         cfg: Optional initial-label sampling configuration.
-        has_anchor_records: Whether canonical labelled-voxel records are available.
         has_train_substacks: Whether cache-v2 train-substack descriptors are available.
 
     Returns:
         InitialLabelSamplingStrategy: Instantiated stage-0 initialization strategy.
     """
 
-    strategy_name = cfg.name if cfg is not None else ("from_csv" if has_anchor_records else "class_balanced_substack")
+    strategy_name = cfg.name if cfg is not None else "class_balanced_substack"
     if strategy_name == "from_csv":
-        return FromCSVInitialLabelSamplingStrategy()
+        raise ValueError(
+            "Initial-label sampling strategy 'from_csv' has been removed. "
+            "Use DatasetConfig.load_train_coords_from/load_val_coords_from for external coordinate import."
+        )
     if not has_train_substacks:
         raise ValueError(
             f"Initial-label sampling strategy '{strategy_name}' requires train_substacks from cache-v2."
@@ -89,24 +95,26 @@ def build_initial_label_sampling_strategy(
     raise ValueError(f"Unknown initial label sampling strategy: {strategy_name}")
 
 
-def build_pseudolabel_admission_policy(cfg: PseudolabelAdmissionConfig) -> PseudolabelAdmissionPolicy:
-    """Build the configured pseudo-label admission policy.
+def build_schedule_admission_policy(cfg: ScheduleAdmissionConfig) -> ScheduleAdmissionPolicy:
+    """Build the configured schedule admission policy.
 
     Args:
-        cfg: Pseudo-label admission configuration.
+        cfg: Schedule admission configuration.
 
     Returns:
-        PseudolabelAdmissionPolicy: Instantiated pseudo-label admission policy.
+        ScheduleAdmissionPolicy: Instantiated schedule admission policy.
     """
 
-    if cfg.name == "confidence_threshold":
-        return ConfidenceThresholdAdmissionPolicy(confidence_min=cfg.confidence_min, confidence_max=cfg.confidence_max)
-    raise ValueError(f"Unknown pseudo-label admission policy: {cfg.name}")
+    if cfg.name == "confidence_threshold_with_pseudolabels":
+        return ConfidenceThresholdWithPlAdmissionPolicy(confidence_min=cfg.confidence_min, confidence_max=cfg.confidence_max)
+    if cfg.name == "admit_all_with_gt":
+        return AdmitAllWithGtAdmissionPolicy()
+    raise ValueError(f"Unknown schedule admission policy: {cfg.name}")
 
 
 def build_pseudolabel_maintenance_policy(
     cfg: PseudolabelMaintenanceConfig,
-    admission_policy: PseudolabelAdmissionPolicy,
+    admission_policy: ScheduleAdmissionPolicy,
 ) -> PseudolabelMaintenancePolicy:
     """Build the configured pseudo-label maintenance policy.
 
@@ -124,4 +132,6 @@ def build_pseudolabel_maintenance_policy(
             pruning_patience=cfg.pruning_patience,
             enable_pruning=cfg.enable_pruning,
         )
+    if cfg.name == "noop":
+        return NoOpMaintenancePolicy()
     raise ValueError(f"Unknown pseudo-label maintenance policy: {cfg.name}")

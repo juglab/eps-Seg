@@ -336,6 +336,26 @@ class DataSchedule(Mapping[str, np.ndarray]):
         pseudo_mask = self._fields["label_source"] == 1
         return np.where(self._fields["is_enabled"] & pseudo_mask)[0].astype(np.int32)
 
+    def get_active_label_source_indices(self, label_source: int | Iterable[int]) -> np.ndarray:
+        """
+        Return the indices of active rows whose label_source is one of the
+        requested values.
+        """
+
+        sources = np.asarray(
+            list(label_source) if isinstance(label_source, Iterable) and not isinstance(label_source, (str, bytes)) else [label_source],
+            dtype=np.int32,
+        )
+        source_mask = np.isin(self._fields["label_source"], sources)
+        return np.where(self._fields["is_enabled"] & source_mask)[0].astype(np.int32)
+
+    def count_active_label_source_rows(self, label_source: int | Iterable[int]) -> int:
+        """
+        Count active rows for one or more label sources.
+        """
+
+        return int(len(self.get_active_label_source_indices(label_source)))
+
     def count_active_pseudolabels(self) -> int:
         """
         Count active pseudo-label rows.

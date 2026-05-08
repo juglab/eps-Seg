@@ -83,7 +83,7 @@ class SamplingDomain:
         return self.patch_size // 2 - self.label_size
 
 
-class UniformTrainRegionSamplingStrategy:
+class UniformCoordinateSamplingStrategy:
     """
     Uniform candidate sampler over the allowed train-region voxels.
 
@@ -92,7 +92,7 @@ class UniformTrainRegionSamplingStrategy:
         rng: Random generator used for candidate sampling.
 
     Returns:
-        UniformTrainRegionSamplingStrategy: Sampler reproducing the current uniform train-region behavior.
+        UniformCoordinateSamplingStrategy: Uniform coordinate sampler over the allowed train region.
     """
 
     def __init__(self, domain: SamplingDomain, rng: random.Random) -> None:
@@ -189,26 +189,79 @@ class UniformTrainRegionSamplingStrategy:
             coords_batch.append(candidate)
             local_forbidden.add(candidate)
         return coords_batch
-
-
-class ClassWeightedTrainRegionSamplingStrategy(UniformTrainRegionSamplingStrategy):
+class ClassBalancedSubstackSamplingStrategy:
     """
-    Placeholder class-weighted candidate sampler.
-
-    Args:
-        domain: Immutable sampling domain.
-        rng: Random generator used for candidate sampling.
-        samples_per_class: Optional class weighting specification.
-
-    Returns:
-        ClassWeightedTrainRegionSamplingStrategy: Sampler keeping the strategy interface stable for future weighting logic.
+    Sample new coordinates by distributing a per-class budget within each train
+    substack, while avoiding already scheduled coordinates.
     """
 
     def __init__(
         self,
         domain: SamplingDomain,
         rng: random.Random,
-        samples_per_class: Optional[Dict[int, int]] = None,
+        samples_per_class: Dict[int, int],
     ) -> None:
-        super().__init__(domain=domain, rng=rng)
-        self.samples_per_class = samples_per_class or {}
+        self.domain = domain
+        self.rng = rng
+        self.samples_per_class = {int(label): int(count) for label, count in (samples_per_class or {}).items()}
+
+    def _is_valid_coord(self, name: str, z: int, y: int, x: int) -> bool:
+        image = self.domain.images[name]
+        z_size, height, width = image.shape
+        offset = self.domain.offset
+        valid = offset <= y < height - offset - 1 and offset <= x < width - offset - 1
+        if self.domain.dim == 3:
+            valid = valid and (offset <= z < z_size - offset - 1)
+        return bool(valid and self.domain.labels[name][z, y, x] != self.domain.ignore_lbl)
+
+    def sample_candidate(self, forbidden_coords: set[Coordinate]) -> Coordinate | None:
+        sampled = self.sample_batch(forbidden_coords=forbidden_coords, batch_size=1)
+        return sampled[0] if sampled else None
+
+    def sample_batch(self, forbidden_coords: set[Coordinate], batch_size: int) -> list[Coordinate]:
+        if batch_size <= 0:
+            return []
+
+        coords_batch: list[Coordinate] = []
+        local_forbidden = set(forbidden_coords)
+        substacks = list(self.domain.train_substacks)
+        self.rng.shuffle(substacks)
+
+        for substack in substacks:
+            if len(coords_batch) >= batch_size:
+                break
+            name = substack["stack_name"]
+            z_start = int(substack["z_start"])
+            z_stop = int(substack["z_stop"])
+
+            class_labels = [label for label, count in self.samples_per_class.items() if count > 0]
+            self.rng.shuffle(class_labels)
+            for class_label in class_labels:
+                if len(coords_batch) >= batch_size:
+                    break
+
+                n_needed = self.samples_per_class.get(class_label, 0)
+                if n_needed <= 0:
+                    continue
+
+                candidate_coords = np.argwhere(self.domain.labels[name][z_start:z_stop] == class_label)
+                if len(candidate_coords) == 0:
+                    continue
+
+                candidate_indices = list(range(len(candidate_coords)))
+                self.rng.shuffle(candidate_indices)
+                taken = 0
+                for idx in candidate_indices:
+                    rel_z, y, x = candidate_coords[idx]
+                    z = z_start + int(rel_z)
+                    coord = (name, z, int(y), int(x))
+                    if coord in local_forbidden:
+                        continue
+                    if not self._is_valid_coord(name=name, z=z, y=int(y), x=int(x)):
+                        continue
+                    coords_batch.append(coord)
+                    local_forbidden.add(coord)
+                    taken += 1
+                    if taken >= n_needed or len(coords_batch) >= batch_size:
+                        break
+        return coords_batch

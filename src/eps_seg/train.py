@@ -38,7 +38,7 @@ The staged training loop works as follows:
 def build_model_for_stage(
     model_cfg,
     train_cfg: TrainConfig,
-    mode: Literal["supervised", "semisupervised"],
+    mode: Literal["supervised", "semisupervised", "active_learning"],
     weights_checkpoint_path: str | None = None,
 ) -> LVAEModel:
     """
@@ -104,7 +104,7 @@ def create_initial_scheduler(exp_config: ExperimentConfig) -> Path:
 
 def train_one_stage(
     exp_config: ExperimentConfig,
-    mode: Literal["supervised", "semisupervised"],
+    mode: Literal["supervised", "semisupervised", "active_learning"],
     stage_idx: int,
     scheduler_path: Path,
     weights_checkpoint_path: str | None = None,
@@ -133,7 +133,10 @@ def train_one_stage(
     if force_full_gt_labels and not train_cfg.train_fully_supervised:
         train_cfg = train_cfg.model_copy(update={"train_fully_supervised": True})
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
-    seed = train_cfg.supervised_seed if mode == "supervised" else train_cfg.semisupervised_seed
+    if mode == "semisupervised":
+        seed = train_cfg.semisupervised_seed
+    else:
+        seed = train_cfg.supervised_seed
     if seed is not None:
         print(f"Setting random seed to {seed} for {mode} stage K{stage_idx}...")
         L.seed_everything(seed, workers=True)
@@ -244,14 +247,12 @@ def evaluate_scheduler_extension(
     scheduler_path: Path,
     weights_checkpoint_path: Path,
     next_stage_idx: int,
+    mode: Literal["semisupervised", "active_learning"],
 ) -> Path | None:
     """
-        Build the scheduler for the next stage by re-evaluating active
-        pseudo-labels, pruning when requested, and then extending the active
-        pseudo-label pool to the target size for the next stage.
-
-        The current best semisupervised model is used both to score the already
-        active pseudo-labels and to score newly sampled candidate voxels.
+        Build the scheduler for the next stage by optionally re-evaluating the
+        active stage-extension rows and then extending the scheduler to the
+        target size required for the next stage.
 
         Returns:
             Path | None:
@@ -265,7 +266,7 @@ def evaluate_scheduler_extension(
         cfg=dataset_cfg,
         train_cfg=train_cfg,
         scheduler_path=scheduler_path,
-        scheduler_stage_index=next_stage_idx - 1,
+        scheduler_stage_index=next_stage_idx,
     )
     dm.prepare_data()
     dm.setup("fit")
@@ -273,7 +274,7 @@ def evaluate_scheduler_extension(
     model = build_model_for_stage(
         model_cfg=model_cfg,
         train_cfg=train_cfg,
-        mode="semisupervised",
+        mode=mode,
         weights_checkpoint_path=str(weights_checkpoint_path),
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -287,34 +288,43 @@ def evaluate_scheduler_extension(
     schedule = dm.train_dataset.schedule
     schedule_engine = dm.train_dataset.schedule_engine
 
-    active_pseudolabels_before = schedule.count_active_pseudolabels()
-    disabled_count = schedule_engine.reevaluate_schedule(
-        next_stage_idx=next_stage_idx,
-        evaluator=model.evaluate_candidate_batch,
-        evaluation_batch_size=train_cfg.test_batch_size,
+    extension_label_source = 1 if mode == "semisupervised" else 2
+    active_rows_before = schedule.count_active_label_source_rows(extension_label_source)
+    should_reevaluate = (
+        train_cfg.pseudolabel_maintenance.name != "noop" and active_rows_before > 0
     )
-    if disabled_count > 0 or active_pseudolabels_before > 0:
+    disabled_count = 0
+    if should_reevaluate:
+        disabled_count = schedule_engine.reevaluate_schedule(
+            next_stage_idx=next_stage_idx,
+            evaluator=model.evaluate_candidate_batch,
+            evaluation_batch_size=train_cfg.test_batch_size,
+            target_label_source=extension_label_source,
+        )
+    if disabled_count > 0 or active_rows_before > 0:
         schedule.bump_version()
         dm.train_dataset.sampling_version = schedule.sampling_version
 
-    target_active_pseudolabels = active_pseudolabels_before + train_cfg.pseudolabels_per_extension
+    target_active_rows = active_rows_before + train_cfg.rows_per_extension
     accepted = schedule_engine.extend_schedule(
         stage_index=next_stage_idx,
-        target_active_pseudolabels=target_active_pseudolabels,
+        target_active_rows=target_active_rows,
         evaluator=model.evaluate_candidate_batch,
         evaluation_batch_size=train_cfg.test_batch_size,
+        target_label_source=extension_label_source,
     )
     if accepted > 0:
         schedule.bump_version()
         dm.train_dataset.sampling_version = schedule.sampling_version
         dm.train_dataset._print_schedule_report()
 
-    active_pseudolabels_after = schedule.count_active_pseudolabels()
-    if active_pseudolabels_after < target_active_pseudolabels:
+    active_rows_after = schedule.count_active_label_source_rows(extension_label_source)
+    extension_desc = "pseudo-labels" if mode == "semisupervised" else "acquired GT labels"
+    if active_rows_after < target_active_rows:
         print(
             f"Scheduler extension stopped at stage K{next_stage_idx}: "
-            f"disabled {disabled_count} pseudo-labels, accepted {accepted} new pseudo-labels, "
-            f"and reached {active_pseudolabels_after}/{target_active_pseudolabels} active pseudo-labels."
+            f"disabled {disabled_count} rows, accepted {accepted} new {extension_desc}, "
+            f"and reached {active_rows_after}/{target_active_rows} active {extension_desc}."
         )
         del dm
         del model
@@ -333,7 +343,7 @@ def evaluate_scheduler_extension(
     return next_scheduler_path
 
 
-def latest_completed_stage(exp_config: ExperimentConfig, mode: Literal["supervised", "semisupervised"]) -> int:
+def latest_completed_stage(exp_config: ExperimentConfig, mode: Literal["supervised", "semisupervised", "active_learning"]) -> int:
     """
         Return the highest stage index that looks complete on disk.
 
@@ -388,6 +398,7 @@ def run_semisupervised_staged_training(exp_config: ExperimentConfig):
                 scheduler_path=exp_config.stage_scheduler_path(stage_idx - 1),
                 weights_checkpoint_path=exp_config.stage_checkpoint_path("semisupervised", stage_idx - 1, "best"),
                 next_stage_idx=stage_idx,
+                mode="semisupervised",
             )
             if scheduler_path is None:
                 break
@@ -402,6 +413,55 @@ def run_semisupervised_staged_training(exp_config: ExperimentConfig):
         train_one_stage(
             exp_config=exp_config,
             mode="semisupervised",
+            stage_idx=stage_idx,
+            scheduler_path=scheduler_path,
+            weights_checkpoint_path=weights_checkpoint_path,
+            training_state_checkpoint_path=training_state_checkpoint_path,
+        )
+
+
+def run_active_learning_staged_training(exp_config: ExperimentConfig):
+    """
+        Run the staged active-learning loop.
+
+        Stage K0 uses the initial GT-labelled scheduler, while every stage K>0
+        adds newly acquired GT labels to the scheduler and then continues
+        training from the previous stage best checkpoint and optimizer state.
+    """
+    train_cfg, _, _ = exp_config.get_configs()
+    if not exp_config.stage_scheduler_path(0).exists():
+        create_initial_scheduler(exp_config)
+
+    completed_stage = latest_completed_stage(exp_config, "active_learning") if train_cfg.auto_resume else -1
+    start_stage = completed_stage + 1
+    if start_stage == 0:
+        print("Starting active-learning staged training from stage K0.")
+    else:
+        print(f"Resuming active-learning staged training from stage K{start_stage}.")
+
+    for stage_idx in range(start_stage, train_cfg.max_extensions + 1):
+        scheduler_path = exp_config.stage_scheduler_path(stage_idx)
+        if not scheduler_path.exists():
+            scheduler_path = evaluate_scheduler_extension(
+                exp_config=exp_config,
+                scheduler_path=exp_config.stage_scheduler_path(stage_idx - 1),
+                weights_checkpoint_path=exp_config.stage_checkpoint_path("active_learning", stage_idx - 1, "best"),
+                next_stage_idx=stage_idx,
+                mode="active_learning",
+            )
+            if scheduler_path is None:
+                break
+
+        if stage_idx == 0:
+            weights_checkpoint_path = None
+            training_state_checkpoint_path = None
+        else:
+            weights_checkpoint_path = str(exp_config.stage_checkpoint_path("active_learning", stage_idx - 1, "best"))
+            training_state_checkpoint_path = str(exp_config.stage_checkpoint_path("active_learning", stage_idx - 1, "best"))
+
+        train_one_stage(
+            exp_config=exp_config,
+            mode="active_learning",
             stage_idx=stage_idx,
             scheduler_path=scheduler_path,
             weights_checkpoint_path=weights_checkpoint_path,
@@ -494,17 +554,26 @@ def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = Non
         The same entrypoint is used for:
 
         - semisupervised staged training
-        - one-stage fully supervised replay
+        - active-learning staged training
+        - fully supervised replay
 
-        By default the entrypoint runs semisupervised staged training.
-        Passing ``fully_supervised_stage`` switches to a single-stage fully
-        supervised replay job that reuses the saved scheduler and the
-        corresponding semisupervised best checkpoint for that stage.
+        The ``training_regime`` field controls which staged regime is used by
+        default. Passing ``fully_supervised_stage`` keeps the compatibility path
+        for one-stage fully supervised replay.
     """
+    train_cfg, _, _ = exp_config.get_configs()
     if fully_supervised_stage is None:
-        run_semisupervised_staged_training(exp_config)
-    else:
-        run_fully_supervised_stage(exp_config, fully_supervised_stage)
+        if train_cfg.training_regime == "semisupervised":
+            run_semisupervised_staged_training(exp_config)
+            return
+        if train_cfg.training_regime == "active_learning":
+            run_active_learning_staged_training(exp_config)
+            return
+        if train_cfg.training_regime == "upper_bound_replay":
+            run_fully_supervised_upper_bound(exp_config)
+            return
+        raise ValueError(f"Unknown training_regime: {train_cfg.training_regime}")
+    run_fully_supervised_stage(exp_config, fully_supervised_stage)
 
 
 def main():
