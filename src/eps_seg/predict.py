@@ -270,6 +270,11 @@ def test_predict(exp_config: ExperimentConfig,
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
 
+    if train_config.training_regime == "semisupervised":
+        seed = train_config.semisupervised_seed
+    else:
+        seed = train_config.supervised_seed
+
     if batch_size is not None:
         print(f"Overriding batch size to {batch_size} for prediction/testing...")
         train_config.test_batch_size = batch_size
@@ -295,6 +300,9 @@ def test_predict(exp_config: ExperimentConfig,
     for mode in MODES:
         for ckpt_path in CKPTS_PATHS:
             print(f"Running {mode} with checkpoint: {ckpt_path}")
+            if seed is not None:
+                print(f"Setting random seed to {seed} for {mode} with checkpoint {ckpt_path.name}...")
+                L.seed_everything(seed, workers=True)
             
             model = LVAEModel.load_from_checkpoint(str(ckpt_path),
                                         model_cfg=model_config,

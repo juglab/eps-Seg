@@ -131,6 +131,53 @@ class AdmitAllWithGtAdmissionPolicy(ScheduleAdmissionPolicy):
 
 
 @dataclass
+class ConfidenceWindowWithGtAdmissionPolicy(ScheduleAdmissionPolicy):
+    """
+    Confidence-window admission policy for active learning acquisitions. Only
+    candidates inside the configured confidence window are admitted, and they
+    are stored with their ground-truth label.
+    """
+
+    confidence_min: float
+    confidence_max: float
+    label_source: int = 2
+
+    def admit(
+        self,
+        stage_index: int,
+        evaluated_candidates: list[EvaluatedCandidate],
+        schedule: DataSchedule,
+        name_to_id: dict[str, int],
+        target_active_rows: int,
+    ) -> int:
+        accepted = 0
+        for candidate in evaluated_candidates:
+            if schedule.count_active_label_source_rows(self.label_source) >= target_active_rows:
+                break
+            if not self.admission_rule(float(candidate.confidence)):
+                continue
+            schedule.add_record(
+                name_id=name_to_id[candidate.stack_name],
+                coords=(candidate.z, candidate.y, candidate.x),
+                current_label=int(candidate.gt_label),
+                gt_label=int(candidate.gt_label),
+                confidence=float(candidate.confidence),
+                label_source=int(self.label_source),
+                stage_index=int(stage_index),
+                is_enabled=True,
+                stage_disabled=-1,
+                consecutive_keep_failures=0,
+                last_predicted_label=int(candidate.predicted_label),
+                last_confidence=float(candidate.confidence),
+            )
+            accepted += 1
+        return accepted
+
+    def admission_rule(self, confidence: float) -> bool:
+        return float(self.confidence_min) <= float(confidence) <= float(self.confidence_max)
+
+
+@dataclass
 class ConfidenceThresholdWithPlAdmissionPolicy(ScheduleAdmissionPolicy):
     """
     Confidence-window pseudo-label admission policy.

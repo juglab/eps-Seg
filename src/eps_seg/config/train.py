@@ -36,7 +36,7 @@ class ScheduleAdmissionConfig(BaseEPSConfig):
         ScheduleAdmissionConfig: Validated schedule admission configuration.
     """
 
-    name: Literal["confidence_threshold_with_pseudolabels", "admit_all_with_gt"] = Field(
+    name: Literal["confidence_threshold_with_pseudolabels", "admit_all_with_gt", "confidence_window_with_gt"] = Field(
         default="confidence_threshold_with_pseudolabels",
         description="Policy used to admit evaluated stage-extension candidates into the scheduler.",
     )
@@ -206,8 +206,14 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("rows_per_extension must be >= 0.")
         if self.max_extensions < 0:
             raise ValueError("max_extensions must be >= 0.")
-        if self.training_regime == "active_learning" and self.schedule_admission.name != "admit_all_with_gt":
-            raise ValueError("Active learning requires schedule_admission.name='admit_all_with_gt'.")
+        if self.training_regime == "active_learning" and self.schedule_admission.name not in {
+            "admit_all_with_gt",
+            "confidence_window_with_gt",
+        }:
+            raise ValueError(
+                "Active learning requires schedule_admission.name to be one of "
+                "{'admit_all_with_gt', 'confidence_window_with_gt'}."
+            )
         if (
             self.training_regime == "active_learning"
             and self.candidate_sampling.name == "class_balanced_substack"
