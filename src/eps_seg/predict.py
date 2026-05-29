@@ -25,10 +25,13 @@ class PredictionWriterCallback(BasePredictionWriter):
         super().__init__(write_interval="batch")
         self.ckpt_path = ckpt_path
         self.exp_config = exp_config
-        _, dataset_config, _ = exp_config.get_configs()
+        train_config, dataset_config, _ = exp_config.get_configs()
         self.test_keys = dataset_config.test_keys
         self._writers: Dict[str, zarr.Array] = {} # Dict[test_key, zarr.Array], zarr writers for each test_key for the current rank
-        self.out_dir = self.exp_config.outputs_dir / "predictions" / self.ckpt_path.stem
+        prediction_stem = self.ckpt_path.stem
+        if train_config.mask_input_during_prediction:
+            prediction_stem = f"{prediction_stem}_masked"
+        self.out_dir = self.exp_config.outputs_dir / "predictions" / prediction_stem
         os.makedirs(self.out_dir, exist_ok=True)
         
         # TODO: We could gain even more speed by tuning chunk sizes based rank batch sizes and volume sizes
@@ -284,6 +287,7 @@ def test_predict(exp_config: ExperimentConfig,
     # Check what checkpoints to use
     CKPTS_PATHS = []
     ckpt_folder = exp_config.best_checkpoint_path("supervised").parent
+    print(f"Using checkpoint directory: {ckpt_folder}")
     if "all" in models:
         CKPTS_PATHS += sorted(list(ckpt_folder.glob("*.ckpt")))
     for ckpt_name in models:

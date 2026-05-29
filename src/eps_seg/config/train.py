@@ -160,6 +160,13 @@ class TrainConfig(BaseEPSConfig):
         default=0.75,
         description="Confidence threshold passed to the LVAE when it internally reasons over unlabeled samples.",
     )
+    mask_input_during_prediction: bool = Field(
+        default=False,
+        description=(
+            "Whether prediction should run the LVAE with the same center-input masking "
+            "used during training/validation. This does not enable validation losses."
+        ),
+    )
     candidate_sampling: CandidateSamplingConfig = Field(
         default_factory=CandidateSamplingConfig,
         description="Candidate voxel sampling strategy used during staged scheduler extension.",

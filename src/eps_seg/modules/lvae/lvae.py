@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from typing import Type, Union
+from typing import Optional, Type, Union
 from eps_seg.modules.lvae.likelihoods import GaussianLikelihood
 import torch.nn.functional as F
 
@@ -233,18 +233,20 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99):
+    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99, mask_input: Optional[bool] = None):
         """
         Forward pass through the LVAE model.
 
         Args:
             x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
             y: Optional labels tensor
-            validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
+            validation_mode: Whether we are in validation mode (used to mask input and compute losses)
             confidence_threshold: Confidence threshold for assigning pseudo-labels.
                 During semisupervised training the staged scheduler already
                 decides which samples enter the batch, so every unlabeled input
                 in the batch is pseudo-labeled regardless of this threshold.
+            mask_input: Optional override for input masking. When ``None``, masking
+                follows the old ``self.training or validation_mode`` rule.
         """
 
         # Defaults
@@ -254,10 +256,9 @@ class LadderVAE(nn.Module):
         kl_per_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
-        # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
-        mask_input = self.training or validation_mode
-        x_orig = x if mask_input else None
-        x = self._mask_input(x) if mask_input else x
+        should_mask_input = (self.training or validation_mode) if mask_input is None else bool(mask_input)
+        x_orig = x if should_mask_input else None
+        x = self._mask_input(x) if should_mask_input else x
 
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
@@ -289,10 +290,10 @@ class LadderVAE(nn.Module):
         out = crop_img_tensor(out, img_size)
 
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
-        ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
+        ll, likelihood_info = self.likelihood(out, x_orig if should_mask_input else x)
 
         inpainting_loss = None
-        if mask_input:
+        if should_mask_input:
             # 3) inpainting loss is centre of -loglikelihood
             # FIXME: This "out" is not a dictionary.
             recons_sep = -ll

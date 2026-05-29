@@ -73,7 +73,14 @@ class LVAEModel(L.LightningModule):
             return batch["gt"]
         return batch["label"]
 
-    def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
+    def forward(
+        self,
+        x,
+        y=None,
+        validation_mode: bool = False,
+        confidence_threshold: float = 0.99,
+        mask_input: bool | None = None,
+    ):
         """
             Forward pass through the LVAE model.
 
@@ -90,7 +97,13 @@ class LVAEModel(L.LightningModule):
         if torch.isnan(x).any() or torch.isinf(x).any():
             print("x has nan or inf")
         
-        return self.model(x, y=y, validation_mode=validation_mode, confidence_threshold=confidence_threshold)
+        return self.model(
+            x,
+            y=y,
+            validation_mode=validation_mode,
+            confidence_threshold=confidence_threshold,
+            mask_input=mask_input,
+        )
 
     def on_fit_start(self):
         # Add data statistics to the model before training or prediction (so that they are saved in checkpoints)
@@ -190,7 +203,12 @@ class LVAEModel(L.LightningModule):
         x, labels, _, coords, key = batch
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
-        outputs = self.forward(x, y=None, validation_mode=False)
+        outputs = self.forward(
+            x,
+            y=None,
+            validation_mode=False,
+            mask_input=bool(self.train_cfg and self.train_cfg.mask_input_during_prediction),
+        )
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
         outputs["labels"] = labels
         outputs["coords"] = coords
