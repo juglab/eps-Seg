@@ -40,13 +40,17 @@ class ScheduleAdmissionConfig(BaseEPSConfig):
         default="confidence_threshold_with_pseudolabels",
         description="Policy used to admit evaluated stage-extension candidates into the scheduler.",
     )
+    score_metric: Literal["max_probability", "normalized_reciprocal_entropy", "margin"] = Field(
+        default="max_probability",
+        description="Model-derived score used by confidence-window admission policies.",
+    )
     confidence_min: float = Field(
         default=0.75,
-        description="Minimum confidence required to accept a newly sampled pseudo-label.",
+        description="Minimum score required to accept a newly sampled candidate.",
     )
     confidence_max: float = Field(
         default=1.0,
-        description="Maximum confidence allowed to accept a newly sampled pseudo-label.",
+        description="Maximum score allowed to accept a newly sampled candidate.",
     )
 
     @model_validator(mode="after")
@@ -188,6 +192,14 @@ class TrainConfig(BaseEPSConfig):
         description="Optional per-class budget used by class-balanced scheduler extension strategies.",
     )
     rows_per_extension: int = Field(default=100000, description="Number of scheduler rows to add whenever the scheduler is extended.")
+    candidate_evaluation_budget: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional maximum number of newly sampled candidates to evaluate per scheduler extension. "
+            "When set, candidate evaluation is capped separately from rows_per_extension, which remains "
+            "the label-admission budget."
+        ),
+    )
     max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
     min_initial_label_fraction: float = Field(default=0.25, description="Minimum fraction of each training batch that must come from the initial GT-labelled pool.")
     auto_resume: bool = Field(default=True, description="Automatically resume from the latest completed staged checkpoint if present.")
@@ -211,6 +223,8 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("model_confidence_threshold must be between 0 and 1.")
         if self.rows_per_extension < 0:
             raise ValueError("rows_per_extension must be >= 0.")
+        if self.candidate_evaluation_budget is not None and self.candidate_evaluation_budget < 0:
+            raise ValueError("candidate_evaluation_budget must be >= 0 when provided.")
         if self.max_extensions < 0:
             raise ValueError("max_extensions must be >= 0.")
         if self.training_regime == "active_learning" and self.schedule_admission.name not in {

@@ -73,6 +73,31 @@ class LVAEModel(L.LightningModule):
             return batch["gt"]
         return batch["label"]
 
+    @staticmethod
+    def _candidate_confidence_scores(
+        probs: torch.Tensor,
+        score_metric: Literal["max_probability", "normalized_reciprocal_entropy", "margin"] = "max_probability",
+    ) -> torch.Tensor:
+        """
+            Compute candidate admission scores from class probabilities.
+        """
+        probs = probs.float()
+        if score_metric == "max_probability":
+            return probs.max(dim=-1).values
+        if score_metric == "normalized_reciprocal_entropy":
+            n_classes = probs.shape[-1]
+            if n_classes <= 1:
+                return torch.ones_like(probs[..., 0])
+            safe_probs = probs.clamp_min(1e-8)
+            entropy = -(safe_probs * safe_probs.log()).sum(dim=-1)
+            return (1.0 - entropy / np.log(n_classes)).clamp(min=0.0, max=1.0)
+        if score_metric == "margin":
+            topk = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1).values
+            if topk.shape[-1] == 1:
+                return topk[..., 0]
+            return topk[..., 0] - topk[..., 1]
+        raise ValueError(f"Unknown candidate score metric: {score_metric}")
+
     def forward(
         self,
         x,
@@ -247,7 +272,9 @@ class LVAEModel(L.LightningModule):
                     confidence_threshold=self.train_cfg.model_confidence_threshold,
                 )
             probs = outputs["class_probabilities"]
-            confidences, predicted_labels = probs.max(dim=-1)
+            predicted_labels = probs.argmax(dim=-1)
+            score_metric = self.train_cfg.schedule_admission.score_metric
+            confidences = self._candidate_confidence_scores(probs, score_metric=score_metric)
         if was_training:
             self.train()
         return predicted_labels.cpu().numpy().astype(np.int32), confidences.cpu().numpy().astype(np.float32)

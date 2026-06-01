@@ -20,7 +20,7 @@ from eps_seg.training.callbacks import (
 )
 
 """
-Training entrypoint for the staged EPS-Seg++ workflow.
+Training entrypoint for EPS-Seg++ stage training.
 
 The staged training loop works as follows:
 
@@ -30,7 +30,9 @@ The staged training loop works as follows:
    stage best path and seed the live checkpointing callbacks with the previous
    best validation score.
 4. Extend the scheduler between stages by adding a fixed number of accepted
-   pseudo-labels.
+   pseudo-labels (semisupervised) or acquired GT labels (active learning) until the best
+   model is not confident enough to extend the scheduler
+   or the maximum number of stages is reached.
 
 """
 
@@ -312,6 +314,7 @@ def evaluate_scheduler_extension(
         evaluator=model.evaluate_candidate_batch,
         evaluation_batch_size=train_cfg.test_batch_size,
         target_label_source=extension_label_source,
+        candidate_evaluation_budget=train_cfg.candidate_evaluation_budget,
     )
     if accepted > 0:
         schedule.bump_version()

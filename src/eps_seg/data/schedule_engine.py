@@ -79,6 +79,7 @@ class ScheduleEngine:
         evaluation_batch_size: int,
         evaluator: Callable[[dict], tuple[np.ndarray, np.ndarray]],
         target_label_source: int = 1,
+        candidate_evaluation_budget: int | None = None,
     ) -> int:
         """
         Extend the scheduler with new admitted rows.
@@ -89,6 +90,8 @@ class ScheduleEngine:
             evaluation_batch_size: Number of proposed candidates evaluated per round.
             evaluator: Callable returning ``(predicted_labels, confidences)`` for a candidate batch.
             target_label_source: Label source to extend. 1 for pseudo-labels, 2 for active learning labels.
+            candidate_evaluation_budget: Optional maximum number of newly sampled candidates to evaluate.
+                When set, admission is run once on the evaluated candidate pool.
 
         Returns:
             int: Number of admitted rows.
@@ -96,6 +99,34 @@ class ScheduleEngine:
 
         if target_active_rows <= self.schedule.count_active_label_source_rows(target_label_source):
             return 0
+        if candidate_evaluation_budget is not None:
+            forbidden_coords = self.schedule.scheduled_coordinate_set(
+                id_to_name=self.dataset.id_to_name,
+                active_only=True,
+            )
+            coords_batch = self.sampler.sample_batch(
+                forbidden_coords=forbidden_coords,
+                batch_size=int(candidate_evaluation_budget),
+            )
+            evaluated_candidates: list[EvaluatedCandidate] = []
+            for batch_start in range(0, len(coords_batch), int(evaluation_batch_size)):
+                eval_coords = coords_batch[batch_start : batch_start + int(evaluation_batch_size)]
+                evaluated_candidates.extend(
+                    self._evaluate_candidate_batch(
+                        coords_batch=eval_coords,
+                        evaluator=evaluator,
+                    )
+                )
+
+            accepted = self.admission_policy.admit(
+                stage_index=stage_index,
+                evaluated_candidates=evaluated_candidates,
+                schedule=self.schedule,
+                name_to_id=self.dataset.name_to_id,
+                target_active_rows=target_active_rows,
+            )
+            self.schedule.stage_index = max(self.schedule.stage_index, int(stage_index))
+            return accepted
 
         forbidden_coords = self.schedule.scheduled_coordinate_set(id_to_name=self.dataset.id_to_name, active_only=True)
         accepted = 0
@@ -110,25 +141,10 @@ class ScheduleEngine:
             if len(coords_batch) == 0:
                 break
 
-            batch = self.dataset.build_candidate_batch(coords_batch)
-            predicted_labels, confidences = evaluator(batch)
-            evaluated_candidates = [
-                EvaluatedCandidate(
-                    stack_name=name,
-                    z=int(z),
-                    y=int(y),
-                    x=int(x),
-                    predicted_label=int(pred_label),
-                    confidence=float(confidence),
-                    gt_label=int(gt_label),
-                )
-                for (name, z, y, x), pred_label, confidence, gt_label in zip(
-                    coords_batch,
-                    predicted_labels,
-                    confidences,
-                    batch["gt"].tolist(),
-                )
-            ]
+            evaluated_candidates = self._evaluate_candidate_batch(
+                coords_batch=coords_batch,
+                evaluator=evaluator,
+            )
 
             accepted_this_round = self.admission_policy.admit(
                 stage_index=stage_index,
@@ -149,6 +165,42 @@ class ScheduleEngine:
                 no_progress_rounds += 1
         self.schedule.stage_index = max(self.schedule.stage_index, int(stage_index))
         return accepted
+
+    def _evaluate_candidate_batch(
+        self,
+        coords_batch: list[tuple[str, int, int, int]],
+        evaluator: Callable[[dict], tuple[np.ndarray, np.ndarray]],
+    ) -> list[EvaluatedCandidate]:
+        """
+        Build, evaluate, and convert one candidate-coordinate batch.
+
+        Args:
+            coords_batch: Candidate coordinates to evaluate.
+            evaluator: Callable returning ``(predicted_labels, confidences)`` for the batch.
+
+        Returns:
+            list[EvaluatedCandidate]: Evaluated candidate records.
+        """
+
+        batch = self.dataset.build_candidate_batch(coords_batch)
+        predicted_labels, confidences = evaluator(batch)
+        return [
+            EvaluatedCandidate(
+                stack_name=name,
+                z=int(z),
+                y=int(y),
+                x=int(x),
+                predicted_label=int(pred_label),
+                confidence=float(confidence),
+                gt_label=int(gt_label),
+            )
+            for (name, z, y, x), pred_label, confidence, gt_label in zip(
+                coords_batch,
+                predicted_labels,
+                confidences,
+                batch["gt"].tolist(),
+            )
+        ]
 
     def reevaluate_schedule(
         self,
