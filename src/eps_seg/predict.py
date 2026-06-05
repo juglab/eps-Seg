@@ -4,7 +4,6 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
-from eps_seg.training.callbacks import EarlyStoppingWithPatiencePropagation, SemiSupervisedModeCallback, ThresholdSchedulerCallback, RadiusSchedulerCallback
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import torch 
@@ -26,10 +25,13 @@ class PredictionWriterCallback(BasePredictionWriter):
         super().__init__(write_interval="batch")
         self.ckpt_path = ckpt_path
         self.exp_config = exp_config
-        _, dataset_config, _ = exp_config.get_configs()
+        train_config, dataset_config, _ = exp_config.get_configs()
         self.test_keys = dataset_config.test_keys
         self._writers: Dict[str, zarr.Array] = {} # Dict[test_key, zarr.Array], zarr writers for each test_key for the current rank
-        self.out_dir = self.exp_config.outputs_dir / "predictions" / self.ckpt_path.stem
+        prediction_stem = self.ckpt_path.stem
+        if train_config.mask_input_during_prediction:
+            prediction_stem = f"{prediction_stem}_masked"
+        self.out_dir = self.exp_config.outputs_dir / "predictions" / prediction_stem
         os.makedirs(self.out_dir, exist_ok=True)
         
         # TODO: We could gain even more speed by tuning chunk sizes based rank batch sizes and volume sizes
@@ -271,6 +273,11 @@ def test_predict(exp_config: ExperimentConfig,
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
 
+    if train_config.training_regime == "semisupervised":
+        seed = train_config.semisupervised_seed
+    else:
+        seed = train_config.supervised_seed
+
     if batch_size is not None:
         print(f"Overriding batch size to {batch_size} for prediction/testing...")
         train_config.test_batch_size = batch_size
@@ -280,6 +287,7 @@ def test_predict(exp_config: ExperimentConfig,
     # Check what checkpoints to use
     CKPTS_PATHS = []
     ckpt_folder = exp_config.best_checkpoint_path("supervised").parent
+    print(f"Using checkpoint directory: {ckpt_folder}")
     if "all" in models:
         CKPTS_PATHS += sorted(list(ckpt_folder.glob("*.ckpt")))
     for ckpt_name in models:
@@ -296,6 +304,9 @@ def test_predict(exp_config: ExperimentConfig,
     for mode in MODES:
         for ckpt_path in CKPTS_PATHS:
             print(f"Running {mode} with checkpoint: {ckpt_path}")
+            if seed is not None:
+                print(f"Setting random seed to {seed} for {mode} with checkpoint {ckpt_path.name}...")
+                L.seed_everything(seed, workers=True)
             
             model = LVAEModel.load_from_checkpoint(str(ckpt_path),
                                         model_cfg=model_config,

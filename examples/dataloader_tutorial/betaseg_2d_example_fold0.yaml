@@ -1,0 +1,14 @@
+type: "BetaSegDatasetConfig"
+dim: 2
+name: "betaseg_2d"
+fold: 0
+max_folds: 5
+data_dir: "dataset/betaseg"
+cache_root: "cache/"
+enable_cache: True
+train_keys: ["high_c1", "high_c2", "high_c3"]
+test_keys: ["high_c4"]
+seed: 42
+patch_size: 64
+samples_per_class_training: {0: 1, 1: 2, 2: 1, 3: 1}
+samples_per_class_validation: {0: 2, 1: 4, 2: 2, 3: 2}

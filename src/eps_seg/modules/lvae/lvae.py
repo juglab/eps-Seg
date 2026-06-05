@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from typing import Type, Union
+from typing import Optional, Type, Union
 from eps_seg.modules.lvae.likelihoods import GaussianLikelihood
 import torch.nn.functional as F
 
@@ -51,7 +51,7 @@ class LadderVAE(nn.Module):
         self.skip_connections_merge_type = cfg.skip_connections_merge_type
         self.batchnorm = cfg.use_batchnorm
         self.color_ch = cfg.color_channels
-        self.n_filters = cfg.n_filters
+        self.n_filters_per_layer = list(cfg.n_filters)
         self.dropout = cfg.dropout
         self.kl_free_bits = cfg.kl_free_bits
         self.learn_top_prior = cfg.learn_top_prior
@@ -96,19 +96,20 @@ class LadderVAE(nn.Module):
 
         # First bottom-up layer: change num channels + downsample by factor 2
         # unless we want to prevent this
+        first_layer_filters = self.n_filters_per_layer[0]
         stride = 1 if self.no_initial_downscaling else 2
         self.first_bottom_up = nn.Sequential(
             # self.conv_type(color_ch, n_filters, 5, padding=2, stride=stride),
             self.conv_type(
-                self.color_ch, self.n_filters, 5, padding=2, stride=1
+                self.color_ch, first_layer_filters, 5, padding=2, stride=1
             ),  # No stride here
             BlurPool(
-                self.n_filters, stride=stride, dim=self.conv_mult
+                first_layer_filters, stride=stride, dim=self.conv_mult
             ),  # Add BlurPool for downsampling
             self.nonlin(),
             BottomUpDeterministicResBlock(
-                c_in=self.n_filters,
-                c_out=self.n_filters,
+                c_in=first_layer_filters,
+                c_out=first_layer_filters,
                 conv_mult=self.conv_mult,
                 nonlin=self.nonlin,
                 batchnorm=self.batchnorm,
@@ -130,6 +131,15 @@ class LadderVAE(nn.Module):
         for i in range(self.n_layers):
             # Whether this is the top layer
             is_top = i == self.n_layers - 1
+            layer_filters = self.n_filters_per_layer[i]
+            bu_in_filters = (
+                self.n_filters_per_layer[i - 1] if i > 0 else first_layer_filters
+            )
+            td_in_filters = (
+                self.n_filters_per_layer[i + 1]
+                if i < self.n_layers - 1
+                else layer_filters
+            )
 
             # Add bottom-up deterministic layer at level i.
             # It's a sequence of residual blocks (BottomUpDeterministicResBlock)
@@ -137,7 +147,8 @@ class LadderVAE(nn.Module):
             new_layer = BottomUpLayer(
                 layer_number=i,
                 n_res_blocks=self.blocks_per_layer,
-                n_filters=self.n_filters,
+                c_in=bu_in_filters,
+                c_out=layer_filters,
                 downsampling_steps=self.downsample[i],
                 conv_mult=self.conv_mult,
                 nonlin=self.nonlin,
@@ -157,7 +168,9 @@ class LadderVAE(nn.Module):
                     z_dim=self.z_dims[i],
                     seg_head_dim=self.head_z_dims[i],
                     n_res_blocks=self.blocks_per_layer,
-                    n_filters=self.n_filters,
+                    n_filters=layer_filters,
+                    td_in_filters=td_in_filters,
+                    bu_filters=layer_filters,
                     is_top_layer=is_top,
                     downsampling_steps=self.downsample[i],
                     conv_mult=self.conv_mult,
@@ -186,8 +199,8 @@ class LadderVAE(nn.Module):
         for i in range(self.blocks_per_layer):
             modules.append(
                 TopDownDeterministicResBlock(
-                    c_in=self.n_filters,
-                    c_out=self.n_filters,
+                    c_in=first_layer_filters,
+                    c_out=first_layer_filters,
                     conv_mult=self.conv_mult,
                     nonlin=self.nonlin,
                     batchnorm=self.batchnorm,
@@ -201,7 +214,7 @@ class LadderVAE(nn.Module):
         self.final_top_down = nn.Sequential(*modules)
         # Define likelihood
         self.likelihood = GaussianLikelihood(
-            self.n_filters, self.color_ch, self.conv_mult
+            first_layer_filters, self.color_ch, self.conv_mult
         )
 
     def increment_global_step(self):
@@ -231,15 +244,20 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99):
+    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99, mask_input: Optional[bool] = None):
         """
         Forward pass through the LVAE model.
 
         Args:
             x: Unmasked Image - Input tensor of shape (batch_size, channels, height, width)
             y: Optional labels tensor
-            validation_mode: Whether we are in validation mode (used to mask input or not and compute losses)
-            confidence_threshold: Confidence threshold for assigning pseudo-labels
+            validation_mode: Whether we are in validation mode (used to mask input and compute losses)
+            confidence_threshold: Confidence threshold for assigning pseudo-labels.
+                During semisupervised training the staged scheduler already
+                decides which samples enter the batch, so every unlabeled input
+                in the batch is pseudo-labeled regardless of this threshold.
+            mask_input: Optional override for input masking. When ``None``, masking
+                follows the old ``self.training or validation_mode`` rule.
         """
 
         # Defaults
@@ -249,10 +267,9 @@ class LadderVAE(nn.Module):
         kl_per_layer = torch.tensor([], dtype=torch.float32, device=x.device)
 
         # TODO: Masking can also be handled outside the model (in LightningModule), but it would need to also move loss computation there
-        # TODO: Find a way to also check it during validation (but not during prediction) to match original behaviour
-        mask_input = self.training or validation_mode
-        x_orig = x if mask_input else None
-        x = self._mask_input(x) if mask_input else x
+        should_mask_input = (self.training or validation_mode) if mask_input is None else bool(mask_input)
+        x_orig = x if should_mask_input else None
+        x = self._mask_input(x) if should_mask_input else x
 
         img_size = x.size()[2:]
         # Pad input to make everything easier with conv strides
@@ -270,24 +287,24 @@ class LadderVAE(nn.Module):
         )
 
         if self.training_mode == "semisupervised" and self.training:
-            # get pseudo-labels
-            pseudo_labels, pseudo_labels_stats = self.get_pseudo_labels(
+            # During semisupervised training every unlabeled row in the batch is
+            # pseudo-labeled. Scheduler admission is handled outside the model.
+            pseudo_labels = self.get_pseudo_labels(
                 td_data["posterior"],
                 y,
                 threshold=confidence_threshold,
             )
         else:
             pseudo_labels = y
-            pseudo_labels_stats = None
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)
 
         # If original (unmasked) input is given, use it for likelihood computation, otherwise use masked input
-        ll, likelihood_info = self.likelihood(out, x_orig if mask_input else x)
+        ll, likelihood_info = self.likelihood(out, x_orig if should_mask_input else x)
 
         inpainting_loss = None
-        if mask_input:
+        if should_mask_input:
             # 3) inpainting loss is centre of -loglikelihood
             # FIXME: This "out" is not a dictionary.
             recons_sep = -ll
@@ -329,7 +346,6 @@ class LadderVAE(nn.Module):
             "class_probabilities": probabilities,
             "layers_logits": td_data["class_logits"],
             "pseudo_labels": pseudo_labels,
-            "pseudo_labels_stats": pseudo_labels_stats,
         }
         return output
 
@@ -574,12 +590,20 @@ class LadderVAE(nn.Module):
         label,
         threshold=0.99,
     ):
+        """
+        Assign pseudo-labels to all unlabeled batch rows from the current batch
+        anchors.
+
+        The ``threshold`` argument is kept for interface compatibility, but the
+        staged training loop now relies on the external scheduler to decide
+        which samples are admitted to training. Once a sample is in the batch,
+        the model assigns it a pseudo-label even if confidence is low.
+        """
         anchors = torch.where(label != -1)[0]
 
         selected_labels = label[anchors].long()
         per_layer_pseudo = []
         per_layer_probs = []
-        confidences = []  # Used for logging 
 
         for posterior in posteriors:
             mu = posterior.mean
@@ -620,14 +644,10 @@ class LadderVAE(nn.Module):
 
             probs = F.softmax(logits, dim=1)
             per_layer_probs.append(probs)
-            layer_conf, pseudo = probs.max(dim=1)
+            _, pseudo = probs.max(dim=1)
             pseudo = pseudo.long()
-            non_anchors = torch.ones_like(pseudo, dtype=torch.bool)
-            non_anchors[anchors] = False
-            pseudo[non_anchors & (layer_conf <= threshold)] = -1
 
             per_layer_pseudo.append(pseudo)
-            confidences.append(probs)
 
         votes = torch.stack(per_layer_pseudo, dim=0)  # (L, B)
         expert_mask = votes != -1
@@ -635,33 +655,14 @@ class LadderVAE(nn.Module):
         masked_probs = probs * expert_mask.unsqueeze(-1)
         n_valid_experts = expert_mask.sum(dim=0)
         moe_probs = masked_probs.sum(dim=0) / n_valid_experts.clamp(min=1).unsqueeze(1)
-        moe_conf, moe_label = moe_probs.max(dim=1)
+        _, moe_label = moe_probs.max(dim=1)
 
         final_pseudo = torch.full_like(label, -1, dtype=torch.long)
-        assignable = (n_valid_experts > 0) & (moe_conf > threshold)
+        assignable = n_valid_experts > 0
         final_pseudo[assignable] = moe_label[assignable]
         final_pseudo[anchors] = selected_labels
 
-        # Collect statistics for debugging
-
-        neighbor_mask = torch.ones_like(final_pseudo, dtype=torch.bool)
-        neighbor_mask[anchors] = False # Remove anchor points from the mask
-        n_neighbors = neighbor_mask.sum()
-        
-        assigned_pseudo_labels = neighbor_mask & (final_pseudo != -1)
-        n_assigned = assigned_pseudo_labels.sum()
-
-        stats = {
-                 "per_layer_pseudo_labels": per_layer_pseudo,
-                 "pseudo_labels_confidences": confidences,
-                 "anchors_indices": anchors,
-                 "n_neighbors": n_neighbors,
-                 "n_assigned": n_assigned,
-                 "neighbor_mask": neighbor_mask,
-                 "assigned_pseudo_labels_mask": assigned_pseudo_labels,
-                 }
-
-        return final_pseudo, stats
+        return final_pseudo
 
     def consolidation_prob(self, all_class_logits, mode="SMV"):
 

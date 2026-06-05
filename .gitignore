@@ -1,3 +1,5 @@
+dev/
+results/
 ablations/
 experiments/*/checkpoints
 experiments/*/logs
@@ -218,3 +220,4 @@ __marimo__/
 scripts/
 lightning_logs/
 results.DS_Store
+.DS_Store

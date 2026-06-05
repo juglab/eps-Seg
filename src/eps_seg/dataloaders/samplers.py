@@ -1,7 +1,7 @@
 import random
 import itertools
+import numpy as np
 from torch.utils.data import BatchSampler, DistributedSampler
-from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from typing import Optional
 from typing import Iterator
 import torch.distributed as dist
@@ -26,7 +26,7 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         # Build per-class pools once (anchors only)
         self.pools = {
             c: [i for i, g in enumerate(dataset.groups) if g["labels"][0] == c]
-            for c in dataset.unique_vals
+            for c in dataset.unique_labels
         }
         self.labels = [c for c, v in self.pools.items() if len(v) > 0]
         if not self.labels:
@@ -93,7 +93,341 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
     def __len__(self):
         # compute against current mode so progress bars don't go crazy after mode flip
         anchors_per_batch, _, num_batches = self._compute_epoch_plan()
-        return num_batches    
+        return num_batches
+
+
+class BalancedScheduledBatchSampler(BatchSampler):
+    """
+        Yields class-balanced batches for the staged scheduler dataset.
+
+        Every batch satisfies two constraints:
+        1. It is class balanced across the labels currently present in the scheduler.
+        2. Its stage composition follows the relative distribution of the scheduler's
+           ``stage_index`` values, while still enforcing a configurable minimum
+           fraction of samples from the initial GT-labelled stage-0 pool.
+    """
+
+    def __init__(self, dataset, batch_size=32, min_initial_label_fraction=0.5, seed=42, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.min_initial_label_fraction = min_initial_label_fraction
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.shuffle = shuffle
+
+        self.labels = None
+        self.full_pools = None
+        self.stage_label_pools = None
+        self.stage_counts = None
+        self.initial_stage_counts = None
+        self.stages = None
+        self._cached_version = None
+        self._num_batches = None
+        self._stage_targets = None
+        self._label_targets = None
+        self._stage_label_targets = None
+
+    def _dataset_version(self):
+        """Return the dataset version used to detect schedule changes."""
+        return getattr(self.dataset, "sampling_version", 0)
+
+    def is_stale(self):
+        """Return whether the cached pools are out of date (i.e., Dataset composition has changed)."""
+        return self._cached_version != self._dataset_version()
+
+    def _build_pools(self, schedule_indices):
+        """Group scheduler indices by their current label."""
+        pools = {}
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        for active_idx in schedule_indices:
+            schedule_idx = int(active_schedule_indices[active_idx])
+            label = int(self.dataset.schedule["current_label"][schedule_idx])
+            pools.setdefault(label, []).append(int(active_idx))
+        return pools
+
+    def _build_stage_label_pools(self, schedule_indices):
+        """Group scheduler indices first by stage and then by current label."""
+        pools = {}
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        for active_idx in schedule_indices:
+            schedule_idx = int(active_schedule_indices[active_idx])
+            stage = int(self.dataset.schedule["stage_index"][schedule_idx])
+            label = int(self.dataset.schedule["current_label"][schedule_idx])
+            pools.setdefault(stage, {}).setdefault(label, []).append(int(active_idx))
+        return pools
+
+    def _rebuild_pools(self):
+        """Rebuild all cached pools from the current scheduler state."""
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        schedule_indices = np.arange(len(active_schedule_indices))
+        initial_mask = self.dataset.get_initial_label_mask()[active_schedule_indices]
+
+        self.full_pools = self._build_pools(schedule_indices.tolist())
+        self.stage_label_pools = self._build_stage_label_pools(schedule_indices.tolist())
+        self.stage_counts = {
+            int(stage): int(sum(len(pool) for pool in label_pools.values()))
+            for stage, label_pools in self.stage_label_pools.items()
+        }
+        initial_stage_indices = np.where(initial_mask)[0].tolist()
+        initial_stage_pools = self._build_stage_label_pools(initial_stage_indices)
+        self.initial_stage_counts = {
+            int(stage): int(sum(len(pool) for pool in label_pools.values()))
+            for stage, label_pools in initial_stage_pools.items()
+        }
+        self.labels = sorted(label for label, pool in self.full_pools.items() if len(pool) > 0)
+        self.stages = sorted(stage for stage, count in self.stage_counts.items() if count > 0)
+        if not self.labels:
+            raise ValueError("No valid samples available in any class.")
+        if not any(count > 0 for count in self.initial_stage_counts.values()):
+            raise ValueError("No initial GT-labelled samples available in the scheduler.")
+        self._cached_version = self._dataset_version()
+
+    def _reset_iters(self, pools):
+        """Create cycling iterators for every pool, shuffling if requested."""
+        iters = {}
+        for key, pool_values in pools.items():
+            if isinstance(pool_values, dict):
+                nested_iters = self._reset_iters(pool_values)
+                if nested_iters:
+                    iters[key] = nested_iters
+                continue
+            if len(pool_values) == 0:
+                continue
+            pool = list(pool_values)
+            if self.shuffle:
+                self.rng.shuffle(pool)
+            iters[key] = itertools.cycle(pool)
+        return iters
+
+    def _balanced_counts(self, total_items, keys):
+        """Split a number of items as evenly as possible across the given keys."""
+        keys = list(keys)
+        if len(keys) == 0:
+            return {}
+        base = total_items // len(keys)
+        rem = total_items % len(keys)
+        counts = {key: base for key in keys}
+        for key in keys[:rem]:
+            counts[key] += 1
+        return counts
+
+    def _weighted_counts(self, total_items, weights):
+        """Split a number of items according to the given weights."""
+        keys = list(weights.keys())
+        if total_items <= 0 or len(keys) == 0:
+            return {key: 0 for key in keys}
+
+        total_weight = float(sum(max(float(weights[key]), 0.0) for key in keys))
+        if total_weight <= 0.0:
+            return self._balanced_counts(total_items, keys)
+
+        raw_counts = {key: total_items * max(float(weights[key]), 0.0) / total_weight for key in keys}
+        counts = {key: int(np.floor(raw_counts[key])) for key in keys}
+        remainder = total_items - sum(counts.values())
+        if remainder > 0:
+            ranked_keys = sorted(
+                keys,
+                key=lambda key: (raw_counts[key] - counts[key], -keys.index(key)),
+                reverse=True,
+            )
+            for key in ranked_keys[:remainder]:
+                counts[key] += 1
+        return counts
+
+    def _remove_from_counts(self, counts, total_to_remove, weights):
+        """Remove items from a count dictionary while following the given weights."""
+        remaining = int(total_to_remove)
+        if remaining <= 0:
+            return counts
+
+        while remaining > 0:
+            active_weights = {
+                key: weights.get(key, 0.0)
+                for key, count in counts.items()
+                if count > 0
+            }
+            if not active_weights:
+                raise ValueError("Cannot remove samples from stage targets without making them negative.")
+
+            proposal = self._weighted_counts(remaining, active_weights)
+            removed_this_round = 0
+            for key, remove_count in proposal.items():
+                if remove_count <= 0 or counts[key] <= 0:
+                    continue
+                actual_remove = min(int(remove_count), int(counts[key]))
+                counts[key] -= actual_remove
+                removed_this_round += actual_remove
+            if removed_this_round == 0:
+                fallback_key = max(active_weights.keys(), key=lambda key: (active_weights[key], counts[key], -key))
+                counts[fallback_key] -= 1
+                removed_this_round = 1
+            remaining -= removed_this_round
+        return counts
+
+    def _compute_stage_targets(self):
+        """Decide how many batch items should come from each scheduler stage."""
+        stage_targets = self._weighted_counts(self.batch_size, self.stage_counts)
+
+        # Enforce the minimum number of samples for the initial GT-labelled stages in a batch
+        n_initial_min = int(np.ceil(self.batch_size * self.min_initial_label_fraction))
+        n_initial_min = min(n_initial_min, self.batch_size)
+        current_initial_target = sum(stage_targets.get(stage, 0) for stage in self.initial_stage_counts)
+
+        # If the current distribution already meets the minimum requirement for initial stages, return it as is
+        if current_initial_target >= n_initial_min:
+            return stage_targets
+
+        deficit = n_initial_min - current_initial_target
+
+        # Add missing initial samples to meet the minimum requirement, distributing them according to the initial stage counts
+        initial_additions = self._weighted_counts(deficit, self.initial_stage_counts)
+        for stage, added_count in initial_additions.items():
+            stage_targets[stage] = stage_targets.get(stage, 0) + int(added_count)
+
+        # Remove the same number of samples from the non-initial stages to maintain the batch size
+        non_initial_weights = {
+            stage: count
+            for stage, count in self.stage_counts.items()
+            if stage not in self.initial_stage_counts
+        }
+        stage_targets = self._remove_from_counts(stage_targets, deficit, non_initial_weights)
+        return stage_targets
+
+    def _stage_available_labels(self):
+        """List which labels are available inside each scheduler stage."""
+        return {
+            stage: sorted(label for label, pool in self.stage_label_pools[stage].items() if len(pool) > 0)
+            for stage in self.stages
+        }
+
+    def _choose_label_for_stage(self, stage, available_labels, remaining_label_targets, stage_label_targets):
+        """Pick the next label to draw for one stage while keeping class balance."""
+        candidate_labels = [label for label in available_labels if remaining_label_targets[label] > 0]
+        if not candidate_labels:
+            candidate_labels = list(available_labels)
+        return max(
+            candidate_labels,
+            key=lambda label: (
+                remaining_label_targets[label],
+                -stage_label_targets[stage][label],
+                -self.labels.index(label),
+            ),
+        )
+
+    def _repair_label_totals(self, stage_label_targets, label_targets, stage_available_labels):
+        """Fix small count mismatches so global class totals match the batch plan."""
+        label_totals = {
+            label: sum(stage_label_targets[stage][label] for stage in self.stages)
+            for label in self.labels
+        }
+
+        while True:
+            deficit_labels = [label for label in self.labels if label_totals[label] < label_targets[label]]
+            excess_labels = [label for label in self.labels if label_totals[label] > label_targets[label]]
+            if not deficit_labels and not excess_labels:
+                return stage_label_targets
+
+            repaired = False
+            for deficit_label in deficit_labels:
+                for excess_label in excess_labels:
+                    candidate_stages = [
+                        stage
+                        for stage in self.stages
+                        if stage_label_targets[stage][excess_label] > 0 and deficit_label in stage_available_labels[stage]
+                    ]
+                    if not candidate_stages:
+                        continue
+                    chosen_stage = min(
+                        candidate_stages,
+                        key=lambda stage: (stage_label_targets[stage][deficit_label], stage),
+                    )
+                    stage_label_targets[chosen_stage][excess_label] -= 1
+                    stage_label_targets[chosen_stage][deficit_label] += 1
+                    label_totals[excess_label] -= 1
+                    label_totals[deficit_label] += 1
+                    repaired = True
+                    break
+                if repaired:
+                    break
+
+            if not repaired:
+                raise ValueError(
+                    "Unable to build a batch plan that is both class balanced and compatible "
+                    "with the stage distribution of the current scheduler."
+                )
+
+    def _compute_stage_label_targets(self, stage_targets, label_targets):
+        """Split each stage target into per-label targets for the current batch."""
+        stage_available_labels = self._stage_available_labels()
+        stage_label_targets = {
+            stage: {label: 0 for label in self.labels}
+            for stage in self.stages
+        }
+        remaining_label_targets = dict(label_targets)
+        stage_order = sorted(self.stages, key=lambda stage: (len(stage_available_labels[stage]), stage))
+
+        for stage in stage_order:
+            for _ in range(stage_targets[stage]):
+                chosen_label = self._choose_label_for_stage(
+                    stage=stage,
+                    available_labels=stage_available_labels[stage],
+                    remaining_label_targets=remaining_label_targets,
+                    stage_label_targets=stage_label_targets,
+                )
+                stage_label_targets[stage][chosen_label] += 1
+                if remaining_label_targets[chosen_label] > 0:
+                    remaining_label_targets[chosen_label] -= 1
+
+        self._repair_label_totals(stage_label_targets, label_targets, stage_available_labels)
+        return stage_label_targets
+
+    def _compute_epoch_plan(self):
+        """Build the cached batch plan and choose the number of batches per epoch."""
+        self._rebuild_pools()
+        max_class = max(len(self.full_pools[label]) for label in self.labels)
+        num_batches = max(1, (max_class * len(self.labels)) // self.batch_size)
+        # Compute the targets according to the stages
+        stage_targets = self._compute_stage_targets()
+        # Compute the label targets (balanced across all labels)
+        label_targets = self._balanced_counts(self.batch_size, self.labels)
+        # Compute the stage-label targets that satisfy both constraints
+        stage_label_targets = self._compute_stage_label_targets(stage_targets, label_targets)
+        self._stage_targets = stage_targets
+        self._label_targets = label_targets
+        self._stage_label_targets = stage_label_targets
+        self._num_batches = num_batches
+        return stage_label_targets, num_batches
+
+    def __iter__(self):
+        """Yield batches that follow the current class and stage plan."""
+        stage_label_targets, num_batches = self._compute_epoch_plan()
+        stage_label_iters = self._reset_iters(self.stage_label_pools)
+
+        for _ in range(num_batches):
+            batch = []
+            stage_order = list(self.stages)
+            label_order = list(self.labels)
+            if self.shuffle:
+                self.rng.shuffle(stage_order)
+                self.rng.shuffle(label_order)
+            for stage in stage_order:
+                for label in label_order:
+                    take = stage_label_targets[stage][label]
+                    if take <= 0:
+                        continue
+                    batch.extend(next(stage_label_iters[stage][label]) for _ in range(take))
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        """Return the number of batches in the current epoch plan."""
+        if self.is_stale() or self._num_batches is None:
+            self._compute_epoch_plan()
+        return self._num_batches
+
+
+BalancedAnchorLabelBatchSampler = BalancedScheduledBatchSampler
 
 class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
     """
@@ -120,8 +454,8 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
     """
     def __init__(
         self,
-        dataset: SemisupervisedDataset,
-        sampler: ModeAwareBalancedAnchorBatchSampler,
+        dataset,
+        sampler: BatchSampler,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
         shuffle: bool = False,
@@ -180,6 +514,13 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
             Yield indices for the current replica by filtering the underlying sampler's indices.
         """
         n_batches_this_replica = len(self) # e.g., 101 for 4 replicas with 404 total batches
+
+        if hasattr(self.sampler, "is_stale") and self.sampler.is_stale():
+            had_active_iterator = self.sampler_iter is not None
+            self.sampler_iter = None
+            self.next_te_idx = 0
+            if self.batches_per_pseudoepoch is not None and had_active_iterator:
+                self.current_true_epoch += 1
         
         
         if self.batches_per_pseudoepoch is None:
@@ -214,4 +555,3 @@ class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
                     self.next_te_idx = 0
                     self.current_true_epoch += 1
                     continue
-

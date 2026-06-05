@@ -1,6 +1,6 @@
 from eps_seg.config.base import BaseEPSConfig
 from pydantic import Field, model_validator
-from typing import List, Literal, Tuple
+from typing import List, Literal, Tuple, Union
 import yaml
 
 
@@ -62,8 +62,14 @@ class LVAEConfig(BaseEPSModelConfig):
         default="supervised",
         description="Training mode for the LVAE. Starts with 'supervised' and can be switched to 'semisupervised' during training.",
     )
-    n_filters: int = Field(
-        default=64, description="Number of filters in all convolutional layers."
+    n_filters: Union[int, List[int], None] = Field(
+        default=None,
+        description=(
+            "Deterministic feature channels. "
+            "If int, the same value is used for all layers. "
+            "If list, must have one value per layer. "
+            "If None, defaults to z_dims."
+        ),
     )
     dropout: float = Field(default=0.2, description="Dropout rate to use in the model.")
     kl_free_bits: float = Field(
@@ -126,4 +132,24 @@ class LVAEConfig(BaseEPSModelConfig):
             raise ValueError(
                 f"enable_top_down_residuals must have length {self.n_layers}, got {len(self.enable_top_down_residuals)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def normalize_n_filters(self):
+        if self.n_filters is None:
+            n_filters = list(self.z_dims)
+        elif isinstance(self.n_filters, int):
+            n_filters = [self.n_filters] * self.n_layers
+        else:
+            n_filters = list(self.n_filters)
+
+        if len(n_filters) != self.n_layers:
+            raise ValueError(
+                f"n_filters must have length {self.n_layers}, got {len(n_filters)}"
+            )
+
+        if any(f <= 0 for f in n_filters):
+            raise ValueError("All n_filters values must be > 0")
+
+        self.n_filters = n_filters
         return self

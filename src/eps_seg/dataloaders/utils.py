@@ -2,6 +2,14 @@ import torch
 
 
 def flex_collate(batch):
+    # TODO: Check this and if it's still needed with PseudoLabelDataset.
+    if isinstance(batch[0], dict):
+        patches = torch.stack([b["patch"] for b in batch], dim=0)
+        labels = torch.stack([b["label"] for b in batch], dim=0)
+        segs = torch.stack([b["segmentation"] for b in batch], dim=0)
+        coords = torch.stack([b["coords"] for b in batch], dim=0)
+        return patches, labels, segs, coords
+
     # batch = list of (patches[M,1,H,W], labels[M], segs[M,1,H,W])
     patches = torch.cat([b[0] for b in batch], dim=0)  # [sum M, 1, H, W]
     labels = torch.cat([b[1] for b in batch], dim=0)  # [sum M]

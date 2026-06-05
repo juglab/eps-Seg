@@ -2,9 +2,11 @@ import lightning as L
 from eps_seg.modules.lvae import LadderVAE
 from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
+from eps_seg.training.logger import log_epoch_dice_scores, log_lvae_step, log_scheduler_stats, log_trainer_state
 from typing import Literal
 import torch 
 from torchmetrics.classification import F1Score
+import numpy as np
 
 
 class LVAEModel(L.LightningModule):
@@ -20,23 +22,90 @@ class LVAEModel(L.LightningModule):
         self.model.register_buffer("data_std", torch.tensor(0.0))        
         self.register_buffer("seen_samples", torch.zeros(1, dtype=torch.long))
 
-        self.current_threshold = self.train_cfg.initial_threshold if self.train_cfg else 0.5
-        self.current_radius = self.train_cfg.initial_radius if self.train_cfg else 5
-        # Patience counter for radius increase
-        self.current_radius_patience = 0
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
                                    "train_config": train_cfg.model_dump() if train_cfg else None})
         
-        # DiceScore implemented as F1Score
-        # Index -1 is passed during selfsupervised mode for inpatinting loss on unlabeled regions
-        # sync_on_compute=False because we want to accumulate stats across devices manually and then compute at epoch end only on rank 0
-        # otherwise it will go deadlock because we end up with different class amounts on different devices
-        self.train_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True) 
-        self.validation_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
-        self.test_dice_score = F1Score(num_classes=self.cfg.n_components, average=None, task="multiclass", ignore_index=-1, sync_on_compute=False, dist_sync_on_step=True)
+        # DiceScore implemented as F1Score.
+        # Under DDP we want the final epoch metric to be computed from the joint
+        # TP/FP/TN/FN statistics across ranks, so we let TorchMetrics sync on
+        # compute and avoid per-step synchronization.
+        self.train_dice_score = F1Score(
+            num_classes=self.cfg.n_components,
+            average=None,
+            task="multiclass",
+            ignore_index=-1,
+            sync_on_compute=True,
+            dist_sync_on_step=False,
+        )
+        self.validation_dice_score = F1Score(
+            num_classes=self.cfg.n_components,
+            average=None,
+            task="multiclass",
+            ignore_index=-1,
+            sync_on_compute=True,
+            dist_sync_on_step=False,
+        )
+        self.test_dice_score = F1Score(
+            num_classes=self.cfg.n_components,
+            average=None,
+            task="multiclass",
+            ignore_index=-1,
+            sync_on_compute=True,
+            dist_sync_on_step=False,
+        )
         self.current_true_epoch = 0
+        self.current_stage_idx = -1
 
-    def forward(self, x, y=None, validation_mode: bool = False, confidence_threshold: float = 0.99):
+    def _resolve_training_targets(self, batch: dict) -> torch.Tensor:
+        """
+            Returns the appropriate training targets for the current training mode.
+        """
+        if self.train_cfg.train_fully_supervised:
+            return batch["gt"]
+        if self.current_training_mode == "semisupervised":
+            # Pseudo-labelled rows stay unlabeled during semisupervised training so
+            # the LVAE can infer pseudo-labels internally from the stage-0 labelled
+            # samples present in the same batch.
+            y = batch["label"].clone()
+            y[~batch["is_initial_label"].bool()] = -1
+            return y
+        if self.current_training_mode == "active_learning":
+            return batch["gt"]
+        return batch["label"]
+
+    @staticmethod
+    def _candidate_confidence_scores(
+        probs: torch.Tensor,
+        score_metric: Literal["max_probability", "normalized_reciprocal_entropy", "margin"] = "max_probability",
+    ) -> torch.Tensor:
+        """
+            Compute candidate admission scores from class probabilities.
+        """
+        probs = probs.float()
+        if score_metric == "max_probability":
+            return probs.max(dim=-1).values
+        if score_metric == "normalized_reciprocal_entropy":
+            n_classes = probs.shape[-1]
+            if n_classes <= 1:
+                return torch.ones_like(probs[..., 0])
+            safe_probs = probs.clamp_min(1e-8)
+            entropy = -(safe_probs * safe_probs.log()).sum(dim=-1)
+            return (1.0 - entropy / np.log(n_classes)).clamp(min=0.0, max=1.0)
+        if score_metric == "margin":
+            topk = torch.topk(probs, k=min(2, probs.shape[-1]), dim=-1).values
+            if topk.shape[-1] == 1:
+                return topk[..., 0]
+            return topk[..., 0] - topk[..., 1]
+        raise ValueError(f"Unknown candidate score metric: {score_metric}")
+
+    def forward(
+        self,
+        x,
+        y=None,
+        validation_mode: bool = False,
+        confidence_threshold: float = 0.99,
+        mask_input: bool | None = None,
+    ):
         """
             Forward pass through the LVAE model.
 
@@ -53,7 +122,13 @@ class LVAEModel(L.LightningModule):
         if torch.isnan(x).any() or torch.isinf(x).any():
             print("x has nan or inf")
         
-        return self.model(x, y=y, validation_mode=validation_mode, confidence_threshold=confidence_threshold)
+        return self.model(
+            x,
+            y=y,
+            validation_mode=validation_mode,
+            confidence_threshold=confidence_threshold,
+            mask_input=mask_input,
+        )
 
     def on_fit_start(self):
         # Add data statistics to the model before training or prediction (so that they are saved in checkpoints)
@@ -67,56 +142,8 @@ class LVAEModel(L.LightningModule):
             print("Using existing data statistics from checkpoint.")
         print("Seen samples:", self.seen_samples.item())
 
-    def log_step(self, 
-                 outputs: dict, 
-                 step: Literal["train", "val", "test"], 
-                 batch_size: int, 
-                 segments: torch.Tensor = None):
-        
-        # Logging Loss Terms
-        self.log(f"{step}/IP", outputs["inpainting_loss"] * self.train_cfg.alpha, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(f"{step}/IP_unweighted", outputs["inpainting_loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        
-        for loss_term_name, weigth in zip(["kl", "cl", "ce"], [self.train_cfg.beta, self.train_cfg.gamma, 1.0]):
-            # Average loss term over all layers
-            self.log(f"{step}/{loss_term_name.upper()}", outputs[loss_term_name] * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            # Log every layer loss term 
-        for l, val in enumerate(outputs["kl_per_layer"]):
-            self.log(f"{step}/{loss_term_name.upper()}_layer_{l}", val * weigth, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            self.log(f"{step}/{loss_term_name.upper()}_layer_{l}_unweighted", val, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.log(f"{step}/total_loss", outputs["loss"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-
-        # Logging x axis for graphs
-        self.log(f"seen_samples", float(self.seen_samples), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, reduce_fx="max")
-        self.log("true_epoch", self.current_true_epoch, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True, reduce_fx="max")
-
-        # Logging correct pseudo-labeling statistics
-        if outputs.get("pseudo_labels_stats") is not None and segments is not None:
-            pl = outputs["pseudo_labels"]
-            pl_stats = outputs["pseudo_labels_stats"]
-            nbr_msk = pl_stats["neighbor_mask"]
-            pl_ass_msk = pl_stats["assigned_pseudo_labels_mask"]
-
-            center_coords = [(self.cfg.img_shape[i] - 1) // 2 for i in range(len(self.cfg.img_shape))]
-            gt_pseudo_labels = segments[:, 0, *center_coords]
-
-            correct_pseudo_labels = (gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk])
-            n_tp_pseudo_labels = correct_pseudo_labels.sum() / pl_ass_msk.sum() if pl_ass_msk.sum() > 0 else 0
-
-            self.log(f"{step}_pseudo_labels/assigned_neighbors_perc", pl_stats["n_assigned"] / pl_stats["n_neighbors"], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy", n_tp_pseudo_labels, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-            for label_cls in range(self.cfg.n_components):
-                n_assigned_pl_class = (pl[pl_ass_msk] == label_cls).sum()
-                n_tp_pseudo_labels_class = ((gt_pseudo_labels[pl_ass_msk] == pl[pl_ass_msk]) & (gt_pseudo_labels[pl_ass_msk] == label_cls)).sum() / n_assigned_pl_class if n_assigned_pl_class > 0 else 0
-                self.log(f"{step}_pseudo_labels/assigned_pseudo_label_accuracy_class_{label_cls}", n_tp_pseudo_labels_class, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-
-            for l, conf in enumerate(pl_stats["pseudo_labels_confidences"]):
-                # How confident each layer is in assigning pseudo-labels to neighbors in general
-                self.log(f"{step}_pseudo_labels/confidence_mean_nbr_layer_{l}", conf[nbr_msk].mean(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-                self.log(f"{step}_pseudo_labels/confidence_std_nbr_layer_{l}", conf[nbr_msk].std(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
-
-
-
+    def log_step(self, outputs: dict, step: Literal["train", "val", "test"], batch: dict):
+        log_lvae_step(self, outputs, step, batch)
 
     def compute_total_loss(self, outputs: dict):
         return (
@@ -127,16 +154,22 @@ class LVAEModel(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        x, y, s, c = batch
-
+        x = batch["patch"]
+        y = self._resolve_training_targets(batch)
+        
         batch_size = x.shape[0]
 
-        outputs = self.model(x, y, validation_mode=False, confidence_threshold=self.current_threshold)
+        outputs = self.model(
+            x,
+            y,
+            validation_mode=False,
+            confidence_threshold=self.train_cfg.model_confidence_threshold,
+        )
         outputs["loss"] = self.compute_total_loss(outputs)
 
         self.seen_samples += batch_size * self.trainer.world_size
         self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
-        self.log_step(outputs, "train", batch_size, segments=s)
+        self.log_step(outputs, "train", batch)
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -159,17 +192,18 @@ class LVAEModel(L.LightningModule):
             )
 
     def validation_step(self, batch, batch_idx):
+        # TODO: For now, validation still uses the old dataloader and batch format
         x, y, s, c = batch
         batch_size = x.shape[0]
 
         outputs = self.forward(x, 
                              y, 
                              validation_mode=True, 
-                             confidence_threshold=self.current_threshold,
+                             confidence_threshold=self.train_cfg.model_confidence_threshold,
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
 
-        self.log_step(outputs, "val", x.shape[0], segments=s)
+        self.log_step(outputs, "val", {"patch": x, "label": y})
         
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
@@ -197,20 +231,23 @@ class LVAEModel(L.LightningModule):
         return outputs
 
     def on_test_epoch_end(self):
-        if self.trainer.is_global_zero:
-            # We are node 0 device 0
-            dice_loss_per_class = self.test_dice_score.compute()
-            for class_idx, dice_score in enumerate(dice_loss_per_class):
-                self.log(f'test/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
-            self.log('test/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
-            self.test_dice_score.reset()
+        dice_loss_per_class = self.test_dice_score.compute()
+        for class_idx, dice_score in enumerate(dice_loss_per_class):
+            self.log(f'test/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
+        self.log('test/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
+        self.test_dice_score.reset()
         super().on_test_epoch_end()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, normalize=True):
         x, labels, _, coords, key = batch
         if normalize:
             x = (x - self.model.data_mean) / self.model.data_std
-        outputs = self.forward(x, y=None, validation_mode=False)
+        outputs = self.forward(
+            x,
+            y=None,
+            validation_mode=False,
+            mask_input=bool(self.train_cfg and self.train_cfg.mask_input_during_prediction),
+        )
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)[:, None]  # Add channel dim for compatibility
         outputs["labels"] = labels
         outputs["coords"] = coords
@@ -219,23 +256,42 @@ class LVAEModel(L.LightningModule):
         return outputs
 
     def on_train_epoch_end(self):
-        if self.trainer.is_global_zero:
-            # We are node 0 device 0
-            dice_loss_per_class = self.train_dice_score.compute()
-            for class_idx, dice_score in enumerate(dice_loss_per_class):
-                self.log(f'train/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
-            self.log('train/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
-        self.train_dice_score.reset()
+        log_epoch_dice_scores(self, "train", self.train_dice_score, mean_prog_bar=False)
+
+    def on_train_epoch_start(self):
+        log_trainer_state(self)
+        log_scheduler_stats(self)
 
     def on_validation_epoch_end(self):
+        log_epoch_dice_scores(self, "val", self.validation_dice_score, mean_prog_bar=True)
         if self.trainer.is_global_zero:
-            # We are node 0 device 0
-            dice_loss_per_class = self.validation_dice_score.compute()
-            for class_idx, dice_score in enumerate(dice_loss_per_class):
-                self.log(f'val/dice_score_class_{class_idx}', dice_score, prog_bar=True, sync_dist=False)
-            self.log('val/dice_score_mean', dice_loss_per_class.mean(), prog_bar=True, sync_dist=False)
-        self.validation_dice_score.reset()
+            log_trainer_state(self)
 
+    def evaluate_candidate_batch(self, batch: dict):
+        """
+            Evaluate scheduler extension candidates and return predicted labels
+            together with their confidence scores.
+        """
+        was_training = self.training
+        self.eval()
+        with torch.inference_mode():
+            x = batch["patch"].to(self.device, non_blocking=True)
+            amp_enabled = bool(self.train_cfg and self.train_cfg.amp and self.device.type == "cuda")
+            autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled)
+            with autocast_context:
+                outputs = self.forward(
+                    x,
+                    y=None,
+                    validation_mode=False,
+                    confidence_threshold=self.train_cfg.model_confidence_threshold,
+                )
+            probs = outputs["class_probabilities"]
+            predicted_labels = probs.argmax(dim=-1)
+            score_metric = self.train_cfg.schedule_admission.score_metric
+            confidences = self._candidate_confidence_scores(probs, score_metric=score_metric)
+        if was_training:
+            self.train()
+        return predicted_labels.cpu().numpy().astype(np.int32), confidences.cpu().numpy().astype(np.float32)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),
@@ -252,11 +308,10 @@ class LVAEModel(L.LightningModule):
             },
         }
 
-    def update_mode(self, mode: Literal["supervised", "semisupervised"]):
+    def update_mode(self, mode: Literal["supervised", "semisupervised", "active_learning"]):
         print(f"Updating model training mode to: {mode}")
         self.current_training_mode = mode
-        self.model.update_mode(mode)
-
+        self.model.update_mode("supervised" if mode == "active_learning" else mode)
 
     def configure_callbacks(self):
         return super().configure_callbacks()
