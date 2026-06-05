@@ -177,6 +177,20 @@ class LVAEModel(L.LightningModule):
 
         return outputs
 
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        self.model.update_top_prior_scheduler(self.current_epoch)
+        top_prior_mu = self.model.get_top_prior_mu_value()
+        if top_prior_mu is not None:
+            self.log(
+                "train/top_prior_mu",
+                top_prior_mu,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
     def validation_step(self, batch, batch_idx):
         # TODO: For now, validation still uses the old dataloader and batch format
         x, y, s, c = batch

@@ -228,6 +228,17 @@ class LadderVAE(nn.Module):
         for layer in self.top_down_layers:
             layer.update_mode(mode)
 
+    def update_top_prior_scheduler(self, epoch: int):
+        for layer in self.top_down_layers:
+            layer.update_top_prior_scheduler(epoch)
+
+    def get_top_prior_mu_value(self):
+        for layer in reversed(self.top_down_layers):
+            mu_value = layer.get_top_prior_mu_value()
+            if mu_value is not None:
+                return mu_value
+        return None
+
     @property
     def global_step(self) -> int:
         """Global step."""
