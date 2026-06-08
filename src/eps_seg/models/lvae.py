@@ -246,6 +246,7 @@ class LVAEModel(L.LightningModule):
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
+        # TODO: make this switchable via config 
         self.model.update_top_prior_scheduler(self.current_epoch)
         top_prior_mu = self.model.get_top_prior_mu_value()
         if top_prior_mu is not None:
@@ -258,8 +259,11 @@ class LVAEModel(L.LightningModule):
                 sync_dist=True,
             )
 
+        log_trainer_state(self)
+        log_scheduler_stats(self)
+
     def validation_step(self, batch, batch_idx):
-        # TODO: For now, validation still uses the old dataloader and batch format
+        # TODO: For now, validation still uses the old eps-Seg dataloader also in AL. No need for a schedule.
         x, y, s, c = batch
         batch_size = x.shape[0]
 
@@ -324,10 +328,6 @@ class LVAEModel(L.LightningModule):
 
     def on_train_epoch_end(self):
         log_epoch_dice_scores(self, "train", self.train_dice_score, mean_prog_bar=False)
-
-    def on_train_epoch_start(self):
-        log_trainer_state(self)
-        log_scheduler_stats(self)
 
     def on_validation_epoch_end(self):
         log_epoch_dice_scores(self, "val", self.validation_dice_score, mean_prog_bar=True)
