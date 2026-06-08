@@ -160,7 +160,12 @@ class InitialLabelSamplingConfig(BaseEPSConfig):
 
 
 class TrainConfig(BaseEPSConfig):
-    training_regime: Literal["semisupervised", "active_learning", "upper_bound_replay"] = Field(
+    training_regime: Literal[
+        "semisupervised",
+        "active_learning",
+        "upper_bound_replay",
+        "neighbor_semisupervised",
+    ] = Field(
         default="semisupervised",
         description="High-level staged training regime controlling how scheduler rows are interpreted and extended.",
     )
@@ -230,6 +235,24 @@ class TrainConfig(BaseEPSConfig):
             "the label-admission budget."
         ),
     )
+    neighbor_radius: int = Field(
+        default=5,
+        description="Maximum radius used to sample local unlabeled neighbors for neighbor-based semisupervised training.",
+    )
+    neighbor_supervised_max_epochs: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum epochs for the supervised warmup phase of neighbor-based semisupervised training. "
+            "Defaults to max_epochs when omitted."
+        ),
+    )
+    neighbor_semisupervised_max_epochs: Optional[int] = Field(
+        default=None,
+        description=(
+            "Additional maximum epochs for the semisupervised phase of neighbor-based semisupervised training. "
+            "Defaults to max_epochs when omitted."
+        ),
+    )
     max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
     training_batch_sampler: Literal["stage_class_balanced", "class_balanced_schedule"] = Field(
         default="stage_class_balanced",
@@ -265,6 +288,12 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("candidate_evaluation_budget must be >= 0 when provided.")
         if self.max_extensions < 0:
             raise ValueError("max_extensions must be >= 0.")
+        if self.neighbor_radius < 1:
+            raise ValueError("neighbor_radius must be >= 1.")
+        if self.neighbor_supervised_max_epochs is not None and self.neighbor_supervised_max_epochs < 1:
+            raise ValueError("neighbor_supervised_max_epochs must be >= 1 when provided.")
+        if self.neighbor_semisupervised_max_epochs is not None and self.neighbor_semisupervised_max_epochs < 1:
+            raise ValueError("neighbor_semisupervised_max_epochs must be >= 1 when provided.")
         if self.training_regime == "active_learning" and self.schedule_admission.name not in {
             "admit_all_with_gt",
             "confidence_window_with_gt",
@@ -286,6 +315,14 @@ class TrainConfig(BaseEPSConfig):
                 "requires extension_samples_per_class."
             )
         return self
+
+    @property
+    def resolved_neighbor_supervised_max_epochs(self) -> int:
+        return int(self.neighbor_supervised_max_epochs or self.max_epochs)
+
+    @property
+    def resolved_neighbor_semisupervised_max_epochs(self) -> int:
+        return int(self.neighbor_semisupervised_max_epochs or self.max_epochs)
 
 
 class ExperimentConfig(BaseEPSConfig):
@@ -375,10 +412,17 @@ class ExperimentConfig(BaseEPSConfig):
         """Return the directory path for saving logs."""
         return self.experiment_root / "logs"
 
+    def checkpoint_path(
+        self,
+        mode: Literal["supervised", "semisupervised", "active_learning"],
+        kind: Literal["best", "last"],
+    ) -> Path:
+        train_cfg, dataset_cfg, model_cfg = self.get_configs()
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}.ckpt"
+
     def best_checkpoint_path(self, mode: Literal["supervised", "semisupervised", "active_learning"]) -> Path:
         """Return the path to the best model checkpoint based on the training mode."""
-        train_cfg, dataset_cfg, model_cfg = self.get_configs()
-        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"best_{mode}.ckpt"
+        return self.checkpoint_path(mode, "best")
 
     def stage_checkpoint_path(
         self,

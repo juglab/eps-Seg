@@ -34,12 +34,16 @@ class EPSSegDataModule(L.LightningDataModule):
         train_cfg: TrainConfig,
         scheduler_path: Optional[Path] = None,
         scheduler_stage_index: int = 0,
+        fit_dataset_kind: Literal["scheduler", "neighbor"] = "scheduler",
+        fit_dataset_mode: Optional[Literal["supervised", "semisupervised"]] = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.train_cfg = train_cfg
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
         self.scheduler_stage_index = scheduler_stage_index
+        self.fit_dataset_kind = fit_dataset_kind
+        self.fit_dataset_mode = fit_dataset_mode
         self.cache_dir = cfg.get_cache_folder()
         self.cache = DatasetCache(cfg, train_cfg=train_cfg)
 
@@ -73,7 +77,15 @@ class EPSSegDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         stage_seed = self._runtime_stage_seed()
-        if self.train_cfg.training_batch_sampler == "stage_class_balanced":
+        if self.fit_dataset_kind == "neighbor":
+            train_sampler = ModeAwareBalancedAnchorBatchSampler(
+                self.train_dataset,
+                total_patches_per_batch=self.train_cfg.batch_size,
+                shuffle=True,
+                n_neighbors=self.cfg.n_neighbors,
+                seed=stage_seed,
+            )
+        elif self.train_cfg.training_batch_sampler == "stage_class_balanced":
             train_sampler = BalancedScheduledBatchSampler(
                 self.train_dataset,
                 batch_size=self.train_cfg.batch_size,
@@ -99,10 +111,10 @@ class EPSSegDataModule(L.LightningDataModule):
             batches_per_pseudoepoch=self.train_cfg.batches_per_pseudoepoch,
         )
 
-        return DataLoader(
-            self.train_dataset,
-            batch_sampler=train_sampler,
-        )
+        dataloader_kwargs = {"batch_sampler": train_sampler}
+        if self.fit_dataset_kind == "neighbor":
+            dataloader_kwargs["collate_fn"] = flex_collate
+        return DataLoader(self.train_dataset, **dataloader_kwargs)
 
     def val_dataloader(self):
         val_sampler = ModeAwareBalancedAnchorBatchSampler(
@@ -157,22 +169,41 @@ class EPSSegDataModule(L.LightningDataModule):
             )
 
         if stage in ["fit"]:
-            self.train_dataset = PseudoLabelDataset(
-                images=self.data["trainval_images"],
-                labels=self.data["trainval_labels"],
-                patch_size=self.cfg.patch_size,
-                label_size=1,
-                n_classes=self.cfg.n_classes,
-                ignore_lbl=-1,
-                dim=self.cfg.dim,
-                seed=self.cfg.seed,
-                samples_per_class=self.cfg.samples_per_class,
-                coordinate_records=self.data["train_coordinate_records"],
-                train_substacks=self.data["train_substacks"],
-                scheduler_path=self.scheduler_path,
-                stage_index=self.scheduler_stage_index,
-                train_cfg=self.train_cfg,
-            )
+            if self.fit_dataset_kind == "scheduler":
+                self.train_dataset = PseudoLabelDataset(
+                    images=self.data["trainval_images"],
+                    labels=self.data["trainval_labels"],
+                    patch_size=self.cfg.patch_size,
+                    label_size=1,
+                    n_classes=self.cfg.n_classes,
+                    ignore_lbl=-1,
+                    dim=self.cfg.dim,
+                    seed=self.cfg.seed,
+                    samples_per_class=self.cfg.samples_per_class,
+                    coordinate_records=self.data["train_coordinate_records"],
+                    train_substacks=self.data["train_substacks"],
+                    scheduler_path=self.scheduler_path,
+                    stage_index=self.scheduler_stage_index,
+                    train_cfg=self.train_cfg,
+                )
+            elif self.fit_dataset_kind == "neighbor":
+                self.train_dataset = SemisupervisedDataset(
+                    images=self.data["trainval_images"],
+                    labels=self.data["trainval_labels"],
+                    patch_size=self.cfg.patch_size,
+                    label_size=1,
+                    mode=self.fit_dataset_mode or self.cfg.mode,
+                    n_classes=self.cfg.n_classes,
+                    ignore_lbl=-1,
+                    dim=self.cfg.dim,
+                    seed=self.cfg.seed,
+                    samples_per_class=self.cfg.samples_per_class,
+                    n_neighbors=self.cfg.n_neighbors,
+                    radius=self.train_cfg.neighbor_radius,
+                    coordinate_records=self.data["train_coordinate_records"],
+                )
+            else:
+                raise ValueError(f"Unknown fit_dataset_kind: {self.fit_dataset_kind}")
         if stage in ["fit", "validate"]:
             self.val_dataset = SemisupervisedDataset(
                 images=self.data["trainval_images"],

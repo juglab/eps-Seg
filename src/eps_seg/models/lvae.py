@@ -206,9 +206,23 @@ class LVAEModel(L.LightningModule):
             outputs["ce"]
         )
 
+    def _unpack_training_batch(self, batch) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        if isinstance(batch, dict):
+            x = batch["patch"]
+            y = self._resolve_training_targets(batch)
+            return x, y, batch
+
+        x, y, segmentation, coords = batch
+        log_batch = {
+            "patch": x,
+            "label": y,
+            "segmentation": segmentation,
+            "coords": coords,
+        }
+        return x, y, log_batch
+
     def training_step(self, batch, batch_idx):
-        x = batch["patch"]
-        y = self._resolve_training_targets(batch)
+        x, y, log_batch = self._unpack_training_batch(batch)
         
         batch_size = x.shape[0]
 
@@ -222,7 +236,7 @@ class LVAEModel(L.LightningModule):
 
         self.seen_samples += batch_size * self.trainer.world_size
         self.current_true_epoch = self.trainer.train_dataloader.batch_sampler.current_true_epoch
-        self.log_step(outputs, "train", batch)
+        self.log_step(outputs, "train", log_batch)
 
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)

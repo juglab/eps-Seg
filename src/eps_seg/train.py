@@ -67,14 +67,14 @@ def build_model_for_stage(
     return model
 
 
-def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str, stage_idx: int):
+def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str, stage_idx: int | None):
     """
         Build the experiment logger for one stage run.
 
         Each stage gets its own logger name so curves and checkpoints can be
         inspected stage by stage.
     """
-    logger_name = f"{exp_config.experiment_name}_{mode}_K{stage_idx}"
+    logger_name = f"{exp_config.experiment_name}_{mode}" if stage_idx is None else f"{exp_config.experiment_name}_{mode}_K{stage_idx}"
     if train_cfg.use_wandb:
         return WandbLogger(
             name=logger_name,
@@ -85,6 +85,13 @@ def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str
         name=logger_name,
         save_dir=exp_config.get_log_dir(),
     )
+
+
+def checkpoint_epoch(checkpoint_path: Path) -> int:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return int(checkpoint.get("epoch", -1))
 
 
 def create_initial_scheduler(exp_config: ExperimentConfig) -> Path:
@@ -230,6 +237,96 @@ def train_one_stage(
     trainer.fit(model, datamodule=dm)
     trainer.save_checkpoint(last_ckpt_path)
     print(f"Completed {mode} stage K{stage_idx}. Best: {best_checkpoint.best_model_path} | Last: {last_ckpt_path}")
+
+    if train_cfg.use_wandb:
+        wandb.finish()
+
+    del trainer
+    del dm
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return Path(best_checkpoint.best_model_path), last_ckpt_path
+
+
+def train_neighbor_phase(
+    exp_config: ExperimentConfig,
+    mode: Literal["supervised", "semisupervised"],
+    fit_dataset_mode: Literal["supervised", "semisupervised"],
+    max_epochs: int,
+    ckpt_path: Path | None = None,
+) -> tuple[Path, Path]:
+    """
+        Train one non-staged neighbor-SSL phase.
+
+        When ``ckpt_path`` is provided, Lightning resumes the full training
+        state from that checkpoint, including optimizer and LR scheduler state.
+    """
+    train_cfg, dataset_cfg, model_cfg = exp_config.get_configs()
+    strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
+    seed = train_cfg.semisupervised_seed if mode == "semisupervised" else train_cfg.supervised_seed
+    if seed is not None and ckpt_path is None:
+        print(f"Setting random seed to {seed} for neighbor {mode} phase...")
+        L.seed_everything(seed, workers=True)
+
+    dm = EPSSegDataModule(
+        cfg=dataset_cfg,
+        train_cfg=train_cfg,
+        scheduler_path=None,
+        scheduler_stage_index=0,
+        fit_dataset_kind="neighbor",
+        fit_dataset_mode=fit_dataset_mode,
+    )
+    model = LVAEModel(model_cfg=model_cfg, train_cfg=train_cfg)
+    model.update_mode(mode)
+
+    best_ckpt_path = exp_config.checkpoint_path(mode, "best")
+    last_ckpt_path = exp_config.checkpoint_path(mode, "last")
+    best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_checkpoint = ModelCheckpoint(
+        monitor=train_cfg.monitored_metric,
+        dirpath=best_ckpt_path.parent,
+        filename=best_ckpt_path.stem,
+        mode=train_cfg.monitored_metric_mode,
+        save_top_k=1,
+        save_last=False,
+    )
+
+    callbacks = [
+        best_checkpoint,
+        EarlyStopping(
+            monitor=train_cfg.monitored_metric,
+            patience=train_cfg.early_stopping_patience,
+            mode=train_cfg.monitored_metric_mode,
+            check_on_train_epoch_end=False,
+        ),
+        LearningRateMonitor(logging_interval="epoch"),
+    ]
+
+    logger = build_logger(exp_config, train_cfg, mode, stage_idx=None)
+    trainer = L.Trainer(
+        devices="auto",
+        strategy=strategy,
+        logger=logger,
+        max_epochs=max_epochs,
+        callbacks=callbacks,
+        precision="16-mixed" if train_cfg.amp else 32,
+        gradient_clip_val=train_cfg.max_grad_norm,
+        log_every_n_steps=train_cfg.log_every_n_steps,
+        deterministic=train_cfg.deterministic,
+        use_distributed_sampler=False,
+        accumulate_grad_batches=train_cfg.accumulate_grad_batches,
+    )
+
+    fit_ckpt_path = str(ckpt_path) if ckpt_path is not None else None
+    if fit_ckpt_path is not None:
+        print(f"Resuming neighbor {mode} phase from checkpoint: {fit_ckpt_path}")
+    trainer.fit(model, datamodule=dm, ckpt_path=fit_ckpt_path)
+    trainer.save_checkpoint(last_ckpt_path)
+    print(f"Completed neighbor {mode} phase. Best: {best_checkpoint.best_model_path} | Last: {last_ckpt_path}")
 
     if train_cfg.use_wandb:
         wandb.finish()
@@ -551,6 +648,61 @@ def run_fully_supervised_stage(exp_config: ExperimentConfig, stage_idx: int):
     )
 
 
+def run_neighbor_semisupervised_training(exp_config: ExperimentConfig):
+    """
+        Run the non-staged neighbor-based semisupervised training pipeline.
+
+        Phase 1 trains labelled cached anchors in supervised mode. Phase 2
+        resumes from the supervised best checkpoint, including optimizer and LR
+        scheduler state, and continues in semisupervised mode with local
+        unlabeled neighbors in each batch.
+    """
+    train_cfg, _, _ = exp_config.get_configs()
+    supervised_best = exp_config.checkpoint_path("supervised", "best")
+    supervised_last = exp_config.checkpoint_path("supervised", "last")
+    semisupervised_best = exp_config.checkpoint_path("semisupervised", "best")
+    semisupervised_last = exp_config.checkpoint_path("semisupervised", "last")
+
+    if train_cfg.auto_resume and supervised_best.exists() and supervised_last.exists():
+        print(f"Skipping neighbor supervised phase because outputs already exist: {supervised_best} | {supervised_last}")
+    else:
+        supervised_resume = supervised_last if train_cfg.auto_resume and supervised_last.exists() else None
+        train_neighbor_phase(
+            exp_config=exp_config,
+            mode="supervised",
+            fit_dataset_mode="supervised",
+            max_epochs=train_cfg.resolved_neighbor_supervised_max_epochs,
+            ckpt_path=supervised_resume,
+        )
+
+    if not supervised_best.exists():
+        raise FileNotFoundError(
+            f"Neighbor semisupervised phase requires supervised best checkpoint: {supervised_best}"
+        )
+
+    if train_cfg.auto_resume and semisupervised_best.exists() and semisupervised_last.exists():
+        print(
+            "Skipping neighbor semisupervised phase because outputs already exist: "
+            f"{semisupervised_best} | {semisupervised_last}"
+        )
+        return
+
+    ssl_resume = semisupervised_last if train_cfg.auto_resume and semisupervised_last.exists() else supervised_best
+    supervised_best_epoch = checkpoint_epoch(supervised_best)
+    ssl_max_epochs = (
+        supervised_best_epoch
+        + 1
+        + train_cfg.resolved_neighbor_semisupervised_max_epochs
+    )
+    train_neighbor_phase(
+        exp_config=exp_config,
+        mode="semisupervised",
+        fit_dataset_mode="semisupervised",
+        max_epochs=ssl_max_epochs,
+        ckpt_path=ssl_resume,
+    )
+
+
 def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = None):
     """
         Main training method for the staged workflow.
@@ -575,6 +727,9 @@ def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = Non
             return
         if train_cfg.training_regime == "upper_bound_replay":
             run_fully_supervised_upper_bound(exp_config)
+            return
+        if train_cfg.training_regime == "neighbor_semisupervised":
+            run_neighbor_semisupervised_training(exp_config)
             return
         raise ValueError(f"Unknown training_regime: {train_cfg.training_regime}")
     run_fully_supervised_stage(exp_config, fully_supervised_stage)
