@@ -20,6 +20,10 @@ class BaseEPSModelConfig(BaseEPSConfig):
 
 
 class LVAEConfig(BaseEPSModelConfig):
+    architecture: Literal["eps_seg_plus", "eps_seg_vanilla"] = Field(
+        default="eps_seg_plus",
+        description="Architecture family to instantiate.",
+    )
     n_components: int = Field(
         default=4, description="Number of components (classes) for the mixture model."
     )
@@ -105,9 +109,37 @@ class LVAEConfig(BaseEPSModelConfig):
     learnable_thetas: bool = Field(
         default=True, description="Whether to use NeurIPS-paper contrastive learning."
     )
-    aggregation_mode: str = Field(
+    aggregation_mode: Literal["SMV", "PoE"] = Field(
         default="SMV",
         description="Aggregation mode for the segmentation prediction. ( SMV: Softmax Majority Voting, PoE: Product of Experts)",
+    )
+    seg_features: Literal["mu", "bu"] = Field(
+        default="mu",
+        description="Which features to use for the vanilla segmentation head.",
+    )
+    feature_spatial_size: List[int] = Field(
+        default_factory=lambda: [0, 0, 8],
+        description="Spatial size of the features used by the vanilla segmentation head at each hierarchy. 0 disables that level.",
+    )
+    top_prior_schedule: Literal["none", "static", "dynamic"] = Field(
+        default="none",
+        description="Policy controlling the top-prior mean evolution across epochs.",
+    )
+    top_prior_mu_init: float = Field(
+        default=10.0,
+        description="Initial mean value assigned to active top-prior mixture channels.",
+    )
+    top_prior_mu_supervised_max: float | None = Field(
+        default=None,
+        description="Maximum top-prior mean reached during supervised training when using the dynamic schedule.",
+    )
+    top_prior_mu_semisupervised_min: float | None = Field(
+        default=None,
+        description="Minimum top-prior mean reached during semisupervised training when using the dynamic schedule.",
+    )
+    top_prior_mu_step_epochs: int = Field(
+        default=10,
+        description="Number of epochs between unit changes in the dynamic top-prior schedule.",
     )
 
     @model_validator(mode="after")
@@ -152,4 +184,37 @@ class LVAEConfig(BaseEPSModelConfig):
             raise ValueError("All n_filters values must be > 0")
 
         self.n_filters = n_filters
+        return self
+
+    @model_validator(mode="after")
+    def validate_architecture_specific_fields(self):
+        if len(self.feature_spatial_size) != self.n_layers:
+            if self.architecture == "eps_seg_plus" and self.feature_spatial_size == [0, 0, 8]:
+                self.feature_spatial_size = [0] * max(self.n_layers - 1, 0) + [8]
+            else:
+                raise ValueError(
+                    f"feature_spatial_size must have length {self.n_layers}, got {len(self.feature_spatial_size)}"
+                )
+
+        if self.top_prior_mu_step_epochs < 1:
+            raise ValueError("top_prior_mu_step_epochs must be >= 1.")
+
+        if self.top_prior_schedule == "dynamic":
+            if self.top_prior_mu_supervised_max is None:
+                raise ValueError("top_prior_mu_supervised_max is required when top_prior_schedule='dynamic'.")
+            if self.top_prior_mu_semisupervised_min is None:
+                raise ValueError("top_prior_mu_semisupervised_min is required when top_prior_schedule='dynamic'.")
+
+        if self.architecture == "eps_seg_vanilla":
+            if len(set(self.n_filters)) != 1:
+                raise ValueError("eps_seg_vanilla requires uniform n_filters across all layers.")
+        else:
+            if self.seg_features != "mu":
+                raise ValueError("seg_features is only supported by eps_seg_vanilla.")
+            default_feature_spatial_size = [0] * max(self.n_layers - 1, 0) + [8]
+            if self.feature_spatial_size != default_feature_spatial_size:
+                raise ValueError(
+                    "feature_spatial_size is only supported by eps_seg_vanilla."
+                )
+
         return self

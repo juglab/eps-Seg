@@ -1,11 +1,13 @@
 import lightning as L
 from eps_seg.data.schedule import CandidateBatchEvaluation
+from eps_seg.modules.eps_seg_vanilla import EpsSegVanilla
 from eps_seg.modules.lvae import LadderVAE
 from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
 from eps_seg.training.logger import log_epoch_dice_scores, log_lvae_step, log_scheduler_stats, log_trainer_state
 from typing import Literal
 import torch 
+from torch import nn
 from torchmetrics.classification import F1Score
 import numpy as np
 
@@ -15,7 +17,7 @@ class LVAEModel(L.LightningModule):
         super().__init__()
         self.cfg = model_cfg
         self.train_cfg = train_cfg
-        self.model: LadderVAE = LadderVAE(model_cfg)
+        self.model: nn.Module = self._build_model_backend(model_cfg)
         self.current_training_mode = "supervised"
 
         # Placeholders for data statistics
@@ -56,6 +58,12 @@ class LVAEModel(L.LightningModule):
         )
         self.current_true_epoch = 0
         self.current_stage_idx = -1
+
+    @staticmethod
+    def _build_model_backend(model_cfg: LVAEConfig) -> nn.Module:
+        if model_cfg.architecture == "eps_seg_vanilla":
+            return EpsSegVanilla(model_cfg)
+        return LadderVAE(model_cfg)
 
     def _resolve_training_targets(self, batch: dict) -> torch.Tensor:
         """

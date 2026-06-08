@@ -189,6 +189,11 @@ class LadderVAE(nn.Module):
                     grad_checkpoint=self.use_grad_checkpoint,
                     n_components=self.n_components,
                     training_mode=self.training_mode,
+                    top_prior_schedule=self.cfg.top_prior_schedule,
+                    top_prior_mu_init=self.cfg.top_prior_mu_init,
+                    top_prior_mu_supervised_max=self.cfg.top_prior_mu_supervised_max,
+                    top_prior_mu_semisupervised_min=self.cfg.top_prior_mu_semisupervised_min,
+                    top_prior_mu_step_epochs=self.cfg.top_prior_mu_step_epochs,
                 )
             )
 

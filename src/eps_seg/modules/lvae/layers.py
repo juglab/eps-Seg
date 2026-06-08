@@ -5,6 +5,8 @@ from torch.distributions import Normal
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from eps_seg.modules.top_prior import TopPriorSchedulingMixin, build_top_prior_params
+
 
 def no_cp(func, inp):
     return func(inp)
@@ -144,7 +146,7 @@ class GateLayer(nn.Module):
         return x * gate
 
 
-class TopDownLayer(nn.Module):
+class TopDownLayer(TopPriorSchedulingMixin, nn.Module):
     """
     Top-down layer, including stochastic sampling, KL computation, and small
     deterministic ResNet with upsampling.
@@ -197,6 +199,11 @@ class TopDownLayer(nn.Module):
         top_prior_param_shape=None,
         n_components=4,  # Used only for Mixture block
         training_mode="supervised",
+        top_prior_schedule="none",
+        top_prior_mu_init=10.0,
+        top_prior_mu_supervised_max=None,
+        top_prior_mu_semisupervised_min=None,
+        top_prior_mu_step_epochs=10,
     ):
         super().__init__()
         self.layer_number = layer_number
@@ -210,12 +217,14 @@ class TopDownLayer(nn.Module):
         self.top_prior_param_shape = top_prior_param_shape
         self.skip_connection = skip_connection
         self.conv_mult = conv_mult
-        self._prior_mu_initial = 5.0
-        self._prior_mu_supervised_max = 20.0
-        self._prior_mu_semisupervised_min = 10.0
-        self._prior_mu_step_epochs = 10
-        self._semisupervised_start_mu = None
         self.n_filters = n_filters
+        self._init_top_prior_schedule(
+            schedule=top_prior_schedule,
+            mu_init=top_prior_mu_init,
+            mu_supervised_max=top_prior_mu_supervised_max,
+            mu_semisupervised_min=top_prior_mu_semisupervised_min,
+            mu_step_epochs=top_prior_mu_step_epochs,
+        )
 
         conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(
             nn, f"Conv{conv_mult}d"
@@ -327,122 +336,27 @@ class TopDownLayer(nn.Module):
         self.training_mode = mode
         if mode == "semisupervised":
             self._semisupervised_start_mu = None
+        self._schedule_phase_start_epoch = None
+        self._schedule_phase_start_mu = None
+        self._schedule_phase_mode = None
         self.stochastic.update_mode(mode)
-
-    def _get_current_top_prior_mu_value(self) -> float:
-        mu_channels = self.top_prior_params.shape[1] // 2
-        mus = self.top_prior_params[:, :mu_channels]
-        mask = self.top_prior_mu_mask > 0
-        if mask.any():
-            return float(mus[mask].mean().item())
-        return self._prior_mu_initial
-
-    def _set_top_prior_mu_value(self, value: float) -> None:
-        mu_channels = self.top_prior_params.shape[1] // 2
-        with torch.no_grad():
-            self.top_prior_params[:, :mu_channels].copy_(self.top_prior_mu_mask * value)
-
-    def update_top_prior_scheduler(self, epoch: int) -> None:
-        if not self.is_top_layer:
-            return
-
-        if self.training_mode == "supervised":
-            step = max(0, epoch) // self._prior_mu_step_epochs
-            target_value = min(
-                self._prior_mu_supervised_max, self._prior_mu_initial + float(step)
-            )
-            self._semisupervised_start_mu = None
-        elif self.training_mode == "semisupervised":
-            if self._semisupervised_start_mu is None:
-                self._semisupervised_start_mu = self._get_current_top_prior_mu_value()
-            step = max(0, epoch) // self._prior_mu_step_epochs
-            target_value = max(
-                self._prior_mu_semisupervised_min,
-                self._semisupervised_start_mu - float(step),
-            )
-        else:
-            return
-
-        if abs(self._get_current_top_prior_mu_value() - target_value) > 1e-6:
-            self._set_top_prior_mu_value(target_value)
-
-    def get_top_prior_mu_value(self) -> Union[float, None]:
-        if not self.is_top_layer:
-            return None
-        return self._get_current_top_prior_mu_value()
 
     def _get_top_prior_params(self) -> Union[None, nn.Parameter]:
         # Define top layer prior parameters, possibly learnable
         if self.is_top_layer:
-            return self._initialize_gmm_prior(
-                self.n_components, self.top_prior_param_shape, self.learn_top_prior
+            prior_params, mu_mask = build_top_prior_params(
+                n_components=self.n_components,
+                top_prior_param_shape=self.top_prior_param_shape,
+                conv_mult=self.conv_mult,
+                learn_top_prior=self.learn_top_prior,
+                mu_init=self.top_prior_mu_init,
             )
+            self.register_buffer("top_prior_mu_mask", mu_mask, persistent=False)
+            return prior_params
         else:
             raise ValueError(
                 "Top prior can only be initialized for mixture stochastic block type."
             )
-
-    def _initialize_gmm_prior(self, n_components, top_prior_param_shape, learn_top_prior):
-        # TODO write tests for this function
-        # Extract spatial dimensions and channels
-        total_channels = top_prior_param_shape[1]  # Total number of channels
-        spatial_dims: tuple = top_prior_param_shape[
-            -self.conv_mult :
-        ]  # Spatial resolution
-
-        # Each GMM component uses an equal fraction of the channels
-        channels_per_component = total_channels // (
-            2 * n_components
-        )  # Half for mus, half for sigmas
-
-        # Initialize the tensor for means (mus)
-        chunk_values = torch.zeros(
-            (
-                n_components,
-                channels_per_component,
-            )
-            + spatial_dims
-        )
-        chunk_mask = torch.zeros_like(chunk_values)
-        # TODO hardcoded 10.0, better initialization strategy?
-        # Dynamically assign values to means
-        chunk_size = channels_per_component // n_components
-        for i in range(n_components):
-            start_idx = i * chunk_size
-            end_idx = (i + 1) * chunk_size
-            chunk_values[i, start_idx:end_idx] = self._prior_mu_initial
-            chunk_mask[i, start_idx:end_idx] = 1.0
-#             chunk_values[i, start_idx:end_idx] = (
-#                 10.0  # Equidistant initialization for means
-#             )
-
-        mus = chunk_values.view(
-            (
-                1,
-                n_components * channels_per_component,
-            )
-            + spatial_dims
-        )
-        mus_mask = chunk_mask.view(
-            (
-                1,
-                n_components * channels_per_component,
-            )
-            + spatial_dims
-        )
-        self.register_buffer("top_prior_mu_mask", mus_mask, persistent=False)
-
-        # Initialize standard deviations (sigmas) as zeros (or another value if needed)
-        sigmas = torch.zeros_like(mus)
-
-        # Concatenate mus and sigmas along the channel dimension
-        prior_params = torch.cat([mus, sigmas], dim=1)
-
-        # Convert to nn.Parameter
-        # Convert prior_params to nn.Parameter
-        prior_params = nn.Parameter(prior_params, requires_grad=learn_top_prior)
-
-        return prior_params
 
     def forward(
         self,
