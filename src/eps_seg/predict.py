@@ -273,7 +273,7 @@ def test_predict(exp_config: ExperimentConfig,
     """
     train_config, dataset_config, model_config = exp_config.get_configs()
 
-    if train_config.training_regime == "semisupervised":
+    if train_config.training_regime in {"semisupervised", "neighbor_semisupervised"}:
         seed = train_config.semisupervised_seed
     else:
         seed = train_config.supervised_seed

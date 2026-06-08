@@ -4,6 +4,10 @@ ablations/
 experiments/*/checkpoints
 experiments/*/logs
 experiments/
+model_analysis/
+datasets/
+scripts/
+staged_training/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -105,7 +105,12 @@ def log_scheduler_stats(module):
 def log_trainer_state(module):
     module.log("trainer/current_stage", float(module.current_stage_idx), on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
     regime_name = getattr(getattr(module, "train_cfg", None), "training_regime", "semisupervised")
-    regime_to_id = {"semisupervised": 0.0, "active_learning": 1.0, "upper_bound_replay": 2.0}
+    regime_to_id = {
+        "semisupervised": 0.0,
+        "active_learning": 1.0,
+        "upper_bound_replay": 2.0,
+        "neighbor_semisupervised": 3.0,
+    }
     module.log("trainer/training_regime_id", regime_to_id.get(regime_name, -1.0), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
     early_stopping_callback = _get_early_stopping_callback(module)
