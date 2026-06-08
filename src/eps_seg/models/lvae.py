@@ -1,4 +1,5 @@
 import lightning as L
+from eps_seg.data.schedule import CandidateBatchEvaluation
 from eps_seg.modules.lvae import LadderVAE
 from eps_seg.config import LVAEConfig
 from eps_seg.config.train import TrainConfig
@@ -76,7 +77,13 @@ class LVAEModel(L.LightningModule):
     @staticmethod
     def _candidate_confidence_scores(
         probs: torch.Tensor,
-        score_metric: Literal["max_probability", "normalized_reciprocal_entropy", "margin"] = "max_probability",
+        score_metric: Literal[
+            "max_probability",
+            "normalized_reciprocal_entropy",
+            "margin",
+            "reconstruction_error",
+            "inpainting_error",
+        ] = "max_probability",
     ) -> torch.Tensor:
         """
             Compute candidate admission scores from class probabilities.
@@ -97,6 +104,52 @@ class LVAEModel(L.LightningModule):
                 return topk[..., 0]
             return topk[..., 0] - topk[..., 1]
         raise ValueError(f"Unknown candidate score metric: {score_metric}")
+
+    @staticmethod
+    def _per_sample_mean(values: torch.Tensor) -> torch.Tensor:
+        values = values.float()
+        if values.ndim <= 1:
+            return values.reshape(-1)
+        return values.reshape(values.shape[0], -1).mean(dim=1)
+
+    def _candidate_scalar_metrics(self, outputs: dict, mask_input: bool) -> dict[str, torch.Tensor]:
+        probs = outputs["class_probabilities"].float()
+        metrics = {
+            "max_probability": self._candidate_confidence_scores(probs, score_metric="max_probability"),
+            "normalized_reciprocal_entropy": self._candidate_confidence_scores(
+                probs,
+                score_metric="normalized_reciprocal_entropy",
+            ),
+            "margin": self._candidate_confidence_scores(probs, score_metric="margin"),
+        }
+
+        if "ll" in outputs and torch.is_tensor(outputs["ll"]):
+            reconstruction_nll = -outputs["ll"].float()
+            metrics["reconstruction_error"] = self._per_sample_mean(reconstruction_nll)
+            if mask_input:
+                metrics["inpainting_error"] = self._per_sample_mean(self.model._centre_crop(reconstruction_nll))
+        return metrics
+
+    @staticmethod
+    def _candidate_latent_summary(outputs: dict) -> dict[str, np.ndarray]:
+        summary: dict[str, np.ndarray] = {}
+        for output_key in ("z", "mu"):
+            values = outputs.get(output_key)
+            if not isinstance(values, (list, tuple)) or len(values) == 0:
+                continue
+            layer_means = []
+            layer_stds = []
+            for tensor in values:
+                if not torch.is_tensor(tensor):
+                    continue
+                flat = tensor.float().reshape(tensor.shape[0], -1)
+                layer_means.append(flat.mean(dim=1))
+                layer_stds.append(flat.std(dim=1, unbiased=False))
+            if layer_means:
+                summary[f"{output_key}_mean"] = torch.stack(layer_means, dim=1).cpu().numpy().astype(np.float32)
+            if layer_stds:
+                summary[f"{output_key}_std"] = torch.stack(layer_stds, dim=1).cpu().numpy().astype(np.float32)
+        return summary
 
     def forward(
         self,
@@ -253,15 +306,17 @@ class LVAEModel(L.LightningModule):
         if self.trainer.is_global_zero:
             log_trainer_state(self)
 
-    def evaluate_candidate_batch(self, batch: dict):
+    def evaluate_candidate_batch(self, batch: dict, mask_input: bool | None = None) -> CandidateBatchEvaluation:
         """
-            Evaluate scheduler extension candidates and return predicted labels
-            together with their confidence scores.
+            Evaluate scheduler extension candidates and return per-candidate
+            model measurements.
         """
         was_training = self.training
         self.eval()
         with torch.inference_mode():
             x = batch["patch"].to(self.device, non_blocking=True)
+            score_metric = self.train_cfg.schedule_admission.score_metric
+            force_mask_input = bool(mask_input) if mask_input is not None else score_metric == "inpainting_error"
             amp_enabled = bool(self.train_cfg and self.train_cfg.amp and self.device.type == "cuda")
             autocast_context = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled)
             with autocast_context:
@@ -270,14 +325,40 @@ class LVAEModel(L.LightningModule):
                     y=None,
                     validation_mode=False,
                     confidence_threshold=self.train_cfg.model_confidence_threshold,
+                    mask_input=force_mask_input,
                 )
             probs = outputs["class_probabilities"]
             predicted_labels = probs.argmax(dim=-1)
-            score_metric = self.train_cfg.schedule_admission.score_metric
-            confidences = self._candidate_confidence_scores(probs, score_metric=score_metric)
+            metrics = self._candidate_scalar_metrics(outputs, mask_input=force_mask_input)
+            if score_metric not in metrics:
+                raise ValueError(
+                    f"Candidate score metric '{score_metric}' was requested, but it was not produced by the model."
+                )
+            confidences = metrics[score_metric]
+
+            head_logits = None
+            head_predicted_labels = None
+            if "layers_logits" in outputs and isinstance(outputs["layers_logits"], (list, tuple)):
+                # Stored as (B, H, C): candidate, segmentation head/layer, class.
+                head_logits_tensor = torch.stack([logits.float() for logits in outputs["layers_logits"]], dim=1)
+                head_logits = head_logits_tensor.cpu().numpy().astype(np.float32)
+                head_predicted_labels = head_logits_tensor.argmax(dim=-1).cpu().numpy().astype(np.int32)
+
+            evaluation = CandidateBatchEvaluation(
+                predicted_labels=predicted_labels.cpu().numpy().astype(np.int32),
+                scores=confidences.cpu().numpy().astype(np.float32),
+                metrics={
+                    metric_name: metric_values.cpu().numpy().astype(np.float32)
+                    for metric_name, metric_values in metrics.items()
+                },
+                class_probabilities=probs.float().cpu().numpy().astype(np.float32),
+                head_logits=head_logits,
+                head_predicted_labels=head_predicted_labels,
+                latent_summary=self._candidate_latent_summary(outputs),
+            )
         if was_training:
             self.train()
-        return predicted_labels.cpu().numpy().astype(np.int32), confidences.cpu().numpy().astype(np.float32)
+        return evaluation
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adamax(self.model.parameters(),

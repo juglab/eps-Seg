@@ -10,6 +10,7 @@ from eps_seg.dataloaders.caching import DatasetCache
 from eps_seg.dataloaders.datasets import PredictionDataset, PseudoLabelDataset, SemisupervisedDataset
 from eps_seg.dataloaders.samplers import (
     BalancedScheduledBatchSampler,
+    ClassBalancedScheduledBatchSampler,
     ModeAwareBalancedAnchorBatchSampler,
     PseudoEpochDistributedParallelBatchSampler,
 )
@@ -72,13 +73,23 @@ class EPSSegDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         stage_seed = self._runtime_stage_seed()
-        train_sampler = BalancedScheduledBatchSampler(
-            self.train_dataset,
-            batch_size=self.train_cfg.batch_size,
-            min_initial_label_fraction=self.train_cfg.min_initial_label_fraction,
-            shuffle=True,
-            seed=stage_seed,
-        )
+        if self.train_cfg.training_batch_sampler == "stage_class_balanced":
+            train_sampler = BalancedScheduledBatchSampler(
+                self.train_dataset,
+                batch_size=self.train_cfg.batch_size,
+                min_initial_label_fraction=self.train_cfg.min_initial_label_fraction,
+                shuffle=True,
+                seed=stage_seed,
+            )
+        elif self.train_cfg.training_batch_sampler == "class_balanced_schedule":
+            train_sampler = ClassBalancedScheduledBatchSampler(
+                self.train_dataset,
+                batch_size=self.train_cfg.batch_size,
+                shuffle=True,
+                seed=stage_seed,
+            )
+        else:
+            raise ValueError(f"Unknown training_batch_sampler: {self.train_cfg.training_batch_sampler}")
 
         train_sampler = PseudoEpochDistributedParallelBatchSampler(
             self.train_dataset,

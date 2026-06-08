@@ -315,6 +315,7 @@ def evaluate_scheduler_extension(
         evaluation_batch_size=train_cfg.test_batch_size,
         target_label_source=extension_label_source,
         candidate_evaluation_budget=train_cfg.candidate_evaluation_budget,
+        candidate_order=train_cfg.schedule_admission.candidate_order,
     )
     if accepted > 0:
         schedule.bump_version()

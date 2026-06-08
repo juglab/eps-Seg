@@ -22,9 +22,11 @@ from eps_seg.data.sampling import (
 )
 from eps_seg.data.schedule_policies import (
     ConfidenceThresholdWithPlAdmissionPolicy,
+    ConfidencePercentileWindowWithGtAdmissionPolicy,
     ConfidenceWindowWithGtAdmissionPolicy,
     AdmitAllWithGtAdmissionPolicy,
     NoOpMaintenancePolicy,
+    ReconstructionErrorWithGtAdmissionPolicy,
     ScheduleAdmissionPolicy,
     PseudolabelMaintenancePolicy,
     PruningPolicy,
@@ -110,8 +112,15 @@ def build_schedule_admission_policy(cfg: ScheduleAdmissionConfig) -> ScheduleAdm
         return ConfidenceThresholdWithPlAdmissionPolicy(confidence_min=cfg.confidence_min, confidence_max=cfg.confidence_max)
     if cfg.name == "confidence_window_with_gt":
         return ConfidenceWindowWithGtAdmissionPolicy(confidence_min=cfg.confidence_min, confidence_max=cfg.confidence_max)
+    if cfg.name == "confidence_percentile_window_with_gt":
+        return ConfidencePercentileWindowWithGtAdmissionPolicy(
+            confidence_percentile_min=cfg.confidence_percentile_min,
+            confidence_percentile_max=cfg.confidence_percentile_max,
+        )
     if cfg.name == "admit_all_with_gt":
         return AdmitAllWithGtAdmissionPolicy()
+    if cfg.name == "reconstruction_error_with_gt":
+        return ReconstructionErrorWithGtAdmissionPolicy(score_metric=cfg.score_metric)
     raise ValueError(f"Unknown schedule admission policy: {cfg.name}")
 
 

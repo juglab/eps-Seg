@@ -2,7 +2,7 @@
 Data pipeline building blocks for staged EPS-Seg training.
 """
 
-from eps_seg.data.schedule import DataSchedule, EvaluatedCandidate
+from eps_seg.data.schedule import CandidateBatchEvaluation, DataSchedule, EvaluatedCandidate
 from eps_seg.data.initial_label_sampling import (
     ClassBalancedSliceInitialLabelSamplingStrategy,
     ClassBalancedSubstackInitialLabelSamplingStrategy,
@@ -16,6 +16,7 @@ from eps_seg.data.sampling import (
 )
 from eps_seg.data.schedule_policies import (
     ConfidenceThresholdWithPlAdmissionPolicy,
+    ReconstructionErrorWithGtAdmissionPolicy,
     ScheduleAdmissionPolicy,
     PseudolabelMaintenancePolicy,
     PruningPolicy,
@@ -28,6 +29,7 @@ __all__ = [
     "ClassBalancedSliceInitialLabelSamplingStrategy",
     "ClassBalancedSubstackInitialLabelSamplingStrategy",
     "ConfidenceThresholdWithPlAdmissionPolicy",
+    "CandidateBatchEvaluation",
     "DataSchedule",
     "EvaluatedCandidate",
     "InitialLabelSamplingStrategy",
@@ -35,6 +37,7 @@ __all__ = [
     "ScheduleAdmissionPolicy",
     "PseudolabelMaintenancePolicy",
     "PruningPolicy",
+    "ReconstructionErrorWithGtAdmissionPolicy",
     "ScheduleEngine",
     "UniformCoordinateSamplingStrategy",
 ]

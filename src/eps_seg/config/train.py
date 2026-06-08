@@ -36,13 +36,29 @@ class ScheduleAdmissionConfig(BaseEPSConfig):
         ScheduleAdmissionConfig: Validated schedule admission configuration.
     """
 
-    name: Literal["confidence_threshold_with_pseudolabels", "admit_all_with_gt", "confidence_window_with_gt"] = Field(
+    name: Literal[
+        "confidence_threshold_with_pseudolabels",
+        "admit_all_with_gt",
+        "confidence_window_with_gt",
+        "confidence_percentile_window_with_gt",
+        "reconstruction_error_with_gt",
+    ] = Field(
         default="confidence_threshold_with_pseudolabels",
         description="Policy used to admit evaluated stage-extension candidates into the scheduler.",
     )
-    score_metric: Literal["max_probability", "normalized_reciprocal_entropy", "margin"] = Field(
+    score_metric: Literal[
+        "max_probability",
+        "normalized_reciprocal_entropy",
+        "margin",
+        "reconstruction_error",
+        "inpainting_error",
+    ] = Field(
         default="max_probability",
-        description="Model-derived score used by confidence-window admission policies.",
+        description="Model-derived score used by admission policies.",
+    )
+    candidate_order: Literal["fifo", "ascending", "descending"] = Field(
+        default="fifo",
+        description="Ordering applied to evaluated candidates before admission.",
     )
     confidence_min: float = Field(
         default=0.75,
@@ -51,6 +67,14 @@ class ScheduleAdmissionConfig(BaseEPSConfig):
     confidence_max: float = Field(
         default=1.0,
         description="Maximum score allowed to accept a newly sampled candidate.",
+    )
+    confidence_percentile_min: float = Field(
+        default=0.0,
+        description="Minimum evaluated-pool score percentile allowed by percentile-window admission policies.",
+    )
+    confidence_percentile_max: float = Field(
+        default=100.0,
+        description="Maximum evaluated-pool score percentile allowed by percentile-window admission policies.",
     )
 
     @model_validator(mode="after")
@@ -70,6 +94,12 @@ class ScheduleAdmissionConfig(BaseEPSConfig):
             raise ValueError("schedule_admission.confidence_max must be between 0 and 1.")
         if self.confidence_min > self.confidence_max:
             raise ValueError("schedule_admission.confidence_min must be <= confidence_max.")
+        if not 0.0 <= self.confidence_percentile_min <= 100.0:
+            raise ValueError("schedule_admission.confidence_percentile_min must be between 0 and 100.")
+        if not 0.0 <= self.confidence_percentile_max <= 100.0:
+            raise ValueError("schedule_admission.confidence_percentile_max must be between 0 and 100.")
+        if self.confidence_percentile_min > self.confidence_percentile_max:
+            raise ValueError("schedule_admission.confidence_percentile_min must be <= confidence_percentile_max.")
         return self
 
 
@@ -201,6 +231,14 @@ class TrainConfig(BaseEPSConfig):
         ),
     )
     max_extensions: int = Field(default=0, description="Maximum number of scheduler extensions after the initial labelled stage.")
+    training_batch_sampler: Literal["stage_class_balanced", "class_balanced_schedule"] = Field(
+        default="stage_class_balanced",
+        description=(
+            "Batch sampler used for scheduler-backed training datasets. "
+            "'stage_class_balanced' balances on class and stage; useful for semisupervised training to keep sufficient GT in each batch to compute psuedo-labels."
+            "'class_balanced_schedule' class-balances active schedule rows without stage stratification."
+        ),
+    )
     min_initial_label_fraction: float = Field(default=0.25, description="Minimum fraction of each training batch that must come from the initial GT-labelled pool.")
     auto_resume: bool = Field(default=True, description="Automatically resume from the latest completed staged checkpoint if present.")
 
@@ -230,10 +268,13 @@ class TrainConfig(BaseEPSConfig):
         if self.training_regime == "active_learning" and self.schedule_admission.name not in {
             "admit_all_with_gt",
             "confidence_window_with_gt",
+            "confidence_percentile_window_with_gt",
+            "reconstruction_error_with_gt",
         }:
             raise ValueError(
                 "Active learning requires schedule_admission.name to be one of "
-                "{'admit_all_with_gt', 'confidence_window_with_gt'}."
+                "{'admit_all_with_gt', 'confidence_window_with_gt', "
+                "'confidence_percentile_window_with_gt', 'reconstruction_error_with_gt'}."
             )
         if (
             self.training_regime == "active_learning"

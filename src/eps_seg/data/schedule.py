@@ -1,11 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, ItemsView, KeysView, Mapping, Optional, ValuesView
 
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class CandidateBatchEvaluation:
+    """
+    Rich model evaluation result for one batch of candidate voxels.
+
+    ``scores`` is the selected scalar score used by legacy admission policies
+    and schedule storage. ``metrics`` may contain additional per-candidate
+    arrays, such as entropy, margin, or reconstruction losses. Larger tensors
+    such as logits and latent summaries are intentionally transient: admission
+    policies can inspect them, but they are not persisted in ``DataSchedule``.
+    """
+
+    predicted_labels: np.ndarray
+    scores: np.ndarray
+    metrics: dict[str, np.ndarray] = field(default_factory=dict)
+    class_probabilities: np.ndarray | None = None
+    head_logits: np.ndarray | None = None
+    head_predicted_labels: np.ndarray | None = None
+    latent_summary: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -19,8 +40,13 @@ class EvaluatedCandidate:
         y: Y coordinate of the voxel center.
         x: X coordinate of the voxel center.
         predicted_label: Label predicted by the current model.
-        confidence: Confidence assigned to the predicted label.
+        confidence: Selected scalar score attached to the candidate.
         gt_label: Ground-truth label at the candidate location.
+        metrics: Additional scalar model-evaluation metrics for this candidate.
+        class_probabilities: Optional consolidated class-probability vector.
+        head_logits: Optional per-head class logits.
+        head_predicted_labels: Optional per-head argmax predictions.
+        latent_summary: Optional compact latent summaries for this candidate.
 
     Returns:
         EvaluatedCandidate: Immutable candidate description used by admission policies.
@@ -33,6 +59,11 @@ class EvaluatedCandidate:
     predicted_label: int
     confidence: float
     gt_label: int
+    metrics: dict[str, float] = field(default_factory=dict)
+    class_probabilities: np.ndarray | None = None
+    head_logits: np.ndarray | None = None
+    head_predicted_labels: np.ndarray | None = None
+    latent_summary: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 class DataSchedule(Mapping[str, np.ndarray]):

@@ -429,6 +429,118 @@ class BalancedScheduledBatchSampler(BatchSampler):
 
 BalancedAnchorLabelBatchSampler = BalancedScheduledBatchSampler
 
+
+class ClassBalancedScheduledBatchSampler(BatchSampler):
+    """
+        Yields class-balanced batches from all active scheduler rows.
+
+        Unlike ``BalancedScheduledBatchSampler``, this sampler does not stratify
+        by ``stage_index`` and does not enforce a minimum contribution from the
+        initial labelled pool. It is intended as an active-learning control where
+        the training set is treated as one active labelled pool.
+    """
+
+    def __init__(self, dataset, batch_size=32, seed=42, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.shuffle = shuffle
+
+        self.labels = None
+        self.full_pools = None
+        self._cached_version = None
+        self._num_batches = None
+        self._label_targets = None
+
+    def _dataset_version(self):
+        """Return the dataset version used to detect schedule changes."""
+        return getattr(self.dataset, "sampling_version", 0)
+
+    def is_stale(self):
+        """Return whether the cached pools are out of date."""
+        return self._cached_version != self._dataset_version()
+
+    def _build_pools(self, active_indices):
+        """Group active dataset indices by their current scheduler label."""
+        pools = {}
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        for active_idx in active_indices:
+            schedule_idx = int(active_schedule_indices[active_idx])
+            label = int(self.dataset.schedule["current_label"][schedule_idx])
+            pools.setdefault(label, []).append(int(active_idx))
+        return pools
+
+    def _rebuild_pools(self):
+        """Rebuild class pools from the currently active scheduler rows."""
+        active_schedule_indices = self.dataset.get_active_schedule_indices()
+        active_indices = np.arange(len(active_schedule_indices))
+        self.full_pools = self._build_pools(active_indices.tolist())
+        self.labels = sorted(label for label, pool in self.full_pools.items() if len(pool) > 0)
+        if not self.labels:
+            raise ValueError("No valid samples available in any class.")
+        self._cached_version = self._dataset_version()
+
+    def _reset_iters(self):
+        """Create cycling iterators for every class pool, shuffling if requested."""
+        iters = {}
+        for label, pool_values in self.full_pools.items():
+            if len(pool_values) == 0:
+                continue
+            pool = list(pool_values)
+            if self.shuffle:
+                self.rng.shuffle(pool)
+            iters[label] = itertools.cycle(pool)
+        return iters
+
+    def _balanced_counts(self, total_items, keys):
+        """Split a number of items as evenly as possible across the given keys."""
+        keys = list(keys)
+        if len(keys) == 0:
+            return {}
+        base = total_items // len(keys)
+        rem = total_items % len(keys)
+        counts = {key: base for key in keys}
+        for key in keys[:rem]:
+            counts[key] += 1
+        return counts
+
+    def _compute_epoch_plan(self):
+        """Build the cached batch plan and choose the number of batches per epoch."""
+        self._rebuild_pools()
+        max_class = max(len(self.full_pools[label]) for label in self.labels)
+        num_batches = max(1, (max_class * len(self.labels)) // self.batch_size)
+        label_targets = self._balanced_counts(self.batch_size, self.labels)
+        self._label_targets = label_targets
+        self._num_batches = num_batches
+        return label_targets, num_batches
+
+    def __iter__(self):
+        """Yield class-balanced batches from the active schedule."""
+        label_targets, num_batches = self._compute_epoch_plan()
+        label_iters = self._reset_iters()
+
+        for _ in range(num_batches):
+            batch = []
+            label_order = list(self.labels)
+            if self.shuffle:
+                self.rng.shuffle(label_order)
+            for label in label_order:
+                take = label_targets[label]
+                if take <= 0:
+                    continue
+                batch.extend(next(label_iters[label]) for _ in range(take))
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        """Return the number of batches in the current epoch plan."""
+        if self.is_stale() or self._num_batches is None:
+            self._compute_epoch_plan()
+        return self._num_batches
+
+
 class PseudoEpochDistributedParallelBatchSampler(DistributedSampler):
     """
         Wraps a ModeAwareBalancedAnchorBatchSampler to provide distributed sampling and pseudo-epoch capabilities.
