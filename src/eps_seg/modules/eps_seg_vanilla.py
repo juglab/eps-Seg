@@ -762,6 +762,7 @@ class EpsSegVanilla(nn.Module):
             "posterior": td_data["posterior"],
             "prior": td_data["prior"],
             "mu": td_data["mu"],
+            "kl_per_layer": kl_layer,
             "kl_layer": kl_layer,
             "kl": torch.mean(kl_layer.mean()) if kl_layer.numel() else torch.tensor(0.0, device=x.device),
             "cl": cl,
