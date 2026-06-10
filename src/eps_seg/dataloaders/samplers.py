@@ -12,7 +12,7 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         Adapts to dataset.mode at the start of every epoch.
         - total_patches_per_batch is in *patch units* (e.g., 32).
         - Supervised: 1 patch per anchor
-        - Semisupervised: 4 patches per anchor
+        - Semisupervised: 1 anchor patch + dataset.neighbor_samples_per_anchor neighbor patches
     """
 
     def __init__(self, dataset, total_patches_per_batch=32, n_neighbors=7, seed=42, shuffle=True):
@@ -36,6 +36,14 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
         self._iters = None
         self._len_cached = None
 
+    def _patches_per_anchor(self):
+        if self.dataset.mode != "semisupervised":
+            return 1
+        neighbors_per_anchor = int(getattr(self.dataset, "neighbor_samples_per_anchor", self.n_neighbors))
+        if neighbors_per_anchor < 1:
+            raise ValueError("neighbors_per_anchor must be >= 1 in semisupervised mode.")
+        return 1 + neighbors_per_anchor
+
     def _reset_iters(self):
         """ 
             Resets the cycling iterators for each class pool. 
@@ -50,14 +58,13 @@ class ModeAwareBalancedAnchorBatchSampler(BatchSampler):
 
     def _compute_epoch_plan(self):
         # anchors-per-batch depends on current mode
-        if self.dataset.mode == "semisupervised":
-            # in semisupervised mode, dataset returns [anchor + 7 neighbors, ancor + 7 neighbors, ...]
-            assert (
-                self.total_patches_per_batch % (1 + self.n_neighbors) == 0  # TODO
-            ), f"total_patches_per_batch must be divisible by {1 + self.n_neighbors} in semisupervised mode."
-            anchors_per_batch = self.total_patches_per_batch // (1 + self.n_neighbors)  # TODO
-        else:
-            anchors_per_batch = self.total_patches_per_batch
+        patches_per_anchor = self._patches_per_anchor()
+        anchors_per_batch = self.total_patches_per_batch // patches_per_anchor
+        if anchors_per_batch < 1:
+            raise ValueError(
+                "total_patches_per_batch is too small for one anchor group: "
+                f"{self.total_patches_per_batch} < {patches_per_anchor}."
+            )
 
         # split anchors-per-batch across labels (balanced, round-robin remainder)
         base = anchors_per_batch // len(self.labels)

@@ -239,6 +239,14 @@ class TrainConfig(BaseEPSConfig):
         default=5,
         description="Maximum radius used to sample local unlabeled neighbors for neighbor-based semisupervised training.",
     )
+    neighbor_samples_per_anchor: int = Field(
+        default=1,
+        description=(
+            "Number of precomputed local neighbors to randomly emit per anchor in each "
+            "neighbor-semisupervised batch. A value of 1 gives 50% GT anchors and "
+            "50% unlabeled neighbor patches."
+        ),
+    )
     neighbor_supervised_max_epochs: Optional[int] = Field(
         default=None,
         description=(
@@ -290,6 +298,8 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("max_extensions must be >= 0.")
         if self.neighbor_radius < 1:
             raise ValueError("neighbor_radius must be >= 1.")
+        if self.neighbor_samples_per_anchor < 1:
+            raise ValueError("neighbor_samples_per_anchor must be >= 1.")
         if self.neighbor_supervised_max_epochs is not None and self.neighbor_supervised_max_epochs < 1:
             raise ValueError("neighbor_supervised_max_epochs must be >= 1 when provided.")
         if self.neighbor_semisupervised_max_epochs is not None and self.neighbor_semisupervised_max_epochs < 1:

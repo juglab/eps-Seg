@@ -347,6 +347,7 @@ class SemisupervisedDataset(Dataset):
         dim=2,
         seed=42,
         n_neighbors=7,
+        neighbor_samples_per_anchor: Optional[int] = None,
         samples_per_class: Dict[int, int] | None = None,
         coordinate_records: Optional[List[Dict[str, int]]] = None,
     ):
@@ -378,7 +379,10 @@ class SemisupervisedDataset(Dataset):
                 Whether to sample 2D or 3D patches (must be 2 or 3)
             seed: int (Default: 42)
                 Random seed for reproducible neighbor sampling         n_neighbors: int (Default: 7)
-                Number of neighbors to sample per anchor in semisupervised mode
+                Number of candidate neighbors stored per anchor in semisupervised mode
+            neighbor_samples_per_anchor: int, optional
+                Number of stored neighbors to randomly emit per anchor at __getitem__ time.
+                Defaults to n_neighbors for backwards compatibility.
             samples_per_class: dict (Default: None)
                 Optional per-class override for number of centers to sample from each class.
                 Key: class label (int), Value: number of centers to sample (int).
@@ -399,6 +403,7 @@ class SemisupervisedDataset(Dataset):
         self.coordinate_records = coordinate_records or []
         self.radius = radius
         self.n_neighbors = n_neighbors
+        self.neighbor_samples_per_anchor = self._resolve_neighbor_samples_per_anchor(neighbor_samples_per_anchor)
         self.seed = seed
         self.rng = random.Random(self.seed)
         self.samples_per_class = samples_per_class or {}
@@ -460,6 +465,28 @@ class SemisupervisedDataset(Dataset):
         ]
         return torch.from_numpy(p).unsqueeze(0)
 
+    def _resolve_neighbor_samples_per_anchor(self, neighbor_samples_per_anchor: Optional[int]) -> int:
+        value = self.n_neighbors if neighbor_samples_per_anchor is None else int(neighbor_samples_per_anchor)
+        if value < 1:
+            raise ValueError("neighbor_samples_per_anchor must be >= 1.")
+        if value > self.n_neighbors:
+            raise ValueError(
+                "neighbor_samples_per_anchor must be <= n_neighbors "
+                f"({value} > {self.n_neighbors})."
+            )
+        return value
+
+    def _sample_group_neighbors(self, g: dict) -> List[Tuple[int, int, int]]:
+        neighbor_coords = [tuple(map(int, xyz)) for xyz in g["coords"][1:]]
+        if len(neighbor_coords) < self.neighbor_samples_per_anchor:
+            raise ValueError(
+                "Semisupervised group has fewer stored neighbors than requested: "
+                f"{len(neighbor_coords)} < {self.neighbor_samples_per_anchor}."
+            )
+        if len(neighbor_coords) == self.neighbor_samples_per_anchor:
+            return neighbor_coords
+        return self.rng.sample(neighbor_coords, self.neighbor_samples_per_anchor)
+
     def __getitem__(self, idx):
         g = self.groups[idx]
         name = g["name"]
@@ -473,9 +500,11 @@ class SemisupervisedDataset(Dataset):
             segment = self.patch_at(lbl_vol, cz, cy, cx).unsqueeze(0)
             return patch, label, segment, torch.tensor(g["coords"][0])
 
-        coords = torch.tensor([tuple(map(int, xyz)) for xyz in g["coords"]])
+        anchor_coord = tuple(map(int, g["coords"][0]))
+        selected_neighbor_coords = self._sample_group_neighbors(g)
+        coords = torch.tensor([anchor_coord, *selected_neighbor_coords])
         patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])
-        labels = torch.tensor([g["labels"][0]] + [-1] * self.n_neighbors, dtype=torch.long)
+        labels = torch.tensor([g["labels"][0]] + [-1] * len(selected_neighbor_coords), dtype=torch.long)
         segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])
         return patches, labels, segments, coords
 

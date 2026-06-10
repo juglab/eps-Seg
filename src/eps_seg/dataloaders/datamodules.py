@@ -199,6 +199,7 @@ class EPSSegDataModule(L.LightningDataModule):
                     seed=self.cfg.seed,
                     samples_per_class=self.cfg.samples_per_class,
                     n_neighbors=self.cfg.n_neighbors,
+                    neighbor_samples_per_anchor=self.train_cfg.neighbor_samples_per_anchor,
                     radius=self.train_cfg.neighbor_radius,
                     coordinate_records=self.data["train_coordinate_records"],
                 )
