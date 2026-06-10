@@ -76,8 +76,7 @@ class DatasetCache:
             "max_folds",
             "train_keys",
             "test_keys",
-            "patch_size",
-            "dim",
+            "max_patch_size",
             "ignore_lbl",
             "train_to_val_ratio",
             "samples_per_class",
@@ -125,8 +124,7 @@ class DatasetCache:
             "max_folds": self.cfg.max_folds,
             "train_keys": list(self.cfg.train_keys),
             "test_keys": list(self.cfg.test_keys),
-            "patch_size": self.cfg.patch_size,
-            "dim": self.cfg.dim,
+            "max_patch_size": list(self.cfg.max_patch_size),
             "ignore_lbl": -1,
             "train_to_val_ratio": self.cfg.train_to_val_ratio,
             "samples_per_class": dict(self.cfg.samples_per_class or {}),
@@ -154,20 +152,37 @@ class DatasetCache:
         with open(path, "r", newline="", encoding="utf-8") as f:
             return list(csv.DictReader(f))
 
-    def patch_offset(self) -> int:
-        return self.cfg.patch_size // 2 - 1
+    def max_patch_offsets(self) -> Tuple[int, int, int]:
+        return tuple(max(0, int(size) // 2 - 1) for size in self.cfg.max_patch_size)
 
     def is_valid_anchor_coord(
-        self, labels: Dict[str, np.ndarray], name: str, z: int, y: int, x: int
+        self,
+        labels: Dict[str, np.ndarray],
+        name: str,
+        z: int,
+        y: int,
+        x: int,
+        z_start: Optional[int] = None,
+        z_stop: Optional[int] = None,
     ) -> bool:
         """
         Check whether a coordinate can be used as the center of a training patch.
+
+        Args:
+            labels: Dictionary of label arrays by stack name.
+            name: Stack name for the coordinate.
+            z, y, x: Coordinate to validate.
+            z_start, z_stop: Optional substack boundaries to enforce for the z dimension.
         """
         Z, H, W = labels[name].shape
-        offset = self.patch_offset()
-        valid = offset <= y < H - offset - 1 and offset <= x < W - offset - 1
-        if self.cfg.dim == 3:
-            valid = valid and (offset <= z < Z - offset - 1)
+        z_offset, y_offset, x_offset = self.max_patch_offsets()
+        valid = (
+            z_offset <= z < Z - z_offset - 1
+            and y_offset <= y < H - y_offset - 1
+            and x_offset <= x < W - x_offset - 1
+        )
+        if z_start is not None and z_stop is not None:
+            valid = valid and (int(z_start) + z_offset <= z < int(z_stop) - z_offset - 1)
         return valid and labels[name][z, y, x] != -1
 
     def load_source_and_labels(
@@ -316,6 +331,7 @@ class DatasetCache:
             patch_size=self.cfg.patch_size,
             label_size=1,
             dim=self.cfg.dim,
+            max_patch_size=list(self.cfg.max_patch_size),
             name_to_id=name_to_id,
         )
         schedule = DataSchedule.empty(seed=self.cfg.seed, stage_index=0)

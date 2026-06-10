@@ -126,6 +126,7 @@ class PseudoLabelDataset(torch.utils.data.Dataset):
             patch_size=self.patch_size,
             label_size=self.label_size,
             dim=self.dim,
+            max_patch_size=None,
             name_to_id=self.name_to_id,
         )
         self.sampling_domain = SamplingDomain(

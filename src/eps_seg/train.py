@@ -102,9 +102,9 @@ def create_initial_scheduler(exp_config: ExperimentConfig) -> Path:
         dataset configuration. This function is only called when the scheduler
         is missing, so resumed runs do not recreate it.
     """
-    train_cfg, dataset_cfg, _ = exp_config.get_configs()
+    train_cfg, dataset_cfg, model_cfg = exp_config.get_configs()
     scheduler_path = exp_config.stage_scheduler_path(0)
-    dm = EPSSegDataModule(cfg=dataset_cfg, train_cfg=train_cfg, scheduler_path=None, scheduler_stage_index=0)
+    dm = EPSSegDataModule(cfg=dataset_cfg, train_cfg=train_cfg, model_cfg=model_cfg, scheduler_path=None, scheduler_stage_index=0,)
     dm.prepare_data()
     dm.setup("fit")
     dm.train_dataset.schedule.save_npz(scheduler_path)
@@ -153,6 +153,7 @@ def train_one_stage(
     dm = EPSSegDataModule(
         cfg=dataset_cfg,
         train_cfg=train_cfg,
+        model_cfg=model_cfg,
         scheduler_path=scheduler_path,
         scheduler_stage_index=stage_idx,
     )
@@ -274,6 +275,7 @@ def train_neighbor_phase(
     dm = EPSSegDataModule(
         cfg=dataset_cfg,
         train_cfg=train_cfg,
+        model_cfg=model_cfg,
         scheduler_path=None,
         scheduler_stage_index=0,
         fit_dataset_kind="neighbor",
@@ -364,6 +366,7 @@ def evaluate_scheduler_extension(
     dm = EPSSegDataModule(
         cfg=dataset_cfg,
         train_cfg=train_cfg,
+        model_cfg=model_cfg,
         scheduler_path=scheduler_path,
         scheduler_stage_index=next_stage_idx,
     )

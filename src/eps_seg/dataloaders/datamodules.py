@@ -5,6 +5,7 @@ import lightning as L
 from torch.utils.data import DataLoader
 
 from eps_seg.config.datasets import BaseEPSDatasetConfig
+from eps_seg.config.models import BaseEPSModelConfig
 from eps_seg.config.train import TrainConfig
 from eps_seg.dataloaders.caching import DatasetCache
 from eps_seg.dataloaders.datasets import PredictionDataset, PseudoLabelDataset, SemisupervisedDataset
@@ -32,6 +33,7 @@ class EPSSegDataModule(L.LightningDataModule):
         self,
         cfg: BaseEPSDatasetConfig,
         train_cfg: TrainConfig,
+        model_cfg: Optional[BaseEPSModelConfig] = None,
         scheduler_path: Optional[Path] = None,
         scheduler_stage_index: int = 0,
         fit_dataset_kind: Literal["scheduler", "neighbor"] = "scheduler",
@@ -40,6 +42,7 @@ class EPSSegDataModule(L.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.train_cfg = train_cfg
+        self.model_cfg = model_cfg
         self.scheduler_path = Path(scheduler_path) if scheduler_path is not None else None
         self.scheduler_stage_index = scheduler_stage_index
         self.fit_dataset_kind = fit_dataset_kind
@@ -53,6 +56,44 @@ class EPSSegDataModule(L.LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
         self.predict_dataset = None
+
+    def _runtime_patch_geometry(self) -> tuple[int, int]:
+        """
+            Determine the runtime patch shape based on the model configuration and dataset constraints.
+            Uses model config conv_mult to determine dimensionality and img_shape 
+            to determine patch size, while ensuring that they remain within the dataset's max_patch_size.
+                
+        """
+        if self.model_cfg is None:
+            return int(self.cfg.dim), int(self.cfg.patch_size)
+
+        runtime_dim = int(getattr(self.model_cfg, "conv_mult"))
+        img_shape = [int(size) for size in getattr(self.model_cfg, "img_shape")]
+        max_patch_size = [int(size) for size in self.cfg.max_patch_size]
+
+        if runtime_dim == 2:
+            if len(img_shape) != 2:
+                raise ValueError("2D models must set model.img_shape as [H, W].")
+            if img_shape[0] != img_shape[1]:
+                raise ValueError("Only square 2D runtime patches are supported by the current datasets.")
+            if img_shape[0] > max_patch_size[1] or img_shape[1] > max_patch_size[2]:
+                raise ValueError(
+                    f"Model img_shape {img_shape} exceeds dataset max_patch_size Y/X envelope {max_patch_size[1:]}."
+                )
+            return runtime_dim, img_shape[0]
+
+        if runtime_dim == 3:
+            if len(img_shape) != 3:
+                raise ValueError("3D models must set model.img_shape as [Z, H, W].")
+            if len(set(img_shape)) != 1:
+                raise ValueError("Only cubic 3D runtime patches are supported by the current datasets.")
+            if any(size > max_size for size, max_size in zip(img_shape, max_patch_size)):
+                raise ValueError(
+                    f"Model img_shape {img_shape} exceeds dataset max_patch_size envelope {max_patch_size}."
+                )
+            return runtime_dim, img_shape[0]
+
+        raise ValueError(f"Unsupported model conv_mult/runtime dim: {runtime_dim}")
 
     def _runtime_stage_seed(self) -> int:
         return int(self.cfg.seed) + int(self.scheduler_stage_index)
@@ -169,15 +210,16 @@ class EPSSegDataModule(L.LightningDataModule):
             )
 
         if stage in ["fit"]:
+            runtime_dim, runtime_patch_size = self._runtime_patch_geometry()
             if self.fit_dataset_kind == "scheduler":
                 self.train_dataset = PseudoLabelDataset(
                     images=self.data["trainval_images"],
                     labels=self.data["trainval_labels"],
-                    patch_size=self.cfg.patch_size,
+                    patch_size=runtime_patch_size,
                     label_size=1,
                     n_classes=self.cfg.n_classes,
                     ignore_lbl=-1,
-                    dim=self.cfg.dim,
+                    dim=runtime_dim,
                     seed=self.cfg.seed,
                     samples_per_class=self.cfg.samples_per_class,
                     coordinate_records=self.data["train_coordinate_records"],
@@ -190,12 +232,12 @@ class EPSSegDataModule(L.LightningDataModule):
                 self.train_dataset = SemisupervisedDataset(
                     images=self.data["trainval_images"],
                     labels=self.data["trainval_labels"],
-                    patch_size=self.cfg.patch_size,
+                    patch_size=runtime_patch_size,
                     label_size=1,
                     mode=self.fit_dataset_mode or self.cfg.mode,
                     n_classes=self.cfg.n_classes,
                     ignore_lbl=-1,
-                    dim=self.cfg.dim,
+                    dim=runtime_dim,
                     seed=self.cfg.seed,
                     samples_per_class=self.cfg.samples_per_class,
                     n_neighbors=self.cfg.n_neighbors,
@@ -206,29 +248,31 @@ class EPSSegDataModule(L.LightningDataModule):
             else:
                 raise ValueError(f"Unknown fit_dataset_kind: {self.fit_dataset_kind}")
         if stage in ["fit", "validate"]:
+            runtime_dim, runtime_patch_size = self._runtime_patch_geometry()
             self.val_dataset = SemisupervisedDataset(
                 images=self.data["trainval_images"],
                 labels=self.data["trainval_labels"],
-                patch_size=self.cfg.patch_size,
+                patch_size=runtime_patch_size,
                 label_size=1,
                 mode="supervised",
                 n_classes=self.cfg.n_classes,
                 ignore_lbl=-1,
-                dim=self.cfg.dim,
+                dim=runtime_dim,
                 seed=self.cfg.seed,
                 samples_per_class=self.cfg.samples_per_class,
                 n_neighbors=self.cfg.n_neighbors,
                 coordinate_records=self.data["val_coordinate_records"],
             )
         if stage in ["test", "predict"]:
+            runtime_dim, runtime_patch_size = self._runtime_patch_geometry()
             if stage == "test":
                 self.test_dataset = PredictionDataset(
                     images=self.data["test_images"],
                     labels=self.data["test_labels"],
                     keys=self.cfg.test_keys,
                     masks=self._build_slice_mask(stage=stage),
-                    patch_size=self.cfg.patch_size,
-                    dim=self.cfg.dim,
+                    patch_size=runtime_patch_size,
+                    dim=runtime_dim,
                     ignore_lbl=-1,
                 )
             else:
@@ -237,8 +281,8 @@ class EPSSegDataModule(L.LightningDataModule):
                     labels=self.data["test_labels"],
                     keys=self.cfg.test_keys,
                     masks=self._build_slice_mask(stage=stage),
-                    patch_size=self.cfg.patch_size,
-                    dim=self.cfg.dim,
+                    patch_size=runtime_patch_size,
+                    dim=runtime_dim,
                     ignore_lbl=-1,
                 )
 
