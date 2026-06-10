@@ -998,6 +998,20 @@ class ConditionalPosterior(nn.Module):
             self.conv_type(2 * c_vars, 2 * c_vars, kernel, padding=pad),
         )
 
+    def _crop_for_classifier(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_dims = x.shape[2:]
+        target_dims = [int(self.seg_head_dim)] * len(spatial_dims)
+        if any(target > current for target, current in zip(target_dims, spatial_dims)):
+            raise ValueError(
+                f"seg_head_dim={self.seg_head_dim} is larger than input spatial dims {tuple(spatial_dims)}."
+            )
+        if all(target == current for target, current in zip(target_dims, spatial_dims)):
+            return x
+        starts = [(current - target) // 2 for target, current in zip(target_dims, spatial_dims)]
+        slices = [slice(None), slice(None)]
+        slices.extend(slice(start, start + target) for start, target in zip(starts, target_dims))
+        return x[tuple(slices)]
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1011,7 +1025,7 @@ class ConditionalPosterior(nn.Module):
             class_probs    : (B, n_components)
         """
         # q(y|x)
-        class_logits = self.qy_x(x)  # (B, n_components)
+        class_logits = self.qy_x(self._crop_for_classifier(x))  # (B, n_components)
 
         # FiLM modulation
         gamma = self.gamma_layer(class_logits)  # (B, c_in)

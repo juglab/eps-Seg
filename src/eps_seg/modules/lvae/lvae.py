@@ -123,10 +123,7 @@ class LadderVAE(nn.Module):
         self.top_down_layers = nn.ModuleList([])
         self.bottom_up_layers = nn.ModuleList([])
 
-        # Z dimensions for stochastic layers are downscaled by factor 2
-        self.head_z_dims = [
-            int(self.input_array_shape[-1] / (2 ** (i + 1))) for i in range(self.n_layers)
-        ]
+        self.head_z_dims = list(self.cfg.feature_spatial_size)
 
         for i in range(self.n_layers):
             # Whether this is the top layer

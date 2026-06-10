@@ -119,7 +119,7 @@ class LVAEConfig(BaseEPSModelConfig):
     )
     feature_spatial_size: List[int] = Field(
         default_factory=lambda: [0, 0, 8],
-        description="Spatial size of the features used by the vanilla segmentation head at each hierarchy. 0 disables that level.",
+        description="Spatial size of selected features at each hierarchy. 0 disables that level.",
     )
     top_prior_schedule: Literal["none", "static", "dynamic"] = Field(
         default="none",
@@ -188,13 +188,33 @@ class LVAEConfig(BaseEPSModelConfig):
 
     @model_validator(mode="after")
     def validate_architecture_specific_fields(self):
+        natural_plus_feature_spatial_size = [
+            int(self.img_shape[-1] / (2 ** (layer_idx + 1)))
+            for layer_idx in range(self.n_layers)
+        ]
+        default_vanilla_feature_spatial_size = [0] * max(self.n_layers - 1, 0) + [
+            natural_plus_feature_spatial_size[-1]
+        ]
+        feature_spatial_size_was_explicit = "feature_spatial_size" in self.model_fields_set
+
+        if self.architecture == "eps_seg_plus" and not feature_spatial_size_was_explicit:
+            self.feature_spatial_size = natural_plus_feature_spatial_size
+        if self.architecture == "eps_seg_vanilla" and not feature_spatial_size_was_explicit:
+            self.feature_spatial_size = default_vanilla_feature_spatial_size
+
         if len(self.feature_spatial_size) != self.n_layers:
-            if self.architecture == "eps_seg_plus" and self.feature_spatial_size == [0, 0, 8]:
-                self.feature_spatial_size = [0] * max(self.n_layers - 1, 0) + [8]
+            if self.feature_spatial_size == [0, 0, 8]:
+                self.feature_spatial_size = (
+                    natural_plus_feature_spatial_size
+                    if self.architecture == "eps_seg_plus"
+                    else default_vanilla_feature_spatial_size
+                )
             else:
                 raise ValueError(
                     f"feature_spatial_size must have length {self.n_layers}, got {len(self.feature_spatial_size)}"
                 )
+        if any(size < 0 for size in self.feature_spatial_size):
+            raise ValueError("feature_spatial_size values must be >= 0.")
 
         if self.top_prior_mu_step_epochs < 1:
             raise ValueError("top_prior_mu_step_epochs must be >= 1.")
@@ -208,13 +228,28 @@ class LVAEConfig(BaseEPSModelConfig):
         if self.architecture == "eps_seg_vanilla":
             if len(set(self.n_filters)) != 1:
                 raise ValueError("eps_seg_vanilla requires uniform n_filters across all layers.")
+            if self.feature_spatial_size != default_vanilla_feature_spatial_size:
+                raise ValueError(
+                    "eps_seg_vanilla only supports the default feature_spatial_size "
+                    f"{default_vanilla_feature_spatial_size}."
+                )
         else:
             if self.seg_features != "mu":
                 raise ValueError("seg_features is only supported by eps_seg_vanilla.")
-            default_feature_spatial_size = [0] * max(self.n_layers - 1, 0) + [8]
-            if self.feature_spatial_size != default_feature_spatial_size:
+            if any(size == 0 for size in self.feature_spatial_size):
+                raise ValueError("eps_seg_plus requires all feature_spatial_size values to be > 0.")
+            invalid_sizes = [
+                (layer_idx, size, natural_size)
+                for layer_idx, (size, natural_size) in enumerate(
+                    zip(self.feature_spatial_size, natural_plus_feature_spatial_size)
+                )
+                if size > natural_size
+            ]
+            if invalid_sizes:
                 raise ValueError(
-                    "feature_spatial_size is only supported by eps_seg_vanilla."
+                    "eps_seg_plus feature_spatial_size values must be <= the natural "
+                    f"per-layer feature sizes {natural_plus_feature_spatial_size}. "
+                    f"Invalid entries: {invalid_sizes}."
                 )
 
         return self
