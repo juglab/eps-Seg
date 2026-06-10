@@ -1,7 +1,9 @@
 import random
 
 import numpy as np
+import pytest
 
+from eps_seg.config.train import TrainConfig
 from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
 
@@ -53,6 +55,31 @@ def test_semisupervised_dataset_randomly_emits_one_neighbor_per_anchor():
     assert len(seen_neighbors) > 1
 
 
+@pytest.mark.parametrize("neighbor_samples_per_anchor", [1, 3, 7])
+def test_semisupervised_dataset_emits_requested_power_of_two_group_sizes(
+    neighbor_samples_per_anchor,
+):
+    dataset = make_minimal_semisupervised_dataset(
+        neighbor_samples_per_anchor=neighbor_samples_per_anchor
+    )
+
+    patches, labels, segments, coords = dataset[0]
+
+    expected_group_size = 1 + neighbor_samples_per_anchor
+    assert patches.shape[0] == expected_group_size
+    assert segments.shape[0] == expected_group_size
+    assert coords.shape[0] == expected_group_size
+    assert labels.tolist() == [2] + [-1] * neighbor_samples_per_anchor
+
+
+@pytest.mark.parametrize("neighbor_samples_per_anchor", [2, 4, 5, 6])
+def test_train_config_rejects_non_ablation_neighbor_counts(
+    neighbor_samples_per_anchor,
+):
+    with pytest.raises(ValueError, match="neighbor_samples_per_anchor must be one of"):
+        TrainConfig(neighbor_samples_per_anchor=neighbor_samples_per_anchor)
+
+
 class DummyNeighborDataset:
     mode = "semisupervised"
     unique_labels = np.array([0, 1])
@@ -64,24 +91,16 @@ class DummyNeighborDataset:
         ]
 
 
-def test_neighbor_sampler_uses_emitted_neighbor_count_for_patch_batch_size():
+@pytest.mark.parametrize(
+    ("neighbor_samples_per_anchor", "expected_anchors_per_batch"),
+    [(1, 256), (3, 128), (7, 64)],
+)
+def test_neighbor_sampler_uses_emitted_neighbor_count_for_patch_batch_size(
+    neighbor_samples_per_anchor,
+    expected_anchors_per_batch,
+):
     dataset = DummyNeighborDataset()
-    sampler = ModeAwareBalancedAnchorBatchSampler(
-        dataset,
-        total_patches_per_batch=8,
-        n_neighbors=7,
-        seed=3,
-        shuffle=False,
-    )
-
-    batch = next(iter(sampler))
-
-    assert len(batch) == 4
-
-
-def test_neighbor_sampler_treats_total_patches_as_budget_when_not_divisible():
-    dataset = DummyNeighborDataset()
-    dataset.neighbor_samples_per_anchor = 2
+    dataset.neighbor_samples_per_anchor = neighbor_samples_per_anchor
     sampler = ModeAwareBalancedAnchorBatchSampler(
         dataset,
         total_patches_per_batch=512,
@@ -92,4 +111,20 @@ def test_neighbor_sampler_treats_total_patches_as_budget_when_not_divisible():
 
     batch = next(iter(sampler))
 
-    assert len(batch) == 170
+    assert len(batch) == expected_anchors_per_batch
+
+
+def test_neighbor_sampler_treats_total_patches_as_budget_when_not_divisible():
+    dataset = DummyNeighborDataset()
+    dataset.neighbor_samples_per_anchor = 3
+    sampler = ModeAwareBalancedAnchorBatchSampler(
+        dataset,
+        total_patches_per_batch=510,
+        n_neighbors=7,
+        seed=3,
+        shuffle=False,
+    )
+
+    batch = next(iter(sampler))
+
+    assert len(batch) == 127
