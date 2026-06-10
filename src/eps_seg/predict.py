@@ -300,7 +300,7 @@ def test_predict(exp_config: ExperimentConfig,
             print(f"Warning: Checkpoint {ckpt_path} does not exist and will be skipped.")
     
     # Run prediction and/or testing           
-    dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config)
+    dm = EPSSegDataModule(cfg=dataset_config, train_cfg=train_config, model_cfg=model_config)
     for mode in MODES:
         for ckpt_path in CKPTS_PATHS:
             print(f"Running {mode} with checkpoint: {ckpt_path}")

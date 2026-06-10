@@ -42,6 +42,7 @@ class InitialLabelSamplingContext:
     patch_size: int
     label_size: int
     dim: int
+    max_patch_size: List[int] | None
     name_to_id: Mapping[str, int]
 
     @property
@@ -56,6 +57,17 @@ class InitialLabelSamplingContext:
         """
 
         return self.patch_size // 2 - self.label_size
+
+    @property
+    def max_patch_offsets(self) -> tuple[int, int, int]:
+        """
+        Return the maximum patch offsets used to validate voxel centers based on the dataset's max_patch_size.
+        """
+        if self.max_patch_size is None:
+            offset = self.offset
+            z_offset = offset if self.dim == 3 else -1
+            return z_offset, offset, offset
+        return tuple(max(0, int(size) // 2 - self.label_size) for size in self.max_patch_size)
 
 
 class InitialLabelSamplingStrategy(Protocol):
@@ -132,6 +144,21 @@ def populate_schedule_from_coordinate_records(
         )
 
 
+def _substack_bounds_for_coord(
+    context: InitialLabelSamplingContext,
+    name: str,
+    z: int,
+) -> tuple[int, int] | None:
+    for substack in context.train_substacks:
+        if substack["stack_name"] != name:
+            continue
+        z_start = int(substack["z_start"])
+        z_stop = int(substack["z_stop"])
+        if z_start <= z < z_stop:
+            return z_start, z_stop
+    return None
+
+
 def _is_valid_coord(context: InitialLabelSamplingContext, name: str, z: int, y: int, x: int) -> bool:
     """Check whether a voxel center is valid for stage-0 schedule construction.
 
@@ -147,10 +174,14 @@ def _is_valid_coord(context: InitialLabelSamplingContext, name: str, z: int, y: 
     """
 
     z_size, height, width = context.images[name].shape
-    offset = context.offset
-    valid = offset <= y < height - offset - 1 and offset <= x < width - offset - 1
-    if context.dim == 3:
-        valid = valid and (offset <= z < z_size - offset - 1)
+    z_offset, y_offset, x_offset = context.max_patch_offsets
+    valid = y_offset <= y < height - y_offset - 1 and x_offset <= x < width - x_offset - 1
+    if z_offset >= 0:
+        valid = valid and (z_offset <= z < z_size - z_offset - 1)
+    bounds = _substack_bounds_for_coord(context=context, name=name, z=z)
+    if context.max_patch_size is not None and bounds is not None:
+        z_start, z_stop = bounds
+        valid = valid and (z_start + z_offset <= z < z_stop - z_offset - 1)
     return bool(valid and context.labels[name][z, y, x] != context.ignore_lbl)
 
 
@@ -294,14 +325,14 @@ class ClassBalancedSubstackInitialLabelSamplingStrategy:
             for lbl in context.unique_labels:
                 n_samples = context.samples_per_class.get(int(lbl), context.default_samples_per_class)
                 for z, y, x in self._sample_coordinates_from_substack(
+                    context=context,
+                    name=name,
                     label_volume=label_volume,
                     class_label=int(lbl),
                     num_samples=n_samples,
                     z_start=z_start,
                     rng=rng,
                 ):
-                    if not _is_valid_coord(context=context, name=name, z=z, y=y, x=x):
-                        continue
                     if (z, y, x) in coords_in_use:
                         continue
                     coords_in_use.add((z, y, x))
@@ -323,6 +354,8 @@ class ClassBalancedSubstackInitialLabelSamplingStrategy:
 
     def _sample_coordinates_from_substack(
         self,
+        context: InitialLabelSamplingContext,
+        name: str,
         label_volume: np.ndarray,
         class_label: int,
         num_samples: int,
@@ -342,10 +375,13 @@ class ClassBalancedSubstackInitialLabelSamplingStrategy:
             list[tuple[int, int, int]]: Sampled global ``(z, y, x)`` coordinates.
         """
 
-        label_coords = np.argwhere(label_volume == class_label)
+        label_coords = [
+            (int(z_start + z), int(y), int(x))
+            for z, y, x in np.argwhere(label_volume == class_label)
+            if _is_valid_coord(context=context, name=name, z=int(z_start + z), y=int(y), x=int(x))
+        ]
         if len(label_coords) == 0 or num_samples <= 0:
             return []
         n_take = min(len(label_coords), num_samples)
         sampled_idx = rng.sample(range(len(label_coords)), n_take)
-        sampled = label_coords[sampled_idx]
-        return [(int(z_start + z), int(y), int(x)) for z, y, x in sampled]
+        return [label_coords[idx] for idx in sampled_idx]

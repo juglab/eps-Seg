@@ -9,7 +9,7 @@ from eps_seg.config.base import BaseEPSConfig
 
 class BaseEPSDatasetConfig(BaseEPSConfig):
     name: str = Field(..., description="Name of the dataset, used for cache naming")
-    dim: int = Field(..., description="Dimensionality of the data (2D or 3D)")
+    dim: int = Field(2, description="Deprecated dataset dimensionality. Use model_cfg.conv_mult.")
     data_dir: str = Field(..., description="Path to the dataset directory")
     cache_root: Optional[str] = Field(
         ...,
@@ -46,7 +46,14 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         ...,
         description="Ratio of training to validation substacks when max_folds == 1. Used only when building a fresh cache.",
     )
-    patch_size: int = Field(..., description="Size of the patches to extract from the images")
+    patch_size: int = Field(64, description="Deprecated patch size returned by the dataset. Use model_cfg.img_shape.",)
+    max_patch_size: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Maximum patch size [Z, Y, X] the dataset can support. Canonical coordinates "
+            "are sampled far enough from image and substack boundaries for this size."
+        ),
+    )
     n_channels: int = Field(..., description="Number of image channels in the dataset")
     n_classes: int = Field(..., description="Number of segmentation classes in the dataset")
     mode: Literal["supervised", "semisupervised"] = Field(
@@ -139,6 +146,15 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
             raise ValueError("fold must be < max_folds.")
         if self.substacking < 1:
             raise ValueError("substacking must be >= 1.")
+        if self.max_patch_size is None:
+            self.max_patch_size = [int(self.patch_size)] * 3
+        if len(self.max_patch_size) != 3:
+            raise ValueError("max_patch_size must have length 3: [Z, Y, X].")
+        self.max_patch_size = [int(size) for size in self.max_patch_size]
+        if any(size <= 0 for size in self.max_patch_size):
+            raise ValueError("All max_patch_size values must be > 0.")
+        if any(size % 2 != 0 for size in self.max_patch_size):
+            raise ValueError("All max_patch_size values must be even.")
         if not 0.0 < self.train_to_val_ratio < 1.0:
             raise ValueError("train_to_val_ratio must be between 0 and 1.")
 
