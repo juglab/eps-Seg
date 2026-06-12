@@ -131,11 +131,18 @@ class LVAEConfig(BaseEPSModelConfig):
     )
     top_prior_mu_supervised_max: float | None = Field(
         default=None,
-        description="Maximum top-prior mean reached during supervised training when using the dynamic schedule.",
+        description=(
+            "Target top-prior mean reached during supervised training when using "
+            "the dynamic schedule. The scheduler increases or decreases toward this value."
+        ),
     )
     top_prior_mu_semisupervised_min: float | None = Field(
         default=None,
-        description="Minimum top-prior mean reached during semisupervised training when using the dynamic schedule.",
+        description=(
+            "Lower target top-prior mean reached during semisupervised training when using "
+            "the dynamic schedule. Semisupervised starts from the carried supervised "
+            "checkpoint value and only decreases toward this value when it is lower."
+        ),
     )
     top_prior_mu_step_epochs: int = Field(
         default=10,

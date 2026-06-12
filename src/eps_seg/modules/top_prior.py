@@ -89,6 +89,14 @@ class TopPriorSchedulingMixin:
         with torch.no_grad():
             self.top_prior_params[:, :mu_channels].copy_(self.top_prior_mu_mask * value)
 
+    @staticmethod
+    def _move_top_prior_mu_toward_target(phase_start_mu: float, target_mu: float, step: int) -> float:
+        if target_mu > phase_start_mu:
+            return min(target_mu, phase_start_mu + float(step))
+        if target_mu < phase_start_mu:
+            return max(target_mu, phase_start_mu - float(step))
+        return target_mu
+
     def update_top_prior_scheduler(self, epoch: int) -> None:
         if not getattr(self, "is_top_layer", False):
             return
@@ -112,15 +120,22 @@ class TopPriorSchedulingMixin:
         phase_start_mu = float(self._schedule_phase_start_mu if self._schedule_phase_start_mu is not None else current_value)
         step = max(0, int(epoch) - phase_start_epoch) // self.top_prior_mu_step_epochs
         if self.training_mode == "supervised":
-            target_value = min(
-                float(self.top_prior_mu_supervised_max),
-                phase_start_mu + float(step),
+            target_value = self._move_top_prior_mu_toward_target(
+                phase_start_mu=phase_start_mu,
+                target_mu=float(self.top_prior_mu_supervised_max),
+                step=step,
             )
             self._semisupervised_start_mu = None
         elif self.training_mode == "semisupervised":
-            target_value = max(
-                float(self.top_prior_mu_semisupervised_min),
-                phase_start_mu - float(step),
+            # Semisupervised training inherits the actual top-prior mu reached
+            # by the supervised checkpoint. If the configured semi target is
+            # above that carried value, keep the carried value instead of
+            # increasing or jumping upward at the phase switch.
+            target_mu = min(float(self.top_prior_mu_semisupervised_min), phase_start_mu)
+            target_value = self._move_top_prior_mu_toward_target(
+                phase_start_mu=phase_start_mu,
+                target_mu=target_mu,
+                step=step,
             )
         else:
             return

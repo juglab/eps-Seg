@@ -1,6 +1,7 @@
 import argparse
 import gc
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -651,7 +652,35 @@ def run_fully_supervised_stage(exp_config: ExperimentConfig, stage_idx: int):
     )
 
 
-def run_neighbor_semisupervised_training(exp_config: ExperimentConfig):
+def archive_path(path: Path, timestamp: str) -> Path:
+    backup_path = path.with_name(f"{path.name}.backup_{timestamp}")
+    counter = 1
+    while backup_path.exists():
+        backup_path = path.with_name(f"{path.name}.backup_{timestamp}_{counter}")
+        counter += 1
+    shutil.move(str(path), str(backup_path))
+    print(f"Archived existing output: {path} -> {backup_path}")
+    return backup_path
+
+
+def archive_neighbor_semisupervised_outputs(exp_config: ExperimentConfig) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for path in (
+        exp_config.checkpoint_path("semisupervised", "best"),
+        exp_config.checkpoint_path("semisupervised", "last"),
+        exp_config.outputs_dir / "predictions" / "best_semisupervised",
+        exp_config.outputs_dir / "predictions" / "last_semisupervised",
+    ):
+        if path.exists():
+            archive_path(path, timestamp)
+
+
+def run_neighbor_semisupervised_training(
+    exp_config: ExperimentConfig,
+    *,
+    skip_supervised: bool = False,
+    force_semisupervised: bool = False,
+):
     """
         Run the non-staged neighbor-based semisupervised training pipeline.
 
@@ -666,7 +695,13 @@ def run_neighbor_semisupervised_training(exp_config: ExperimentConfig):
     semisupervised_best = exp_config.checkpoint_path("semisupervised", "best")
     semisupervised_last = exp_config.checkpoint_path("semisupervised", "last")
 
-    if train_cfg.auto_resume and supervised_best.exists() and supervised_last.exists():
+    if skip_supervised:
+        if not supervised_best.exists():
+            raise FileNotFoundError(
+                f"--skip_supervised requires an existing supervised best checkpoint: {supervised_best}"
+            )
+        print(f"Skipping neighbor supervised phase because --skip_supervised was set. Using: {supervised_best}")
+    elif train_cfg.auto_resume and supervised_best.exists() and supervised_last.exists():
         print(f"Skipping neighbor supervised phase because outputs already exist: {supervised_best} | {supervised_last}")
     else:
         supervised_resume = supervised_last if train_cfg.auto_resume and supervised_last.exists() else None
@@ -683,14 +718,25 @@ def run_neighbor_semisupervised_training(exp_config: ExperimentConfig):
             f"Neighbor semisupervised phase requires supervised best checkpoint: {supervised_best}"
         )
 
-    if train_cfg.auto_resume and semisupervised_best.exists() and semisupervised_last.exists():
+    if force_semisupervised:
+        print(
+            "Forcing neighbor semisupervised phase from supervised best. "
+            "Existing semisupervised checkpoints/predictions will be archived."
+        )
+        archive_neighbor_semisupervised_outputs(exp_config)
+    elif train_cfg.auto_resume and semisupervised_best.exists() and semisupervised_last.exists():
         print(
             "Skipping neighbor semisupervised phase because outputs already exist: "
             f"{semisupervised_best} | {semisupervised_last}"
         )
         return
 
-    ssl_resume = semisupervised_last if train_cfg.auto_resume and semisupervised_last.exists() else supervised_best
+    ssl_resume = (
+        supervised_best
+        if force_semisupervised
+        else semisupervised_last if train_cfg.auto_resume and semisupervised_last.exists()
+        else supervised_best
+    )
     supervised_best_epoch = checkpoint_epoch(supervised_best)
     ssl_max_epochs = (
         supervised_best_epoch
@@ -706,7 +752,13 @@ def run_neighbor_semisupervised_training(exp_config: ExperimentConfig):
     )
 
 
-def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = None):
+def train(
+    exp_config: ExperimentConfig,
+    fully_supervised_stage: int | None = None,
+    *,
+    skip_supervised: bool = False,
+    force_semisupervised: bool = False,
+):
     """
         Main training method for the staged workflow.
 
@@ -721,6 +773,8 @@ def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = Non
         for one-stage fully supervised replay.
     """
     train_cfg, _, _ = exp_config.get_configs()
+    if (skip_supervised or force_semisupervised) and train_cfg.training_regime != "neighbor_semisupervised":
+        raise ValueError("--skip_supervised and --force_semisupervised are only supported for neighbor_semisupervised training.")
     if fully_supervised_stage is None:
         if train_cfg.training_regime == "semisupervised":
             run_semisupervised_staged_training(exp_config)
@@ -732,7 +786,11 @@ def train(exp_config: ExperimentConfig, fully_supervised_stage: int | None = Non
             run_fully_supervised_upper_bound(exp_config)
             return
         if train_cfg.training_regime == "neighbor_semisupervised":
-            run_neighbor_semisupervised_training(exp_config)
+            run_neighbor_semisupervised_training(
+                exp_config,
+                skip_supervised=skip_supervised,
+                force_semisupervised=force_semisupervised,
+            )
             return
         raise ValueError(f"Unknown training_regime: {train_cfg.training_regime}")
     run_fully_supervised_stage(exp_config, fully_supervised_stage)
@@ -752,13 +810,34 @@ def main():
             "This expects the stage scheduler and semisupervised best checkpoint to already exist."
         ),
     )
+    parser.add_argument(
+        "--skip_supervised",
+        action="store_true",
+        help=(
+            "For neighbor_semisupervised training, skip the supervised phase and "
+            "require an existing best_supervised.ckpt."
+        ),
+    )
+    parser.add_argument(
+        "--force_semisupervised",
+        action="store_true",
+        help=(
+            "For neighbor_semisupervised training, archive existing semisupervised "
+            "checkpoints/predictions and start semisupervised again from best_supervised.ckpt."
+        ),
+    )
     
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
     print("Loading environment variables from:", args.env_file)
     load_dotenv(args.env_file)
     exp_config = ExperimentConfig.from_yaml(args.exp_config)
-    train(exp_config, fully_supervised_stage=args.fully_supervised_stage)
+    train(
+        exp_config,
+        fully_supervised_stage=args.fully_supervised_stage,
+        skip_supervised=args.skip_supervised,
+        force_semisupervised=args.force_semisupervised,
+    )
 
 
 if __name__ == "__main__":
