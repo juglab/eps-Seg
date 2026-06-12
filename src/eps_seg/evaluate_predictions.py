@@ -1,34 +1,30 @@
-import tifffile as tiff
+import argparse
+import re
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
-import numpy as np
-from pathlib import Path
-import re
+import tifffile as tiff
+
 from eps_seg.config.train import ExperimentConfig
-from torchmetrics.classification import F1Score
-import torch
-import argparse
+
 
 PRED_SLICE = 626
 PRED_KEY = "high_c4.tif"
 GT_TIFF = "/group/jug/Sheida/pancreatic beta cells/download/high_c4/high_c4_gt.tif"
-INPUT_TIFF = "/group/jug/Sheida/pancreatic beta cells/download/high_c4/high_c4_source.tif"
 
-LEGACY_CHECKPOINTS = ("best_supervised", "best_semisupervised")
 CHECKPOINT_PATTERN = re.compile(
     r"^(?P<kind>best|last)_(?P<mode>supervised|semisupervised)(?:_K(?P<stage>\d+))?$"
 )
 
 
-def _checkpoint_sort_key(checkpoint_name: str) -> tuple[int, int, int]:
-    """
-    Return a stable sort key for prediction folders.
-
-    Staged checkpoints are ordered by mode, then stage index, then best/last.
-    Legacy checkpoint names are kept supported and sorted after staged folders of the
-    same mode by assigning them stage -1.
-    """
+def checkpoint_sort_key(checkpoint_name: str) -> tuple[int, int, int]:
     match = CHECKPOINT_PATTERN.match(checkpoint_name)
     if match is None:
         return (99, 99_999, 99)
@@ -43,14 +39,7 @@ def _checkpoint_sort_key(checkpoint_name: str) -> tuple[int, int, int]:
     )
 
 
-def _discover_prediction_checkpoints(predictions_root: Path) -> list[str]:
-    """
-    Discover prediction subfolders produced by the current checkpoint naming scheme.
-
-    The staged training code writes predictions under folders matching the checkpoint
-    stem, e.g. ``best_semisupervised_K0``. Older runs may still use the legacy names
-    ``best_supervised`` and ``best_semisupervised``. We support both schemes.
-    """
+def discover_prediction_checkpoints(predictions_root: Path, pred_key: str) -> list[str]:
     if not predictions_root.exists():
         return []
 
@@ -60,106 +49,222 @@ def _discover_prediction_checkpoints(predictions_root: Path) -> list[str]:
             continue
         if CHECKPOINT_PATTERN.match(child.name) is None:
             continue
-        if not (child / PRED_KEY).exists():
-            continue
-        discovered.append(child.name)
+        if (child / pred_key).exists():
+            discovered.append(child.name)
+    return sorted(discovered, key=checkpoint_sort_key)
 
-    if discovered:
-        return sorted(discovered, key=_checkpoint_sort_key)
 
-    return [name for name in LEGACY_CHECKPOINTS if (predictions_root / name / PRED_KEY).exists()]
+def selected_checkpoint(checkpoint_names: list[str]) -> str | None:
+    if "best_semisupervised" in checkpoint_names:
+        return "best_semisupervised"
+    if "best_supervised" in checkpoint_names:
+        return "best_supervised"
+    return checkpoint_names[0] if checkpoint_names else None
 
-def evaluate(exp_root: str):
-    ablation_name = str(Path(exp_root).name)
-    exp_yaml_files = sorted(list(str(p) for p in Path(exp_root).glob("exp_*.yaml")))
-    experiment_predictions_folders = {}
-    experiment_checkpoint_names = {}
+
+def dice_scores(gt_image: np.ndarray, pred_image: np.ndarray) -> tuple[float, dict[int, float], int]:
+    gt = gt_image.reshape(-1)
+    pred = pred_image.reshape(-1)
+    mask = (gt != -1) & (pred != -1)
+    if not np.any(mask):
+        return float("nan"), {}, 0
+
+    gt_masked = gt[mask].astype(np.int64)
+    pred_masked = pred[mask].astype(np.int64)
+    labels = sorted(set(gt_masked.tolist()) | set(pred_masked.tolist()))
+    per_class = {}
+    for label in labels:
+        gt_label = gt_masked == label
+        pred_label = pred_masked == label
+        denom = int(gt_label.sum() + pred_label.sum())
+        if denom == 0:
+            per_class[label] = float("nan")
+        else:
+            per_class[label] = float(2.0 * np.logical_and(gt_label, pred_label).sum() / denom)
+
+    finite_scores = [value for value in per_class.values() if np.isfinite(value)]
+    average = float(np.mean(finite_scores)) if finite_scores else float("nan")
+    return average, per_class, int(mask.sum())
+
+
+def read_slice(path: Path, pred_slice: int) -> np.ndarray:
+    image = tiff.imread(path)
+    if image.ndim < 3:
+        return image
+    return image[pred_slice]
+
+
+def save_prediction_grid(
+    predictions: dict[str, dict[str, np.ndarray]],
+    checkpoint_names: list[str],
+    out_path: Path,
+    title: str,
+) -> None:
+    if not predictions or not checkpoint_names:
+        return
+
+    sns.set_theme(context="paper", style="white", font_scale=1.0, rc={"axes.linewidth": 0.5})
+    n_rows = len(predictions)
+    n_cols = len(checkpoint_names)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(max(4, 3.2 * n_cols), max(4, 2.8 * n_rows)),
+        squeeze=False,
+    )
+
+    for i, (experiment, preds) in enumerate(predictions.items()):
+        for j, checkpoint in enumerate(checkpoint_names):
+            ax = axes[i, j]
+            if checkpoint in preds:
+                ax.imshow(preds[checkpoint], interpolation="nearest", cmap="tab20")
+            ax.set_title(f"{experiment}\n{checkpoint}", fontsize=7)
+            ax.axis("off")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def save_selected_barplot(results_df: pd.DataFrame, out_path: Path) -> None:
+    selected = results_df[results_df["SelectedByRule"]].copy()
+    if selected.empty:
+        return
+
+    selected = selected.sort_values("Average Dice Score", ascending=False)
+    fig, ax = plt.subplots(figsize=(12, max(5, 0.35 * len(selected))))
+    sns.barplot(data=selected, y="Experiment", x="Average Dice Score", hue="Checkpoint", dodge=False, ax=ax)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_title("Selected checkpoint prediction Dice")
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def evaluate(
+    exp_root: str,
+    out_dir: str = "./results",
+    pred_slice: int = PRED_SLICE,
+    pred_key: str = PRED_KEY,
+    gt_tiff: str = GT_TIFF,
+) -> Path:
+    exp_root_path = Path(exp_root)
+    if not list(exp_root_path.glob("exp_*.yaml")) and (exp_root_path / "experiment_config").is_dir():
+        exp_root_path = exp_root_path / "experiment_config"
+
+    ablation_name = exp_root_path.name
+    exp_yaml_files = sorted(exp_root_path.glob("exp_*.yaml"))
+    if not exp_yaml_files:
+        raise FileNotFoundError(
+            f"No exp_*.yaml files found in {exp_root_path}. "
+            "Pass the directory containing the experiment YAMLs, for example "
+            "/group/jug/Sheida/Experiments/ablation_paper/experiment_config."
+        )
+
+    out_result_folder = Path(out_dir) / ablation_name
+    out_result_folder.mkdir(parents=True, exist_ok=True)
+
+    gt_image = read_slice(Path(gt_tiff), pred_slice)
+    predictions: dict[str, dict[str, np.ndarray]] = {}
+    rows: list[dict[str, object]] = []
+    selected_predictions: dict[str, dict[str, np.ndarray]] = {}
+
     for exp_yaml in exp_yaml_files:
         exp = ExperimentConfig.from_yaml(str(exp_yaml))
         predictions_root = exp.outputs_dir / "predictions"
-        experiment_predictions_folders[exp.experiment_name] = predictions_root
-        experiment_checkpoint_names[exp.experiment_name] = _discover_prediction_checkpoints(predictions_root)
+        checkpoint_names = discover_prediction_checkpoints(predictions_root, pred_key)
+        selected = selected_checkpoint(checkpoint_names)
+        predictions[exp.experiment_name] = {}
 
-    # Load ground truth and predictions
-    input_image = tiff.imread(INPUT_TIFF)[PRED_SLICE]
-    gt_image = tiff.imread(GT_TIFF)[PRED_SLICE]
-    predictions = {}
-
-    
-    out_result_folder = Path("./results/") / ablation_name 
-    out_result_folder.mkdir(parents=True, exist_ok=True)
-
-    results_df = pd.DataFrame(columns=["Experiment", "Checkpoint"])
-
-    for experiment, pred_folder in experiment_predictions_folders.items():
-
-        predictions[experiment] = {}
-        checkpoint_names = experiment_checkpoint_names[experiment]
-
-        for ckpt in checkpoint_names:
-            pred_path = Path(pred_folder) / ckpt / PRED_KEY
-
-            if pred_path.exists():
-                print(f"Evaluating {experiment} at {ckpt}")
-                pred_image = tiff.imread(pred_path)[PRED_SLICE]
-                predictions[experiment][ckpt] = pred_image
-
-                gtf = torch.tensor(gt_image.flatten())
-                prf = torch.tensor(pred_image.flatten())
-                mask = torch.logical_and(gtf != -1, prf != -1)
-                dice_score = F1Score(num_classes=len(gtf[mask].unique()), average=None, task="multiclass", ignore_index=-1)
-                dsc_per_class = dice_score(prf[mask].int(), gtf[mask].int())
-                avg_dsc = dsc_per_class.mean().item()
-
-                new_row = {
-                    "Experiment": experiment,
-                    "Checkpoint": ckpt,
-                    "Average Dice Score": avg_dsc
+        if not checkpoint_names:
+            rows.append(
+                {
+                    "Experiment": exp.experiment_name,
+                    "Checkpoint": "",
+                    "SelectedByRule": False,
+                    "PredictionPath": "",
+                    "Average Dice Score": np.nan,
+                    "EvaluatedPixels": 0,
+                    "Status": "missing_prediction",
                 }
-                for class_idx, dsc in enumerate(dsc_per_class):
-                    new_row[f"DSC_Class_{class_idx}"] = dsc.item()
+            )
+            print(f"No predictions found for {exp.experiment_name}")
+            continue
 
-                results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
-                
-                results_df.to_csv(out_result_folder / f"results_{PRED_SLICE}.csv", index=False)
+        for checkpoint in checkpoint_names:
+            pred_path = predictions_root / checkpoint / pred_key
+            print(f"Evaluating {exp.experiment_name} at {checkpoint}")
+            pred_image = read_slice(pred_path, pred_slice)
+            predictions[exp.experiment_name][checkpoint] = pred_image
+            avg_dice, per_class, evaluated_pixels = dice_scores(gt_image, pred_image)
 
-                dice_score.reset()
-            else:
-                print(f"Prediction not found for {experiment} at {ckpt}")
+            row = {
+                "Experiment": exp.experiment_name,
+                "Checkpoint": checkpoint,
+                "SelectedByRule": checkpoint == selected,
+                "PredictionPath": str(pred_path),
+                "Average Dice Score": avg_dice,
+                "EvaluatedPixels": evaluated_pixels,
+                "Status": "ok",
+            }
+            for class_idx, dice in per_class.items():
+                row[f"DSC_Class_{class_idx}"] = dice
+            rows.append(row)
 
-    # Save figures for each ckpt 
+        if selected is not None and selected in predictions[exp.experiment_name]:
+            selected_predictions[exp.experiment_name] = {selected: predictions[exp.experiment_name][selected]}
+
+    results_df = pd.DataFrame(rows)
+    results_path = out_result_folder / f"results_{pred_slice}.csv"
+    selected_results_path = out_result_folder / f"selected_results_{pred_slice}.csv"
+    results_df.to_csv(results_path, index=False)
+    if "SelectedByRule" in results_df.columns:
+        results_df[results_df["SelectedByRule"]].to_csv(selected_results_path, index=False)
+    else:
+        pd.DataFrame().to_csv(selected_results_path, index=False)
+
     all_checkpoints = sorted(
         {checkpoint for preds in predictions.values() for checkpoint in preds},
-        key=_checkpoint_sort_key,
+        key=checkpoint_sort_key,
+    )
+    save_prediction_grid(
+        predictions=predictions,
+        checkpoint_names=all_checkpoints,
+        out_path=out_result_folder / f"prediction_grid_{pred_slice}.png",
+        title=f"{ablation_name} predictions",
+    )
+    save_prediction_grid(
+        predictions=selected_predictions,
+        checkpoint_names=sorted({next(iter(preds)) for preds in selected_predictions.values()}, key=checkpoint_sort_key),
+        out_path=out_result_folder / f"selected_prediction_grid_{pred_slice}.png",
+        title=f"{ablation_name} selected predictions",
+    )
+    save_selected_barplot(results_df, out_result_folder / f"selected_dice_{pred_slice}.png")
+
+    print(f"Wrote evaluation results to {results_path}")
+    return results_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate EPS-Seg prediction TIFFs.")
+    parser.add_argument("--exp_root", type=str, required=True, help="Directory containing exp_*.yaml files.")
+    parser.add_argument("--out_dir", type=str, default="./results", help="Directory where evaluation outputs are written.")
+    parser.add_argument("--pred_slice", type=int, default=PRED_SLICE)
+    parser.add_argument("--pred_key", type=str, default=PRED_KEY)
+    parser.add_argument("--gt_tiff", type=str, default=GT_TIFF)
+    args = parser.parse_args()
+    evaluate(
+        exp_root=args.exp_root,
+        out_dir=args.out_dir,
+        pred_slice=args.pred_slice,
+        pred_key=args.pred_key,
+        gt_tiff=args.gt_tiff,
     )
 
-    sns.set_theme(
-        context="paper",
-        style="white",
-        font_scale=1.2,
-        rc={"axes.linewidth": 0.5}
-    )
-
-    # Plot predictions in a table, row per experiment, column per checkpoint
-    n_rows = len(experiment_predictions_folders)
-    n_cols = max(1, len(all_checkpoints))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 4*n_rows), squeeze=False)
-
-    for i, (experiment, preds) in enumerate(predictions.items()):
-        for j, ckpt in enumerate(all_checkpoints):
-            ax = axes[i, j]
-            if ckpt in preds:
-                ax.imshow(preds[ckpt])
-            ax.set_title(f"{experiment}\n{ckpt}", fontsize=8)
-            ax.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_result_folder / f"{ablation_name}.png", dpi=300)
-    plt.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate predictions Eps-Seg experiments.")
-    parser.add_argument("--exp_root", type=str, required=True, help="Path to the root directory of the experiments.")
-    args = parser.parse_args()
-    evaluate(args.exp_root)
+    main()
