@@ -34,6 +34,18 @@ from eps_seg.models import LVAEModel
 PoolingMode = Literal["center", "mean", "flatten"]
 
 
+def load_tiff_array(path: str | Path) -> np.ndarray:
+    """Memory-map contiguous TIFFs and load compressed/tiled TIFFs normally."""
+
+    try:
+        return tiff.memmap(path, mode="r")
+    except ValueError as error:
+        if "not memory-mappable" not in str(error):
+            raise
+        print(f"TIFF is not memory-mappable; loading it into RAM: {path}")
+        return tiff.imread(path)
+
+
 class TestSliceDataset(Dataset):
     """Return one model patch for every evaluable pixel in a test slice."""
 
@@ -820,8 +832,8 @@ def evaluate_latent_kmeans(
         raise ValueError("Inference batch_size must be positive.")
 
     image_path, label_path = dataset_cfg.get_image_label_paths([test_key])[test_key]
-    image = tiff.memmap(image_path)
-    labels = tiff.memmap(label_path)
+    image = load_tiff_array(image_path)
+    labels = load_tiff_array(label_path)
     dataset = TestSliceDataset(
         image,
         labels,

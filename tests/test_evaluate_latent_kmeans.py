@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import tifffile
 import torch
 
 from eps_seg.evaluate_latent_kmeans import (
@@ -7,6 +8,7 @@ from eps_seg.evaluate_latent_kmeans import (
     align_clusters_to_ground_truth,
     dice_scores,
     fit_kmeans_streaming,
+    load_tiff_array,
     pool_latent_mus,
     save_pca_artifacts,
 )
@@ -146,3 +148,31 @@ def test_save_pca_artifacts_writes_reusable_features(tmp_path):
     assert np.allclose(saved, expected)
     assert (tmp_path / "pca_transform.npz").exists()
     assert (tmp_path / "pca_features_metadata.npz").exists()
+
+
+def test_load_tiff_array_falls_back_for_compressed_tiff(tmp_path):
+    expected = np.arange(4 * 5 * 6, dtype=np.uint8).reshape(4, 5, 6)
+    path = tmp_path / "compressed.tif"
+    tifffile.imwrite(
+        path,
+        expected,
+        compression="zlib",
+        photometric="minisblack",
+    )
+
+    loaded = load_tiff_array(path)
+
+    assert np.array_equal(loaded, expected)
+
+
+def test_load_tiff_array_opens_contiguous_tiff_read_only(tmp_path):
+    expected = np.arange(5 * 6, dtype=np.int8).reshape(5, 6)
+    path = tmp_path / "read_only.tif"
+    tifffile.imwrite(path, expected)
+    path.chmod(0o444)
+
+    loaded = load_tiff_array(path)
+
+    assert isinstance(loaded, np.memmap)
+    assert loaded.mode == "r"
+    assert np.array_equal(loaded, expected)
