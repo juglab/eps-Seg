@@ -166,6 +166,7 @@ class LVAEModel(L.LightningModule):
         validation_mode: bool = False,
         confidence_threshold: float = 0.99,
         mask_input: bool | None = None,
+        use_pseudo_labels: bool = False,
     ):
         """
             Forward pass through the LVAE model.
@@ -189,6 +190,7 @@ class LVAEModel(L.LightningModule):
             validation_mode=validation_mode,
             confidence_threshold=confidence_threshold,
             mask_input=mask_input,
+            use_pseudo_labels=use_pseudo_labels,
         )
 
     def on_fit_start(self):
@@ -279,6 +281,10 @@ class LVAEModel(L.LightningModule):
                              y, 
                              validation_mode=True, 
                              confidence_threshold=self.train_cfg.model_confidence_threshold,
+                             use_pseudo_labels=(
+                                 self.current_training_mode == "semisupervised"
+                                 and self.train_cfg.validation_use_pseudolabel_neighbors
+                             ),
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
 

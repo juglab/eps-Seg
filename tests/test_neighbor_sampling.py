@@ -80,6 +80,13 @@ def test_train_config_rejects_non_ablation_neighbor_counts(
         TrainConfig(neighbor_samples_per_anchor=neighbor_samples_per_anchor)
 
 
+def test_pseudolabel_neighbor_validation_is_opt_in():
+    assert TrainConfig().validation_use_pseudolabel_neighbors is False
+    assert TrainConfig(
+        validation_use_pseudolabel_neighbors=True
+    ).validation_use_pseudolabel_neighbors is True
+
+
 class DummyNeighborDataset:
     mode = "semisupervised"
     unique_labels = np.array([0, 1])

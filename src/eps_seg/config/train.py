@@ -199,6 +199,14 @@ class TrainConfig(BaseEPSConfig):
         default=0.75,
         description="Confidence threshold passed to the LVAE when it internally reasons over unlabeled samples.",
     )
+    validation_use_pseudolabel_neighbors: bool = Field(
+        default=False,
+        description=(
+            "Whether neighbor-based semisupervised validation should include local "
+            "unlabeled neighbors and treat the model's hard pseudo-labels as targets "
+            "for validation losses."
+        ),
+    )
     mask_input_during_prediction: bool = Field(
         default=False,
         description=(

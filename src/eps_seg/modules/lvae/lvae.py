@@ -246,7 +246,15 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-    def forward(self, x, y=None, validation_mode=False, confidence_threshold=0.99, mask_input: Optional[bool] = None):
+    def forward(
+        self,
+        x,
+        y=None,
+        validation_mode=False,
+        confidence_threshold=0.99,
+        mask_input: Optional[bool] = None,
+        use_pseudo_labels: bool = False,
+    ):
         """
         Forward pass through the LVAE model.
 
@@ -260,6 +268,8 @@ class LadderVAE(nn.Module):
                 in the batch is pseudo-labeled regardless of this threshold.
             mask_input: Optional override for input masking. When ``None``, masking
                 follows the old ``self.training or validation_mode`` rule.
+            use_pseudo_labels: Whether to infer hard pseudo-label targets outside
+                training, such as for neighbor-based semisupervised validation.
         """
 
         # Defaults
@@ -288,7 +298,7 @@ class LadderVAE(nn.Module):
             all_class_logits, mode=self.aggregation_mode
         )
 
-        if self.training_mode == "semisupervised" and self.training:
+        if self.training_mode == "semisupervised" and (self.training or use_pseudo_labels):
             # During semisupervised training every unlabeled row in the batch is
             # pseudo-labeled. Scheduler admission is handled outside the model.
             pseudo_labels = self.get_pseudo_labels(

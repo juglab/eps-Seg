@@ -698,6 +698,7 @@ class EpsSegVanilla(nn.Module):
         validation_mode=False,
         confidence_threshold=0.99,
         mask_input: Optional[bool] = None,
+        use_pseudo_labels: bool = False,
     ):
         cl = torch.tensor(0.0, dtype=torch.float32, device=x.device)
         ce = torch.tensor(0.0, dtype=torch.float32, device=x.device)
@@ -720,7 +721,7 @@ class EpsSegVanilla(nn.Module):
         else:
             raise KeyError(f"Unknown segmentation features type: {self.seg_features}")
 
-        if self.training_mode == "semisupervised" and self.training:
+        if self.training_mode == "semisupervised" and (self.training or use_pseudo_labels):
             pseudo_labels = self.get_pseudo_labels(
                 td_data["mu"][-1], y, threshold=confidence_threshold
             )

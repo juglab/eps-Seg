@@ -249,18 +249,28 @@ class EPSSegDataModule(L.LightningDataModule):
                 raise ValueError(f"Unknown fit_dataset_kind: {self.fit_dataset_kind}")
         if stage in ["fit", "validate"]:
             runtime_dim, runtime_patch_size = self._runtime_patch_geometry()
+            validation_mode = (
+                "semisupervised"
+                if (
+                    self.fit_dataset_kind == "neighbor"
+                    and self.train_cfg.validation_use_pseudolabel_neighbors
+                )
+                else "supervised"
+            )
             self.val_dataset = SemisupervisedDataset(
                 images=self.data["trainval_images"],
                 labels=self.data["trainval_labels"],
                 patch_size=runtime_patch_size,
                 label_size=1,
-                mode="supervised",
+                mode=validation_mode,
                 n_classes=self.cfg.n_classes,
                 ignore_lbl=-1,
                 dim=runtime_dim,
                 seed=self.cfg.seed,
                 samples_per_class=self.cfg.samples_per_class,
                 n_neighbors=self.cfg.n_neighbors,
+                neighbor_samples_per_anchor=self.train_cfg.neighbor_samples_per_anchor,
+                radius=self.train_cfg.neighbor_radius,
                 coordinate_records=self.data["val_coordinate_records"],
             )
         if stage in ["test", "predict"]:
