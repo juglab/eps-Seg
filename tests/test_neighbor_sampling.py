@@ -2,10 +2,12 @@ import random
 
 import numpy as np
 import pytest
+import torch
 
 from eps_seg.config.train import TrainConfig
 from eps_seg.dataloaders.datasets import SemisupervisedDataset
 from eps_seg.dataloaders.samplers import ModeAwareBalancedAnchorBatchSampler
+from eps_seg.models.lvae import LVAEModel
 
 
 def make_minimal_semisupervised_dataset(neighbor_samples_per_anchor=1):
@@ -15,6 +17,9 @@ def make_minimal_semisupervised_dataset(neighbor_samples_per_anchor=1):
     dataset.offset = 0
     dataset.n_neighbors = 7
     dataset.neighbor_samples_per_anchor = neighbor_samples_per_anchor
+    dataset.neighbor_sampling_mode = "spatial"
+    dataset.neighbor_label_mode = "pseudo"
+    dataset.deterministic_neighbor_selection = False
     dataset.rng = random.Random(0)
     dataset.images = {
         "stack": np.arange(30 * 30, dtype=np.float32).reshape(1, 30, 30),
@@ -85,6 +90,75 @@ def test_pseudolabel_neighbor_validation_is_opt_in():
     assert TrainConfig(
         validation_use_pseudolabel_neighbors=True
     ).validation_use_pseudolabel_neighbors is True
+    assert TrainConfig().resolved_validation_variant == "anchor_gt"
+    assert TrainConfig(validation_use_pseudolabel_neighbors=True).resolved_validation_variant == "spatial_pl"
+    assert TrainConfig(
+        validation_use_pseudolabel_neighbors=True,
+        validation_variant="random_gt",
+    ).resolved_validation_variant == "random_gt"
+
+
+def test_semisupervised_dataset_can_emit_neighbor_gt_labels():
+    dataset = make_minimal_semisupervised_dataset(neighbor_samples_per_anchor=1)
+    dataset.neighbor_label_mode = "gt"
+    dataset.deterministic_neighbor_selection = True
+
+    _, labels, _, coords = dataset[0]
+
+    assert labels.tolist() == [2, 0]
+    assert coords.tolist() == [[0, 10, 10], [0, 10, 11]]
+
+
+def test_semisupervised_dataset_deterministic_neighbor_selection_is_stable():
+    dataset = make_minimal_semisupervised_dataset(neighbor_samples_per_anchor=1)
+    dataset.neighbor_label_mode = "pseudo"
+    dataset.deterministic_neighbor_selection = True
+
+    first = dataset[0][3].tolist()
+    second = dataset[0][3].tolist()
+
+    assert first == second == [[0, 10, 10], [0, 10, 11]]
+
+
+def test_random_validation_neighbors_are_not_spatially_constrained():
+    image = np.arange(1 * 30 * 30, dtype=np.float32).reshape(1, 30, 30)
+    label = np.zeros((1, 30, 30), dtype=np.int64)
+    records = [
+        {"stack_name": "stack", "z": 0, "y": 10, "x": 10, "gt_label": 1, "z_start": 0, "z_stop": 1, "substack_id": 0, "coord_id": 0},
+        {"stack_name": "stack", "z": 0, "y": 20, "x": 20, "gt_label": 2, "z_start": 0, "z_stop": 1, "substack_id": 0, "coord_id": 1},
+    ]
+    dataset = SemisupervisedDataset(
+        images={"stack": image},
+        labels={"stack": label},
+        patch_size=2,
+        label_size=1,
+        mode="semisupervised",
+        n_classes=3,
+        radius=1,
+        dim=2,
+        seed=0,
+        n_neighbors=1,
+        neighbor_samples_per_anchor=1,
+        neighbor_sampling_mode="random",
+        neighbor_label_mode="gt",
+        deterministic_neighbor_selection=True,
+        coordinate_records=records,
+    )
+
+    _, labels, _, coords = dataset[0]
+
+    assert labels.tolist() == [1, 2]
+    assert coords.tolist() == [[0, 10, 10], [0, 20, 20]]
+
+
+def test_validation_metric_targets_ignore_non_anchor_rows():
+    labels = torch.tensor([1, 2, 3, 0])
+    coords = torch.zeros(2, 2, 3, dtype=torch.long)
+
+    targets = LVAEModel._validation_metric_targets("spatial_gt", labels, coords)
+
+    assert targets.tolist() == [1, -1, 3, -1]
+    assert torch.equal(LVAEModel._validation_metric_targets("anchor_gt", labels, coords), labels)
 
 
 class DummyNeighborDataset:
