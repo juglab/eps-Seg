@@ -680,6 +680,7 @@ def run_neighbor_semisupervised_training(
     *,
     skip_supervised: bool = False,
     force_semisupervised: bool = False,
+    supervised_only: bool = False,
 ):
     """
         Run the non-staged neighbor-based semisupervised training pipeline.
@@ -717,6 +718,10 @@ def run_neighbor_semisupervised_training(
         raise FileNotFoundError(
             f"Neighbor semisupervised phase requires supervised best checkpoint: {supervised_best}"
         )
+
+    if supervised_only:
+        print("Stopping after neighbor supervised phase because --supervised_only was set.")
+        return
 
     if force_semisupervised:
         print(
@@ -758,6 +763,7 @@ def train(
     *,
     skip_supervised: bool = False,
     force_semisupervised: bool = False,
+    supervised_only: bool = False,
 ):
     """
         Main training method for the staged workflow.
@@ -775,6 +781,10 @@ def train(
     train_cfg, _, _ = exp_config.get_configs()
     if (skip_supervised or force_semisupervised) and train_cfg.training_regime != "neighbor_semisupervised":
         raise ValueError("--skip_supervised and --force_semisupervised are only supported for neighbor_semisupervised training.")
+    if supervised_only and train_cfg.training_regime != "neighbor_semisupervised":
+        raise ValueError("--supervised_only is only supported for neighbor_semisupervised training.")
+    if supervised_only and (skip_supervised or force_semisupervised):
+        raise ValueError("--supervised_only cannot be combined with --skip_supervised or --force_semisupervised.")
     if fully_supervised_stage is None:
         if train_cfg.training_regime == "semisupervised":
             run_semisupervised_staged_training(exp_config)
@@ -790,6 +800,7 @@ def train(
                 exp_config,
                 skip_supervised=skip_supervised,
                 force_semisupervised=force_semisupervised,
+                supervised_only=supervised_only,
             )
             return
         raise ValueError(f"Unknown training_regime: {train_cfg.training_regime}")
@@ -826,6 +837,11 @@ def main():
             "checkpoints/predictions and start semisupervised again from best_supervised.ckpt."
         ),
     )
+    parser.add_argument(
+        "--supervised_only",
+        action="store_true",
+        help="For neighbor_semisupervised training, run only the supervised warmup phase.",
+    )
     
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
@@ -837,6 +853,7 @@ def main():
         fully_supervised_stage=args.fully_supervised_stage,
         skip_supervised=args.skip_supervised,
         force_semisupervised=args.force_semisupervised,
+        supervised_only=args.supervised_only,
     )
 
 
