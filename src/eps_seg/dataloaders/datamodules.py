@@ -249,20 +249,16 @@ class EPSSegDataModule(L.LightningDataModule):
                 raise ValueError(f"Unknown fit_dataset_kind: {self.fit_dataset_kind}")
         if stage in ["fit", "validate"]:
             runtime_dim, runtime_patch_size = self._runtime_patch_geometry()
-            validation_mode = (
-                "semisupervised"
-                if (
-                    self.fit_dataset_kind == "neighbor"
-                    and self.train_cfg.validation_use_pseudolabel_neighbors
-                )
-                else "supervised"
-            )
+            validation_variant = self.train_cfg.resolved_validation_variant
+            use_validation_neighbors = self.fit_dataset_kind == "neighbor" and validation_variant != "anchor_gt"
+            neighbor_sampling_mode = "random" if validation_variant.startswith("random_") else "spatial"
+            neighbor_label_mode = "gt" if validation_variant.endswith("_gt") else "pseudo"
             self.val_dataset = SemisupervisedDataset(
                 images=self.data["trainval_images"],
                 labels=self.data["trainval_labels"],
                 patch_size=runtime_patch_size,
                 label_size=1,
-                mode=validation_mode,
+                mode="semisupervised" if use_validation_neighbors else "supervised",
                 n_classes=self.cfg.n_classes,
                 ignore_lbl=-1,
                 dim=runtime_dim,
@@ -270,6 +266,9 @@ class EPSSegDataModule(L.LightningDataModule):
                 samples_per_class=self.cfg.samples_per_class,
                 n_neighbors=self.cfg.n_neighbors,
                 neighbor_samples_per_anchor=self.train_cfg.neighbor_samples_per_anchor,
+                neighbor_sampling_mode=neighbor_sampling_mode,
+                neighbor_label_mode=neighbor_label_mode,
+                deterministic_neighbor_selection=True,
                 radius=self.train_cfg.neighbor_radius,
                 coordinate_records=self.data["val_coordinate_records"],
             )

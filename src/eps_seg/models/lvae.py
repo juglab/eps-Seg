@@ -231,6 +231,20 @@ class LVAEModel(L.LightningModule):
         }
         return x, y, log_batch
 
+    @staticmethod
+    def _validation_metric_targets(
+        validation_variant: str,
+        labels: torch.Tensor,
+        coords: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if validation_variant == "anchor_gt" or not torch.is_tensor(coords) or coords.ndim != 3:
+            return labels
+        group_size = coords.shape[1]
+        metric_targets = labels.clone()
+        non_anchor_mask = torch.arange(labels.numel(), device=labels.device) % group_size != 0
+        metric_targets[non_anchor_mask] = -1
+        return metric_targets
+
     def training_step(self, batch, batch_idx):
         x, y, log_batch = self._unpack_training_batch(batch)
         
@@ -276,6 +290,7 @@ class LVAEModel(L.LightningModule):
         # TODO: For now, validation still uses the old eps-Seg dataloader also in AL. No need for a schedule.
         x, y, s, c = batch
         batch_size = x.shape[0]
+        validation_variant = self.train_cfg.resolved_validation_variant
 
         outputs = self.forward(x, 
                              y, 
@@ -283,7 +298,7 @@ class LVAEModel(L.LightningModule):
                              confidence_threshold=self.train_cfg.model_confidence_threshold,
                              use_pseudo_labels=(
                                  self.current_training_mode == "semisupervised"
-                                 and self.train_cfg.validation_use_pseudolabel_neighbors
+                                 and validation_variant in {"spatial_pl", "random_pl"}
                              ),
                              )
         outputs["loss"] = self.compute_total_loss(outputs)   
@@ -292,7 +307,8 @@ class LVAEModel(L.LightningModule):
         
         # Accumulate metrics for dice loss (it is logged on epoch end)
         preds = torch.argmax(outputs["class_probabilities"], dim=-1)
-        self.validation_dice_score.update(preds, y)
+        metric_targets = self._validation_metric_targets(validation_variant, y, c)
+        self.validation_dice_score.update(preds, metric_targets)
 
         return outputs
 

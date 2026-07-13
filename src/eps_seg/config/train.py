@@ -207,6 +207,20 @@ class TrainConfig(BaseEPSConfig):
             "for validation losses."
         ),
     )
+    validation_variant: Literal[
+        "anchor_gt",
+        "spatial_pl",
+        "spatial_gt",
+        "random_pl",
+        "random_gt",
+    ] = Field(
+        default="anchor_gt",
+        description=(
+            "Validation loss target/source variant for neighbor semisupervised "
+            "training. The legacy validation_use_pseudolabel_neighbors=True flag "
+            "maps to spatial_pl when this is left at the default."
+        ),
+    )
     mask_input_during_prediction: bool = Field(
         default=False,
         description=(
@@ -344,6 +358,12 @@ class TrainConfig(BaseEPSConfig):
     @property
     def resolved_neighbor_semisupervised_max_epochs(self) -> int:
         return int(self.neighbor_semisupervised_max_epochs or self.max_epochs)
+
+    @property
+    def resolved_validation_variant(self) -> str:
+        if self.validation_use_pseudolabel_neighbors and self.validation_variant == "anchor_gt":
+            return "spatial_pl"
+        return self.validation_variant
 
 
 class ExperimentConfig(BaseEPSConfig):

@@ -349,6 +349,9 @@ class SemisupervisedDataset(Dataset):
         seed=42,
         n_neighbors=7,
         neighbor_samples_per_anchor: Optional[int] = None,
+        neighbor_sampling_mode: str = "spatial",
+        neighbor_label_mode: str = "pseudo",
+        deterministic_neighbor_selection: bool = False,
         samples_per_class: Dict[int, int] | None = None,
         coordinate_records: Optional[List[Dict[str, int]]] = None,
     ):
@@ -405,6 +408,13 @@ class SemisupervisedDataset(Dataset):
         self.radius = radius
         self.n_neighbors = n_neighbors
         self.neighbor_samples_per_anchor = self._resolve_neighbor_samples_per_anchor(neighbor_samples_per_anchor)
+        if neighbor_sampling_mode not in {"spatial", "random"}:
+            raise ValueError("neighbor_sampling_mode must be 'spatial' or 'random'.")
+        if neighbor_label_mode not in {"pseudo", "gt"}:
+            raise ValueError("neighbor_label_mode must be 'pseudo' or 'gt'.")
+        self.neighbor_sampling_mode = neighbor_sampling_mode
+        self.neighbor_label_mode = neighbor_label_mode
+        self.deterministic_neighbor_selection = deterministic_neighbor_selection
         self.seed = seed
         self.rng = random.Random(self.seed)
         self.samples_per_class = samples_per_class or {}
@@ -486,15 +496,17 @@ class SemisupervisedDataset(Dataset):
             )
         if len(neighbor_coords) == self.neighbor_samples_per_anchor:
             return neighbor_coords
+        if self.deterministic_neighbor_selection:
+            return neighbor_coords[: self.neighbor_samples_per_anchor]
         return self.rng.sample(neighbor_coords, self.neighbor_samples_per_anchor)
 
     def __getitem__(self, idx):
         g = self.groups[idx]
         name = g["name"]
-        img_vol = self.images[name]
-        lbl_vol = self.labels[name]
 
         if self.mode == "supervised":
+            img_vol = self.images[name]
+            lbl_vol = self.labels[name]
             cz, cy, cx = map(int, g["coords"][0])
             patch = self.patch_at(img_vol, cz, cy, cx).unsqueeze(0)
             label = torch.tensor([int(g["labels"][0])], dtype=torch.long)
@@ -503,10 +515,26 @@ class SemisupervisedDataset(Dataset):
 
         anchor_coord = tuple(map(int, g["coords"][0]))
         selected_neighbor_coords = self._sample_group_neighbors(g)
+        selected_neighbor_indices = [
+            int(g["coords"][1:].index(tuple(coord))) for coord in selected_neighbor_coords
+        ]
         coords = torch.tensor([anchor_coord, *selected_neighbor_coords])
-        patches = torch.stack([self.patch_at(img_vol, cz, cy, cx) for (cz, cy, cx) in coords])
-        labels = torch.tensor([g["labels"][0]] + [-1] * len(selected_neighbor_coords), dtype=torch.long)
-        segments = torch.stack([self.patch_at(lbl_vol, cz, cy, cx) for (cz, cy, cx) in coords])
+        coord_names = g.get("coord_names", [g["name"]] * len(g["coords"]))
+        selected_names = [coord_names[0]] + [coord_names[index + 1] for index in selected_neighbor_indices]
+        selected_labels = [int(g["labels"][0])] + [int(g["labels"][index + 1]) for index in selected_neighbor_indices]
+
+        patches = torch.stack([
+            self.patch_at(self.images[patch_name], cz, cy, cx)
+            for patch_name, (cz, cy, cx) in zip(selected_names, coords.tolist())
+        ])
+        if self.neighbor_label_mode == "gt":
+            labels = torch.tensor(selected_labels, dtype=torch.long)
+        else:
+            labels = torch.tensor([selected_labels[0]] + [-1] * len(selected_neighbor_coords), dtype=torch.long)
+        segments = torch.stack([
+            self.patch_at(self.labels[patch_name], cz, cy, cx)
+            for patch_name, (cz, cy, cx) in zip(selected_names, coords.tolist())
+        ])
         return patches, labels, segments, coords
 
     def _prepare_metadata(self) -> List[dict]:
@@ -554,6 +582,11 @@ class SemisupervisedDataset(Dataset):
 
     def _prepare_metadata_from_coordinate_records(self) -> List[dict]:
         groups: List[dict] = []
+        random_neighbor_pool = (
+            self._build_random_neighbor_pool()
+            if self.mode == "semisupervised" and self.neighbor_sampling_mode == "random"
+            else None
+        )
         for record in tqdm(self.coordinate_records, desc="Preparing cached coordinate groups", leave=False):
             name = record["stack_name"]
             cz = int(record["z"])
@@ -572,21 +605,29 @@ class SemisupervisedDataset(Dataset):
             used_coords = {(cz, cy, cx)}
             neighbors: List[Dict[str, int]] = []
             if self.mode == "semisupervised":
-                neighbors = self._sample_neighbors(
-                    name=name,
-                    cz=cz,
-                    cy=cy,
-                    cx=cx,
-                    Z=Z,
-                    H=H,
-                    W=W,
-                    used_coords=used_coords,
-                    lbl=lbl,
-                    z_start=z_start,
-                    z_stop=z_stop,
-                    k=self.n_neighbors,
-                    max_tries=100,
-                )
+                if self.neighbor_sampling_mode == "random":
+                    neighbors = self._sample_random_neighbors(
+                        anchor_name=name,
+                        anchor_coord=(cz, cy, cx),
+                        pool=random_neighbor_pool or [],
+                        k=self.n_neighbors,
+                    )
+                else:
+                    neighbors = self._sample_neighbors(
+                        name=name,
+                        cz=cz,
+                        cy=cy,
+                        cx=cx,
+                        Z=Z,
+                        H=H,
+                        W=W,
+                        used_coords=used_coords,
+                        lbl=lbl,
+                        z_start=z_start,
+                        z_stop=z_stop,
+                        k=self.n_neighbors,
+                        max_tries=100,
+                    )
                 if len(neighbors) != self.n_neighbors:
                     continue
 
@@ -764,6 +805,47 @@ class SemisupervisedDataset(Dataset):
             tries += 1
         return neighbors
 
+    def _build_random_neighbor_pool(self) -> List[Dict[str, int]]:
+        pool: List[Dict[str, int]] = []
+        for record in self.coordinate_records:
+            name = record["stack_name"]
+            z = int(record["z"])
+            y = int(record["y"])
+            x = int(record["x"])
+            z_start = int(record["z_start"])
+            z_stop = int(record["z_stop"])
+            img = self.images[name]
+            lbl = self.labels[name]
+            Z, H, W = img.shape
+            if self._is_valid_coord(name, z, y, x, Z, H, W, z_start=z_start, z_stop=z_stop):
+                pool.append(
+                    {
+                        "name": name,
+                        "z": z,
+                        "y": y,
+                        "x": x,
+                        "label": int(record["gt_label"]),
+                    }
+                )
+        return pool
+
+    def _sample_random_neighbors(
+        self,
+        anchor_name: str,
+        anchor_coord: Tuple[int, int, int],
+        pool: List[Dict[str, int]],
+        k: int,
+    ) -> List[Dict[str, int]]:
+        candidates = [
+            entry
+            for entry in pool
+            if (entry["name"], entry["z"], entry["y"], entry["x"])
+            != (anchor_name, *anchor_coord)
+        ]
+        if len(candidates) < k:
+            return []
+        return [dict(entry) for entry in self.rng.sample(candidates, k)]
+
     def _make_group_record(
         self,
         name: str,
@@ -781,6 +863,7 @@ class SemisupervisedDataset(Dataset):
             "name": name,
             "z": int(cz),
             "coords": [(int(cz), int(cy), int(cx))] + [(n["z"], n["y"], n["x"]) for n in neighbors],
+            "coord_names": [name] + [n.get("name", name) for n in neighbors],
             "labels": [int(c)] + [n["label"] for n in neighbors],
             "substack_id": substack_id,
             "z_start": z_start,
