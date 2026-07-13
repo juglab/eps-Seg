@@ -4,6 +4,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from eps_seg.models import LVAEModel
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
+from eps_seg.config import LVAEConfig
 from eps_seg.config.train import ExperimentConfig
 from dotenv import load_dotenv
 import torch 
@@ -16,6 +17,89 @@ import numpy as np
 import zarr
 from eps_seg.utils.outputs import zarr_to_tiff
 from typing import Dict, Set, Tuple
+
+
+def _load_checkpoint_metadata(ckpt_path: Path) -> dict:
+    try:
+        return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(ckpt_path, map_location="cpu")
+
+
+def _infer_feature_spatial_size_from_state_dict(
+    state_dict: dict,
+    model_config: LVAEConfig,
+) -> list[int] | None:
+    inferred = list(model_config.feature_spatial_size)
+    found_any = False
+
+    for layer_idx, z_dim in enumerate(model_config.z_dims):
+        key = f"model.top_down_layers.{layer_idx}.stochastic.conditional_layer.qy_x.3.weight"
+        weight = state_dict.get(key)
+        if weight is None or weight.ndim != 2:
+            continue
+
+        in_features = int(weight.shape[1])
+        base = in_features / int(z_dim)
+        size = round(base ** (1 / int(model_config.conv_mult)))
+        if int(z_dim) * (size ** int(model_config.conv_mult)) != in_features:
+            print(
+                f"Warning: could not infer feature_spatial_size for layer {layer_idx} "
+                f"from checkpoint weight shape {tuple(weight.shape)}."
+            )
+            continue
+
+        inferred[layer_idx] = size
+        found_any = True
+
+    return inferred if found_any else None
+
+
+def _model_config_for_checkpoint(
+    ckpt_path: Path,
+    experiment_model_config: LVAEConfig,
+) -> LVAEConfig:
+    try:
+        checkpoint = _load_checkpoint_metadata(ckpt_path)
+    except Exception as exc:
+        print(
+            f"Warning: could not inspect checkpoint metadata for {ckpt_path}; "
+            f"using experiment model config. Error: {exc}"
+        )
+        return experiment_model_config
+
+    model_config = experiment_model_config
+    checkpoint_model_config = checkpoint.get("hyper_parameters", {}).get("model_config")
+    if isinstance(checkpoint_model_config, dict):
+        try:
+            model_config = LVAEConfig(**checkpoint_model_config)
+            if model_config.feature_spatial_size != experiment_model_config.feature_spatial_size:
+                print(
+                    "Using model config saved in checkpoint: "
+                    f"feature_spatial_size={model_config.feature_spatial_size} "
+                    f"(experiment YAML has {experiment_model_config.feature_spatial_size})."
+                )
+        except Exception as exc:
+            print(
+                f"Warning: could not parse model config saved in checkpoint {ckpt_path}; "
+                f"using experiment model config. Error: {exc}"
+            )
+            model_config = experiment_model_config
+
+    inferred_feature_spatial_size = _infer_feature_spatial_size_from_state_dict(
+        checkpoint.get("state_dict", {}),
+        model_config,
+    )
+    if inferred_feature_spatial_size and inferred_feature_spatial_size != model_config.feature_spatial_size:
+        print(
+            "Adjusting feature_spatial_size from checkpoint weights: "
+            f"{model_config.feature_spatial_size} -> {inferred_feature_spatial_size}."
+        )
+        model_config = model_config.model_copy(
+            update={"feature_spatial_size": inferred_feature_spatial_size}
+        )
+
+    return model_config
 
 class PredictionWriterCallback(BasePredictionWriter):
     """
@@ -308,8 +392,12 @@ def test_predict(exp_config: ExperimentConfig,
                 print(f"Setting random seed to {seed} for {mode} with checkpoint {ckpt_path.name}...")
                 L.seed_everything(seed, workers=True)
             
+            checkpoint_model_config = _model_config_for_checkpoint(
+                ckpt_path=ckpt_path,
+                experiment_model_config=model_config,
+            )
             model = LVAEModel.load_from_checkpoint(str(ckpt_path),
-                                        model_cfg=model_config,
+                                        model_cfg=checkpoint_model_config,
                                         train_cfg=train_config)
             model.eval()
             devices = 1 if mode == "test" else "auto"
