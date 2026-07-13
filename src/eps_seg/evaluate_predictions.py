@@ -1,5 +1,6 @@
 import argparse
 import re
+from collections import Counter
 from pathlib import Path
 
 import matplotlib
@@ -88,10 +89,34 @@ def dice_scores(gt_image: np.ndarray, pred_image: np.ndarray) -> tuple[float, di
 
 
 def read_slice(path: Path, pred_slice: int) -> np.ndarray:
-    image = tiff.imread(path)
-    if image.ndim < 3:
-        return image
-    return image[pred_slice]
+    with tiff.TiffFile(path) as tif:
+        series = tif.series[0]
+        if len(series.shape) < 3:
+            return np.asarray(series.asarray()).copy()
+
+        if len(tif.pages) > pred_slice and tif.pages[0].shape == tuple(series.shape[1:]):
+            return np.asarray(tif.pages[pred_slice].asarray()).copy()
+
+        image = series.asarray()
+        return np.asarray(image[pred_slice]).copy()
+
+
+def write_results_csvs(
+    rows: list[dict[str, object]],
+    out_result_folder: Path,
+    pred_slice: int,
+) -> tuple[pd.DataFrame, Path]:
+    results_df = pd.DataFrame(rows)
+    results_path = out_result_folder / f"results_{pred_slice}.csv"
+    selected_results_path = out_result_folder / f"selected_results_{pred_slice}.csv"
+
+    results_df.to_csv(results_path, index=False)
+    if "SelectedByRule" in results_df.columns:
+        results_df[results_df["SelectedByRule"]].to_csv(selected_results_path, index=False)
+    else:
+        pd.DataFrame().to_csv(selected_results_path, index=False)
+
+    return results_df, results_path
 
 
 def save_prediction_grid(
@@ -99,6 +124,7 @@ def save_prediction_grid(
     checkpoint_names: list[str],
     out_path: Path,
     title: str,
+    max_cells: int,
 ) -> None:
     if not predictions or not checkpoint_names:
         return
@@ -106,6 +132,13 @@ def save_prediction_grid(
     sns.set_theme(context="paper", style="white", font_scale=1.0, rc={"axes.linewidth": 0.5})
     n_rows = len(predictions)
     n_cols = len(checkpoint_names)
+    if n_rows * n_cols > max_cells:
+        print(
+            f"Skipping {out_path.name}: grid would contain {n_rows * n_cols} panels "
+            f"({n_rows} experiments x {n_cols} checkpoints), above --max_grid_cells={max_cells}."
+        )
+        return
+
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -129,6 +162,9 @@ def save_prediction_grid(
 
 
 def save_selected_barplot(results_df: pd.DataFrame, out_path: Path) -> None:
+    if "SelectedByRule" not in results_df.columns:
+        return
+
     selected = results_df[results_df["SelectedByRule"]].copy()
     if selected.empty:
         return
@@ -151,6 +187,11 @@ def evaluate(
     pred_slice: int = PRED_SLICE,
     pred_key: str = PRED_KEY,
     gt_tiff: str = GT_TIFF,
+    experiment_regex: str | None = None,
+    selected_only: bool = False,
+    save_prediction_grids: bool = False,
+    save_plots: bool = True,
+    max_grid_cells: int = 120,
 ) -> Path:
     exp_root_path = Path(exp_root)
     if not list(exp_root_path.glob("exp_*.yaml")) and (exp_root_path / "experiment_config").is_dir():
@@ -158,6 +199,10 @@ def evaluate(
 
     ablation_name = exp_root_path.name
     exp_yaml_files = sorted(exp_root_path.glob("exp_*.yaml"))
+    if experiment_regex is not None:
+        pattern = re.compile(experiment_regex)
+        exp_yaml_files = [path for path in exp_yaml_files if pattern.search(path.stem)]
+
     if not exp_yaml_files:
         raise FileNotFoundError(
             f"No exp_*.yaml files found in {exp_root_path}. "
@@ -172,15 +217,30 @@ def evaluate(
     predictions: dict[str, dict[str, np.ndarray]] = {}
     rows: list[dict[str, object]] = []
     selected_predictions: dict[str, dict[str, np.ndarray]] = {}
+    checkpoint_counts: Counter[str] = Counter()
+    total_discovered_checkpoints = 0
+    total_evaluated_checkpoints = 0
+    results_df = pd.DataFrame()
+    results_path = out_result_folder / f"results_{pred_slice}.csv"
 
     for exp_yaml in exp_yaml_files:
         exp = ExperimentConfig.from_yaml(str(exp_yaml))
         predictions_root = exp.outputs_dir / "predictions"
         checkpoint_names = discover_prediction_checkpoints(predictions_root, pred_key)
         selected = selected_checkpoint(checkpoint_names)
-        predictions[exp.experiment_name] = {}
+        checkpoints_to_evaluate = [selected] if selected_only and selected is not None else checkpoint_names
 
-        if not checkpoint_names:
+        total_discovered_checkpoints += len(checkpoint_names)
+        for checkpoint_name in checkpoint_names:
+            match = CHECKPOINT_PATTERN.match(checkpoint_name)
+            checkpoint_counts[
+                f"{match.group('kind')}_{match.group('mode')}" if match is not None else checkpoint_name
+            ] += 1
+
+        if save_prediction_grids:
+            predictions[exp.experiment_name] = {}
+
+        if not checkpoints_to_evaluate:
             rows.append(
                 {
                     "Experiment": exp.experiment_name,
@@ -193,14 +253,18 @@ def evaluate(
                 }
             )
             print(f"No predictions found for {exp.experiment_name}")
+            results_df, results_path = write_results_csvs(rows, out_result_folder, pred_slice)
             continue
 
-        for checkpoint in checkpoint_names:
+        for checkpoint in checkpoints_to_evaluate:
             pred_path = predictions_root / checkpoint / pred_key
             print(f"Evaluating {exp.experiment_name} at {checkpoint}")
             pred_image = read_slice(pred_path, pred_slice)
-            predictions[exp.experiment_name][checkpoint] = pred_image
             avg_dice, per_class, evaluated_pixels = dice_scores(gt_image, pred_image)
+            total_evaluated_checkpoints += 1
+
+            if save_prediction_grids:
+                predictions[exp.experiment_name][checkpoint] = pred_image
 
             row = {
                 "Experiment": exp.experiment_name,
@@ -215,37 +279,50 @@ def evaluate(
                 row[f"DSC_Class_{class_idx}"] = dice
             rows.append(row)
 
-        if selected is not None and selected in predictions[exp.experiment_name]:
+            if not save_prediction_grids:
+                del pred_image
+
+        if save_prediction_grids and selected is not None and selected in predictions[exp.experiment_name]:
             selected_predictions[exp.experiment_name] = {selected: predictions[exp.experiment_name][selected]}
 
-    results_df = pd.DataFrame(rows)
-    results_path = out_result_folder / f"results_{pred_slice}.csv"
-    selected_results_path = out_result_folder / f"selected_results_{pred_slice}.csv"
-    results_df.to_csv(results_path, index=False)
-    if "SelectedByRule" in results_df.columns:
-        results_df[results_df["SelectedByRule"]].to_csv(selected_results_path, index=False)
-    else:
-        pd.DataFrame().to_csv(selected_results_path, index=False)
+        results_df, results_path = write_results_csvs(rows, out_result_folder, pred_slice)
 
-    all_checkpoints = sorted(
-        {checkpoint for preds in predictions.values() for checkpoint in preds},
-        key=checkpoint_sort_key,
-    )
-    save_prediction_grid(
-        predictions=predictions,
-        checkpoint_names=all_checkpoints,
-        out_path=out_result_folder / f"prediction_grid_{pred_slice}.png",
-        title=f"{ablation_name} predictions",
-    )
-    save_prediction_grid(
-        predictions=selected_predictions,
-        checkpoint_names=sorted({next(iter(preds)) for preds in selected_predictions.values()}, key=checkpoint_sort_key),
-        out_path=out_result_folder / f"selected_prediction_grid_{pred_slice}.png",
-        title=f"{ablation_name} selected predictions",
-    )
-    save_selected_barplot(results_df, out_result_folder / f"selected_dice_{pred_slice}.png")
+    if rows:
+        results_df, results_path = write_results_csvs(rows, out_result_folder, pred_slice)
+
+    if save_plots and not results_df.empty:
+        if save_prediction_grids:
+            all_checkpoints = sorted(
+                {checkpoint for preds in predictions.values() for checkpoint in preds},
+                key=checkpoint_sort_key,
+            )
+            save_prediction_grid(
+                predictions=predictions,
+                checkpoint_names=all_checkpoints,
+                out_path=out_result_folder / f"prediction_grid_{pred_slice}.png",
+                title=f"{ablation_name} predictions",
+                max_cells=max_grid_cells,
+            )
+            save_prediction_grid(
+                predictions=selected_predictions,
+                checkpoint_names=sorted(
+                    {next(iter(preds)) for preds in selected_predictions.values()},
+                    key=checkpoint_sort_key,
+                ),
+                out_path=out_result_folder / f"selected_prediction_grid_{pred_slice}.png",
+                title=f"{ablation_name} selected predictions",
+                max_cells=max_grid_cells,
+            )
+        save_selected_barplot(results_df, out_result_folder / f"selected_dice_{pred_slice}.png")
 
     print(f"Wrote evaluation results to {results_path}")
+    print(
+        f"Found {total_discovered_checkpoints} prediction checkpoint folders containing {pred_key} "
+        f"across {len(exp_yaml_files)} experiment configs; evaluated {total_evaluated_checkpoints}."
+    )
+    if checkpoint_counts:
+        summary = ", ".join(f"{name}: {count}" for name, count in sorted(checkpoint_counts.items()))
+        print(f"Checkpoint breakdown: {summary}")
     return results_path
 
 
@@ -256,6 +333,33 @@ def main() -> None:
     parser.add_argument("--pred_slice", type=int, default=PRED_SLICE)
     parser.add_argument("--pred_key", type=str, default=PRED_KEY)
     parser.add_argument("--gt_tiff", type=str, default=GT_TIFF)
+    parser.add_argument(
+        "--experiment_regex",
+        type=str,
+        default=None,
+        help="Optional regex matched against exp_*.yaml stems before evaluation.",
+    )
+    parser.add_argument(
+        "--selected_only",
+        action="store_true",
+        help="Evaluate only the selected checkpoint per experiment (best_semisupervised, then best_supervised).",
+    )
+    parser.add_argument(
+        "--save_prediction_grids",
+        action="store_true",
+        help="Save prediction image grids. Disabled by default to keep full-suite evaluation memory-safe.",
+    )
+    parser.add_argument(
+        "--skip_plots",
+        action="store_true",
+        help="Skip all plots and write only CSV outputs.",
+    )
+    parser.add_argument(
+        "--max_grid_cells",
+        type=int,
+        default=120,
+        help="Maximum number of panels allowed in a prediction grid.",
+    )
     args = parser.parse_args()
     evaluate(
         exp_root=args.exp_root,
@@ -263,6 +367,11 @@ def main() -> None:
         pred_slice=args.pred_slice,
         pred_key=args.pred_key,
         gt_tiff=args.gt_tiff,
+        experiment_regex=args.experiment_regex,
+        selected_only=args.selected_only,
+        save_prediction_grids=args.save_prediction_grids,
+        save_plots=not args.skip_plots,
+        max_grid_cells=args.max_grid_cells,
     )
 
 
