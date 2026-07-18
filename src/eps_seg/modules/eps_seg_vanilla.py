@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple, Type, Union
+from typing import Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -697,6 +697,7 @@ class EpsSegVanilla(nn.Module):
         y=None,
         validation_mode=False,
         confidence_threshold=0.99,
+        confidence_direction: Literal["above", "below"] = "above",
         mask_input: Optional[bool] = None,
         use_pseudo_labels: bool = False,
     ):
@@ -723,7 +724,10 @@ class EpsSegVanilla(nn.Module):
 
         if self.training_mode == "semisupervised" and (self.training or use_pseudo_labels):
             pseudo_labels = self.get_pseudo_labels(
-                td_data["mu"][-1], y, threshold=confidence_threshold
+                td_data["mu"][-1],
+                y,
+                threshold=confidence_threshold,
+                confidence_direction=confidence_direction,
             )
         else:
             pseudo_labels = y
@@ -947,7 +951,13 @@ class EpsSegVanilla(nn.Module):
         logits = self.segmentation_head(feature_subset)
         return logits, feature_subset
 
-    def get_pseudo_labels(self, innermost_mu, label, threshold=0.99):
+    def get_pseudo_labels(
+        self,
+        innermost_mu,
+        label,
+        threshold=0.99,
+        confidence_direction: Literal["above", "below"] = "above",
+    ):
         batch_size = innermost_mu.shape[0]
         group_size = 0
         while label[group_size + 1] == -1:
@@ -996,7 +1006,12 @@ class EpsSegVanilla(nn.Module):
         logits = logits - logits.max(dim=1, keepdim=True).values
         probs = F.softmax(logits, dim=1)
         conf, pseudo = probs.max(dim=1)
-        accept = conf > threshold
+        if confidence_direction == "above":
+            accept = conf > threshold
+        elif confidence_direction == "below":
+            accept = conf < threshold
+        else:
+            raise ValueError(f"Unknown pseudo-label confidence direction: {confidence_direction}")
         pseudo[~accept] = -1
         pseudo[anchors] = label[anchors].long()
         return pseudo
