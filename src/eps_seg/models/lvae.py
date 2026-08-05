@@ -24,6 +24,17 @@ class LVAEModel(L.LightningModule):
         self.model.register_buffer("data_mean", torch.tensor(0.0))
         self.model.register_buffer("data_std", torch.tensor(0.0))        
         self.register_buffer("seen_samples", torch.zeros(1, dtype=torch.long))
+        initial_confidence_threshold = (
+            float(train_cfg.model_confidence_threshold) if train_cfg is not None else 0.75
+        )
+        self.register_buffer(
+            "current_model_confidence_threshold",
+            torch.tensor(initial_confidence_threshold, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "semisupervised_threshold_epoch_count",
+            torch.zeros(1, dtype=torch.long),
+        )
 
         self.save_hyperparameters({"model_config": model_cfg.model_dump(), 
                                    "train_config": train_cfg.model_dump() if train_cfg else None})
@@ -159,12 +170,46 @@ class LVAEModel(L.LightningModule):
                 summary[f"{output_key}_std"] = torch.stack(layer_stds, dim=1).cpu().numpy().astype(np.float32)
         return summary
 
+    def _current_confidence_threshold(self) -> float:
+        return float(self.current_model_confidence_threshold.detach().item())
+
+    def _pseudo_label_confidence_direction(self) -> Literal["above", "below"]:
+        if self.train_cfg is None:
+            return "above"
+        return self.train_cfg.pseudo_label_confidence_direction
+
+    def _update_pseudo_label_threshold(self) -> None:
+        if self.train_cfg is None:
+            return
+        if self.current_training_mode != "semisupervised":
+            return
+        target = self.train_cfg.model_confidence_threshold_end
+        if target is None:
+            return
+
+        self.semisupervised_threshold_epoch_count += 1
+        epoch_count = int(self.semisupervised_threshold_epoch_count.item())
+        if epoch_count % self.train_cfg.model_confidence_threshold_step_epochs != 0:
+            return
+
+        current = self._current_confidence_threshold()
+        if abs(current - target) < 1e-8:
+            return
+
+        step = abs(float(self.train_cfg.model_confidence_threshold_step))
+        if target > current:
+            next_threshold = min(current + step, target)
+        else:
+            next_threshold = max(current - step, target)
+        self.current_model_confidence_threshold.fill_(float(next_threshold))
+
     def forward(
         self,
         x,
         y=None,
         validation_mode: bool = False,
         confidence_threshold: float = 0.99,
+        confidence_direction: Literal["above", "below"] = "above",
         mask_input: bool | None = None,
         use_pseudo_labels: bool = False,
     ):
@@ -189,6 +234,7 @@ class LVAEModel(L.LightningModule):
             y=y,
             validation_mode=validation_mode,
             confidence_threshold=confidence_threshold,
+            confidence_direction=confidence_direction,
             mask_input=mask_input,
             use_pseudo_labels=use_pseudo_labels,
         )
@@ -204,6 +250,20 @@ class LVAEModel(L.LightningModule):
         else:
             print("Using existing data statistics from checkpoint.")
         print("Seen samples:", self.seen_samples.item())
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        state_dict = checkpoint.setdefault("state_dict", {})
+        state_dict.setdefault(
+            "current_model_confidence_threshold",
+            torch.tensor(
+                float(self.train_cfg.model_confidence_threshold) if self.train_cfg is not None else 0.75,
+                dtype=torch.float32,
+            ),
+        )
+        state_dict.setdefault(
+            "semisupervised_threshold_epoch_count",
+            torch.zeros(1, dtype=torch.long),
+        )
 
     def log_step(self, outputs: dict, step: Literal["train", "val", "test"], batch: dict):
         log_lvae_step(self, outputs, step, batch)
@@ -254,7 +314,8 @@ class LVAEModel(L.LightningModule):
             x,
             y,
             validation_mode=False,
-            confidence_threshold=self.train_cfg.model_confidence_threshold,
+            confidence_threshold=self._current_confidence_threshold(),
+            confidence_direction=self._pseudo_label_confidence_direction(),
         )
         outputs["loss"] = self.compute_total_loss(outputs)
 
@@ -282,6 +343,15 @@ class LVAEModel(L.LightningModule):
                 on_epoch=True,
                 sync_dist=True,
             )
+        if self.train_cfg is not None:
+            self.log(
+                "train/pseudo_label_threshold",
+                self.current_model_confidence_threshold,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
 
         log_trainer_state(self)
         log_scheduler_stats(self)
@@ -295,7 +365,8 @@ class LVAEModel(L.LightningModule):
         outputs = self.forward(x, 
                              y, 
                              validation_mode=True, 
-                             confidence_threshold=self.train_cfg.model_confidence_threshold,
+                             confidence_threshold=self._current_confidence_threshold(),
+                             confidence_direction=self._pseudo_label_confidence_direction(),
                              use_pseudo_labels=(
                                  self.current_training_mode == "semisupervised"
                                  and validation_variant in {"spatial_pl", "random_pl"}
@@ -358,6 +429,7 @@ class LVAEModel(L.LightningModule):
 
     def on_train_epoch_end(self):
         log_epoch_dice_scores(self, "train", self.train_dice_score, mean_prog_bar=False)
+        self._update_pseudo_label_threshold()
 
     def on_validation_epoch_end(self):
         log_epoch_dice_scores(self, "val", self.validation_dice_score, mean_prog_bar=True)

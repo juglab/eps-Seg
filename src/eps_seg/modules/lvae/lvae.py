@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from typing import Optional, Type, Union
+from typing import Literal, Optional, Type, Union
 from eps_seg.modules.lvae.likelihoods import GaussianLikelihood
 import torch.nn.functional as F
 
@@ -252,6 +252,7 @@ class LadderVAE(nn.Module):
         y=None,
         validation_mode=False,
         confidence_threshold=0.99,
+        confidence_direction: Literal["above", "below"] = "above",
         mask_input: Optional[bool] = None,
         use_pseudo_labels: bool = False,
     ):
@@ -263,9 +264,8 @@ class LadderVAE(nn.Module):
             y: Optional labels tensor
             validation_mode: Whether we are in validation mode (used to mask input and compute losses)
             confidence_threshold: Confidence threshold for assigning pseudo-labels.
-                During semisupervised training the staged scheduler already
-                decides which samples enter the batch, so every unlabeled input
-                in the batch is pseudo-labeled regardless of this threshold.
+            confidence_direction: Whether pseudo-labels are accepted above or
+                below the configured confidence threshold.
             mask_input: Optional override for input masking. When ``None``, masking
                 follows the old ``self.training or validation_mode`` rule.
             use_pseudo_labels: Whether to infer hard pseudo-label targets outside
@@ -305,6 +305,7 @@ class LadderVAE(nn.Module):
                 td_data["posterior"],
                 y,
                 threshold=confidence_threshold,
+                confidence_direction=confidence_direction,
             )
         else:
             pseudo_labels = y
@@ -601,15 +602,11 @@ class LadderVAE(nn.Module):
         posteriors,
         label,
         threshold=0.99,
+        confidence_direction: Literal["above", "below"] = "above",
     ):
         """
-        Assign pseudo-labels to all unlabeled batch rows from the current batch
-        anchors.
-
-        The ``threshold`` argument is kept for interface compatibility, but the
-        staged training loop now relies on the external scheduler to decide
-        which samples are admitted to training. Once a sample is in the batch,
-        the model assigns it a pseudo-label even if confidence is low.
+        Assign pseudo-labels to unlabeled batch rows from the current batch
+        anchors when their consolidated confidence passes the configured gate.
         """
         anchors = torch.where(label != -1)[0]
 
@@ -667,10 +664,16 @@ class LadderVAE(nn.Module):
         masked_probs = probs * expert_mask.unsqueeze(-1)
         n_valid_experts = expert_mask.sum(dim=0)
         moe_probs = masked_probs.sum(dim=0) / n_valid_experts.clamp(min=1).unsqueeze(1)
-        _, moe_label = moe_probs.max(dim=1)
+        moe_confidence, moe_label = moe_probs.max(dim=1)
 
         final_pseudo = torch.full_like(label, -1, dtype=torch.long)
-        assignable = n_valid_experts > 0
+        if confidence_direction == "above":
+            confidence_mask = moe_confidence > threshold
+        elif confidence_direction == "below":
+            confidence_mask = moe_confidence < threshold
+        else:
+            raise ValueError(f"Unknown pseudo-label confidence direction: {confidence_direction}")
+        assignable = (n_valid_experts > 0) & confidence_mask
         final_pseudo[assignable] = moe_label[assignable]
         final_pseudo[anchors] = selected_labels
 

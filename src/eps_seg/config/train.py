@@ -199,6 +199,28 @@ class TrainConfig(BaseEPSConfig):
         default=0.75,
         description="Confidence threshold passed to the LVAE when it internally reasons over unlabeled samples.",
     )
+    pseudo_label_confidence_direction: Literal["above", "below"] = Field(
+        default="above",
+        description=(
+            "Direction used by internal pseudo-label confidence gating. "
+            "'above' keeps high-confidence pseudo-labels; 'below' keeps low-confidence pseudo-labels."
+        ),
+    )
+    model_confidence_threshold_end: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional final confidence threshold for semisupervised threshold annealing. "
+            "When omitted, model_confidence_threshold stays static."
+        ),
+    )
+    model_confidence_threshold_step: float = Field(
+        default=0.005,
+        description="Absolute threshold step used when annealing toward model_confidence_threshold_end.",
+    )
+    model_confidence_threshold_step_epochs: int = Field(
+        default=1,
+        description="Number of semisupervised epochs between threshold annealing steps.",
+    )
     validation_use_pseudolabel_neighbors: bool = Field(
         default=False,
         description=(
@@ -312,6 +334,12 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError("min_initial_label_fraction must be between 0 and 1.")
         if not 0.0 <= self.model_confidence_threshold <= 1.0:
             raise ValueError("model_confidence_threshold must be between 0 and 1.")
+        if self.model_confidence_threshold_end is not None and not 0.0 <= self.model_confidence_threshold_end <= 1.0:
+            raise ValueError("model_confidence_threshold_end must be between 0 and 1 when provided.")
+        if self.model_confidence_threshold_step <= 0.0:
+            raise ValueError("model_confidence_threshold_step must be > 0.")
+        if self.model_confidence_threshold_step_epochs < 1:
+            raise ValueError("model_confidence_threshold_step_epochs must be >= 1.")
         if self.rows_per_extension < 0:
             raise ValueError("rows_per_extension must be >= 0.")
         if self.candidate_evaluation_budget is not None and self.candidate_evaluation_budget < 0:
