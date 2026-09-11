@@ -291,6 +291,44 @@ class TrainConfig(BaseEPSConfig):
             "50% unlabeled neighbor patches."
         ),
     )
+    deterministic_neighbor_selection: bool = Field(
+        default=False,
+        description=(
+            "Whether neighbor-semisupervised training should emit a fixed contiguous "
+            "window of stored neighbors instead of randomly sampling per anchor access."
+        ),
+    )
+    neighbor_selection_start_index: int = Field(
+        default=0,
+        description=(
+            "Zero-based first stored-neighbor index used when deterministic neighbor "
+            "selection is enabled."
+        ),
+    )
+    neighbor_unlabeled_curriculum_step_size: int = Field(
+        default=0,
+        description=(
+            "If greater than zero, run neighbor semisupervised training as a cumulative "
+            "unlabeled-pool curriculum with this many additional unlabeled neighbor "
+            "patches per phase."
+        ),
+    )
+    neighbor_unlabeled_curriculum_max_samples: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum number of unlabeled neighbor patches to expose in the cumulative "
+            "neighbor curriculum. Required when neighbor_unlabeled_curriculum_step_size "
+            "is greater than zero."
+        ),
+    )
+    neighbor_unlabeled_curriculum_seed: Optional[int] = Field(
+        default=None,
+        description=(
+            "Seed used to deterministically shuffle the full unlabeled neighbor pool "
+            "before taking cumulative prefixes. Defaults to the semisupervised seed, "
+            "then the dataset seed."
+        ),
+    )
     neighbor_supervised_max_epochs: Optional[int] = Field(
         default=None,
         description=(
@@ -352,6 +390,31 @@ class TrainConfig(BaseEPSConfig):
             raise ValueError(
                 "neighbor_samples_per_anchor must be one of {1, 3, 7}, "
                 "so each anchor group has 2, 4, or 8 patches."
+            )
+        if self.neighbor_selection_start_index < 0:
+            raise ValueError("neighbor_selection_start_index must be >= 0.")
+        if self.neighbor_unlabeled_curriculum_step_size < 0:
+            raise ValueError("neighbor_unlabeled_curriculum_step_size must be >= 0.")
+        if (
+            self.neighbor_unlabeled_curriculum_max_samples is not None
+            and self.neighbor_unlabeled_curriculum_max_samples < 1
+        ):
+            raise ValueError("neighbor_unlabeled_curriculum_max_samples must be >= 1 when provided.")
+        if (
+            self.neighbor_unlabeled_curriculum_step_size > 0
+            and self.neighbor_unlabeled_curriculum_max_samples is None
+        ):
+            raise ValueError(
+                "neighbor_unlabeled_curriculum_max_samples is required when "
+                "neighbor_unlabeled_curriculum_step_size > 0."
+            )
+        if (
+            self.neighbor_unlabeled_curriculum_step_size > 0
+            and self.neighbor_samples_per_anchor != 1
+        ):
+            raise ValueError(
+                "neighbor_unlabeled_curriculum_step_size > 0 requires "
+                "neighbor_samples_per_anchor=1 to keep batches 50% anchors and 50% unlabeled."
             )
         if self.neighbor_supervised_max_epochs is not None and self.neighbor_supervised_max_epochs < 1:
             raise ValueError("neighbor_supervised_max_epochs must be >= 1 when provided.")

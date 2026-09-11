@@ -68,14 +68,19 @@ def build_model_for_stage(
     return model
 
 
-def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str, stage_idx: int | None):
+def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str, stage_idx: int | str | None):
     """
         Build the experiment logger for one stage run.
 
         Each stage gets its own logger name so curves and checkpoints can be
         inspected stage by stage.
     """
-    logger_name = f"{exp_config.experiment_name}_{mode}" if stage_idx is None else f"{exp_config.experiment_name}_{mode}_K{stage_idx}"
+    if stage_idx is None:
+        logger_name = f"{exp_config.experiment_name}_{mode}"
+    elif isinstance(stage_idx, int):
+        logger_name = f"{exp_config.experiment_name}_{mode}_K{stage_idx}"
+    else:
+        logger_name = f"{exp_config.experiment_name}_{mode}_{stage_idx}"
     if train_cfg.use_wandb:
         return WandbLogger(
             name=logger_name,
@@ -259,13 +264,32 @@ def train_neighbor_phase(
     fit_dataset_mode: Literal["supervised", "semisupervised"],
     max_epochs: int,
     ckpt_path: Path | None = None,
+    weights_checkpoint_path: Path | None = None,
+    training_state_checkpoint_path: Path | None = None,
+    best_ckpt_path: Path | None = None,
+    last_ckpt_path: Path | None = None,
+    checkpoint_tag: str | None = None,
+    neighbor_selection_start_index: int | None = None,
+    neighbor_unlabeled_limit: int | None = None,
+    phase_index: int | None = None,
+    carry_best_score: bool = False,
 ) -> tuple[Path, Path]:
     """
         Train one non-staged neighbor-SSL phase.
 
         When ``ckpt_path`` is provided, Lightning resumes the full training
         state from that checkpoint, including optimizer and LR scheduler state.
+        When ``weights_checkpoint_path`` is provided instead, model weights are
+        loaded from that checkpoint and selected optimizer/training state can
+        be transferred without restoring the already-finished trainer loop.
     """
+    if ckpt_path is not None and (
+        weights_checkpoint_path is not None or training_state_checkpoint_path is not None
+    ):
+        raise ValueError(
+            "ckpt_path cannot be combined with weights_checkpoint_path or training_state_checkpoint_path."
+        )
+
     train_cfg, dataset_cfg, model_cfg = exp_config.get_configs()
     strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
     seed = train_cfg.semisupervised_seed if mode == "semisupervised" else train_cfg.supervised_seed
@@ -273,21 +297,45 @@ def train_neighbor_phase(
         print(f"Setting random seed to {seed} for neighbor {mode} phase...")
         L.seed_everything(seed, workers=True)
 
+    stage_seed_index = int(phase_index) if phase_index is not None else (
+        int(neighbor_selection_start_index)
+        if neighbor_selection_start_index is not None
+        else int(train_cfg.neighbor_selection_start_index)
+    )
     dm = EPSSegDataModule(
         cfg=dataset_cfg,
         train_cfg=train_cfg,
         model_cfg=model_cfg,
         scheduler_path=None,
-        scheduler_stage_index=0,
+        scheduler_stage_index=stage_seed_index,
         fit_dataset_kind="neighbor",
         fit_dataset_mode=fit_dataset_mode,
+        neighbor_selection_start_index=neighbor_selection_start_index,
+        neighbor_unlabeled_limit=neighbor_unlabeled_limit,
     )
-    model = LVAEModel(model_cfg=model_cfg, train_cfg=train_cfg)
-    model.update_mode(mode)
+    if weights_checkpoint_path is not None:
+        model = build_model_for_stage(
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            mode=mode,
+            weights_checkpoint_path=str(weights_checkpoint_path),
+        )
+    else:
+        model = LVAEModel(model_cfg=model_cfg, train_cfg=train_cfg)
+        model.update_mode(mode)
+    model.current_stage_idx = stage_seed_index
 
-    best_ckpt_path = exp_config.checkpoint_path(mode, "best")
-    last_ckpt_path = exp_config.checkpoint_path(mode, "last")
+    best_ckpt_path = best_ckpt_path or exp_config.checkpoint_path(mode, "best")
+    last_ckpt_path = last_ckpt_path or exp_config.checkpoint_path(mode, "last")
     best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if carry_best_score:
+        if weights_checkpoint_path is None:
+            raise ValueError("carry_best_score requires weights_checkpoint_path.")
+        previous_best_path = Path(weights_checkpoint_path)
+        if not previous_best_path.exists():
+            raise FileNotFoundError(f"Previous neighbor best checkpoint not found: {previous_best_path}")
+        shutil.copy2(previous_best_path, best_ckpt_path)
 
     best_checkpoint = ModelCheckpoint(
         monitor=train_cfg.monitored_metric,
@@ -309,7 +357,28 @@ def train_neighbor_phase(
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
-    logger = build_logger(exp_config, train_cfg, mode, stage_idx=None)
+    if training_state_checkpoint_path is not None:
+        callbacks.append(
+            OptimizerStateTransferCallback(
+                checkpoint_path=str(training_state_checkpoint_path),
+                restore_optimizer=True,
+                restore_lr_scheduler=True,
+                restore_precision=train_cfg.amp,
+                restore_module_buffers=True,
+                strict_counts=True,
+            )
+        )
+    if carry_best_score:
+        callbacks.append(
+            StageMetricCarryoverCallback(
+                reference_checkpoint_path=str(weights_checkpoint_path),
+                carried_best_path=str(best_ckpt_path),
+                monitor=train_cfg.monitored_metric,
+                mode=train_cfg.monitored_metric_mode,
+            )
+        )
+
+    logger = build_logger(exp_config, train_cfg, mode, stage_idx=checkpoint_tag)
     trainer = L.Trainer(
         devices="auto",
         strategy=strategy,
@@ -327,6 +396,22 @@ def train_neighbor_phase(
     fit_ckpt_path = str(ckpt_path) if ckpt_path is not None else None
     if fit_ckpt_path is not None:
         print(f"Resuming neighbor {mode} phase from checkpoint: {fit_ckpt_path}")
+    if (
+        fit_dataset_mode == "semisupervised"
+        and train_cfg.deterministic_neighbor_selection
+        and neighbor_selection_start_index is not None
+    ):
+        print(
+            "Using deterministic neighbor selection window: "
+            f"start_index={neighbor_selection_start_index}, "
+            f"samples_per_anchor={train_cfg.neighbor_samples_per_anchor}"
+        )
+    if fit_dataset_mode == "semisupervised" and neighbor_unlabeled_limit is not None:
+        print(
+            "Using cumulative unlabeled neighbor pool: "
+            f"{neighbor_unlabeled_limit} unlabeled neighbor patches, "
+            f"samples_per_anchor={train_cfg.neighbor_samples_per_anchor}"
+        )
     trainer.fit(model, datamodule=dm, ckpt_path=fit_ckpt_path)
     trainer.save_checkpoint(last_ckpt_path)
     print(f"Completed neighbor {mode} phase. Best: {best_checkpoint.best_model_path} | Last: {last_ckpt_path}")
@@ -341,7 +426,8 @@ def train_neighbor_phase(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return Path(best_checkpoint.best_model_path), last_ckpt_path
+    best_model_path = Path(best_checkpoint.best_model_path) if best_checkpoint.best_model_path else best_ckpt_path
+    return best_model_path, last_ckpt_path
 
 
 def evaluate_scheduler_extension(
@@ -665,14 +751,207 @@ def archive_path(path: Path, timestamp: str) -> Path:
 
 def archive_neighbor_semisupervised_outputs(exp_config: ExperimentConfig) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for path in (
+    checkpoint_dir = exp_config.checkpoint_path("semisupervised", "best").parent
+    prediction_dir = exp_config.outputs_dir / "predictions"
+    paths = [
         exp_config.checkpoint_path("semisupervised", "best"),
         exp_config.checkpoint_path("semisupervised", "last"),
         exp_config.outputs_dir / "predictions" / "best_semisupervised",
         exp_config.outputs_dir / "predictions" / "last_semisupervised",
-    ):
+    ]
+    if checkpoint_dir.exists():
+        paths.extend(sorted(checkpoint_dir.glob("*_semisupervised_N*.ckpt")))
+        paths.extend(sorted(checkpoint_dir.glob("*_semisupervised_U*.ckpt")))
+    if prediction_dir.exists():
+        paths.extend(sorted(prediction_dir.glob("*_semisupervised_N*")))
+        paths.extend(sorted(prediction_dir.glob("*_semisupervised_U*")))
+
+    for path in dict.fromkeys(paths):
         if path.exists():
             archive_path(path, timestamp)
+
+
+def neighbor_unlabeled_curriculum_checkpoint_path(
+    exp_config: ExperimentConfig,
+    unlabeled_count: int,
+    kind: Literal["best", "last"],
+) -> Path:
+    train_cfg, _, _ = exp_config.get_configs()
+    return (
+        exp_config.checkpoints_dir.resolve()
+        / exp_config.experiment_name
+        / train_cfg.model_name
+        / f"{kind}_semisupervised_U{int(unlabeled_count)}.ckpt"
+    )
+
+
+def neighbor_unlabeled_curriculum_counts(train_cfg: TrainConfig) -> list[int]:
+    step_size = int(train_cfg.neighbor_unlabeled_curriculum_step_size)
+    if step_size <= 0:
+        return []
+    max_samples = train_cfg.neighbor_unlabeled_curriculum_max_samples
+    if max_samples is None:
+        raise ValueError(
+            "neighbor_unlabeled_curriculum_max_samples is required when "
+            "neighbor_unlabeled_curriculum_step_size > 0."
+        )
+
+    counts = list(range(step_size, int(max_samples) + 1, step_size))
+    if not counts or counts[-1] != int(max_samples):
+        counts.append(int(max_samples))
+    return counts
+
+
+def latest_completed_neighbor_unlabeled_curriculum_phase(
+    exp_config: ExperimentConfig,
+    unlabeled_counts: list[int],
+) -> int:
+    train_cfg, _, _ = exp_config.get_configs()
+    latest = -1
+    for phase_idx, unlabeled_count in enumerate(unlabeled_counts):
+        best_ckpt = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, unlabeled_count, "best")
+        last_ckpt = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, unlabeled_count, "last")
+        if best_ckpt.exists() and last_ckpt.exists():
+            latest = phase_idx
+        else:
+            break
+    return latest
+
+
+def neighbor_unlabeled_curriculum_phase_index(train_cfg: TrainConfig, unlabeled_count: int) -> int:
+    unlabeled_counts = neighbor_unlabeled_curriculum_counts(train_cfg)
+    if unlabeled_count not in unlabeled_counts:
+        raise ValueError(
+            f"Requested unlabeled curriculum count U{unlabeled_count}, but valid counts are: "
+            + ", ".join(f"U{count}" for count in unlabeled_counts)
+        )
+    return unlabeled_counts.index(unlabeled_count)
+
+
+def archive_neighbor_unlabeled_curriculum_phase_outputs(
+    exp_config: ExperimentConfig,
+    unlabeled_count: int,
+) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = exp_config.checkpoint_path("semisupervised", "best").parent
+    prediction_dir = exp_config.outputs_dir / "predictions"
+    paths = [
+        checkpoint_dir / f"best_semisupervised_U{unlabeled_count}.ckpt",
+        checkpoint_dir / f"last_semisupervised_U{unlabeled_count}.ckpt",
+        prediction_dir / f"best_semisupervised_U{unlabeled_count}",
+        prediction_dir / f"last_semisupervised_U{unlabeled_count}",
+    ]
+    for path in paths:
+        if path.exists():
+            archive_path(path, timestamp)
+
+
+def publish_final_neighbor_unlabeled_curriculum_checkpoint(
+    exp_config: ExperimentConfig,
+    final_unlabeled_count: int,
+) -> None:
+    final_best = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, final_unlabeled_count, "best")
+    final_last = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, final_unlabeled_count, "last")
+    canonical_best = exp_config.checkpoint_path("semisupervised", "best")
+    canonical_last = exp_config.checkpoint_path("semisupervised", "last")
+    canonical_best.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(final_best, canonical_best)
+    shutil.copy2(final_last, canonical_last)
+    print(
+        "Published final unlabeled-curriculum checkpoints: "
+        f"{final_best} -> {canonical_best} | {final_last} -> {canonical_last}"
+    )
+
+
+def run_neighbor_unlabeled_curriculum_phase(
+    exp_config: ExperimentConfig,
+    supervised_best: Path,
+    unlabeled_count: int,
+    *,
+    force: bool = False,
+) -> None:
+    train_cfg, _, _ = exp_config.get_configs()
+    phase_idx = neighbor_unlabeled_curriculum_phase_index(train_cfg, unlabeled_count)
+    best_ckpt = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, unlabeled_count, "best")
+    last_ckpt = neighbor_unlabeled_curriculum_checkpoint_path(exp_config, unlabeled_count, "last")
+
+    if force:
+        archive_neighbor_unlabeled_curriculum_phase_outputs(exp_config, unlabeled_count)
+    elif train_cfg.auto_resume and best_ckpt.exists() and last_ckpt.exists():
+        print(
+            f"Skipping neighbor unlabeled curriculum phase U{unlabeled_count} "
+            f"because outputs already exist: {best_ckpt} | {last_ckpt}"
+        )
+        return
+    elif best_ckpt.exists() or last_ckpt.exists():
+        raise FileExistsError(
+            f"Partial or stale outputs already exist for U{unlabeled_count}. "
+            "Use --force_semisupervised to archive and rerun this U-count."
+        )
+
+    if not supervised_best.exists():
+        raise FileNotFoundError(
+            f"Unlabeled curriculum phase U{unlabeled_count} requires supervised best checkpoint: "
+            f"{supervised_best}"
+        )
+
+    train_neighbor_phase(
+        exp_config=exp_config,
+        mode="semisupervised",
+        fit_dataset_mode="semisupervised",
+        max_epochs=train_cfg.resolved_neighbor_semisupervised_max_epochs,
+        weights_checkpoint_path=supervised_best,
+        training_state_checkpoint_path=supervised_best,
+        best_ckpt_path=best_ckpt,
+        last_ckpt_path=last_ckpt,
+        checkpoint_tag=f"U{unlabeled_count}",
+        neighbor_unlabeled_limit=unlabeled_count,
+        phase_index=phase_idx,
+        carry_best_score=False,
+    )
+
+
+def run_neighbor_unlabeled_curriculum(exp_config: ExperimentConfig, supervised_best: Path) -> None:
+    train_cfg, _, _ = exp_config.get_configs()
+    unlabeled_counts = neighbor_unlabeled_curriculum_counts(train_cfg)
+    if not unlabeled_counts:
+        return
+
+    completed_phase = (
+        latest_completed_neighbor_unlabeled_curriculum_phase(exp_config, unlabeled_counts)
+        if train_cfg.auto_resume
+        else -1
+    )
+    final_phase_idx = len(unlabeled_counts) - 1
+    final_unlabeled_count = unlabeled_counts[final_phase_idx]
+    canonical_best = exp_config.checkpoint_path("semisupervised", "best")
+    canonical_last = exp_config.checkpoint_path("semisupervised", "last")
+    if (
+        train_cfg.auto_resume
+        and completed_phase >= final_phase_idx
+        and canonical_best.exists()
+        and canonical_last.exists()
+    ):
+        print(
+            "Skipping neighbor unlabeled curriculum because all outputs already exist: "
+            f"U{unlabeled_counts[0]}-U{final_unlabeled_count}"
+        )
+        return
+
+    start_phase = completed_phase + 1
+    if start_phase == 0:
+        print(
+            "Starting neighbor unlabeled curriculum "
+            f"from U{unlabeled_counts[0]} to U{final_unlabeled_count}."
+        )
+    else:
+        print(f"Resuming neighbor unlabeled curriculum from U{unlabeled_counts[start_phase]}.")
+
+    for phase_idx in range(start_phase, len(unlabeled_counts)):
+        unlabeled_count = unlabeled_counts[phase_idx]
+        run_neighbor_unlabeled_curriculum_phase(exp_config, supervised_best, unlabeled_count)
+
+    publish_final_neighbor_unlabeled_curriculum_checkpoint(exp_config, final_unlabeled_count)
 
 
 def run_neighbor_semisupervised_training(
@@ -681,20 +960,21 @@ def run_neighbor_semisupervised_training(
     skip_supervised: bool = False,
     force_semisupervised: bool = False,
     supervised_only: bool = False,
+    neighbor_unlabeled_count: int | None = None,
 ):
     """
-        Run the non-staged neighbor-based semisupervised training pipeline.
+        Run the neighbor-based semisupervised training pipeline.
 
         Phase 1 trains labelled cached anchors in supervised mode. Phase 2
-        resumes from the supervised best checkpoint, including optimizer and LR
-        scheduler state, and continues in semisupervised mode with local
-        unlabeled neighbors in each batch.
+        either runs the historical single semisupervised phase or a cumulative
+        unlabeled-pool curriculum when configured.
     """
     train_cfg, _, _ = exp_config.get_configs()
     supervised_best = exp_config.checkpoint_path("supervised", "best")
     supervised_last = exp_config.checkpoint_path("supervised", "last")
     semisupervised_best = exp_config.checkpoint_path("semisupervised", "best")
     semisupervised_last = exp_config.checkpoint_path("semisupervised", "last")
+    curriculum_enabled = train_cfg.neighbor_unlabeled_curriculum_step_size > 0
 
     if skip_supervised:
         if not supervised_best.exists():
@@ -723,17 +1003,46 @@ def run_neighbor_semisupervised_training(
         print("Stopping after neighbor supervised phase because --supervised_only was set.")
         return
 
-    if force_semisupervised:
-        print(
-            "Forcing neighbor semisupervised phase from supervised best. "
-            "Existing semisupervised checkpoints/predictions will be archived."
+    if neighbor_unlabeled_count is not None and not curriculum_enabled:
+        raise ValueError(
+            "--neighbor_unlabeled_count requires neighbor_unlabeled_curriculum_step_size > 0."
         )
-        archive_neighbor_semisupervised_outputs(exp_config)
-    elif train_cfg.auto_resume and semisupervised_best.exists() and semisupervised_last.exists():
+
+    if force_semisupervised:
+        if curriculum_enabled and neighbor_unlabeled_count is not None:
+            print(
+                f"Forcing neighbor semisupervised U{neighbor_unlabeled_count} "
+                "from supervised best. Existing outputs for that U-count will be archived."
+            )
+        else:
+            print(
+                "Forcing neighbor semisupervised phase from supervised best. "
+                "Existing semisupervised checkpoints/predictions will be archived."
+            )
+            archive_neighbor_semisupervised_outputs(exp_config)
+    elif (
+        not curriculum_enabled
+        and train_cfg.auto_resume
+        and semisupervised_best.exists()
+        and semisupervised_last.exists()
+    ):
         print(
             "Skipping neighbor semisupervised phase because outputs already exist: "
             f"{semisupervised_best} | {semisupervised_last}"
         )
+        return
+
+    if neighbor_unlabeled_count is not None:
+        run_neighbor_unlabeled_curriculum_phase(
+            exp_config,
+            supervised_best,
+            int(neighbor_unlabeled_count),
+            force=force_semisupervised,
+        )
+        return
+
+    if curriculum_enabled:
+        run_neighbor_unlabeled_curriculum(exp_config, supervised_best)
         return
 
     ssl_resume = (
@@ -754,6 +1063,7 @@ def run_neighbor_semisupervised_training(
         fit_dataset_mode="semisupervised",
         max_epochs=ssl_max_epochs,
         ckpt_path=ssl_resume,
+        neighbor_selection_start_index=train_cfg.neighbor_selection_start_index,
     )
 
 
@@ -764,6 +1074,7 @@ def train(
     skip_supervised: bool = False,
     force_semisupervised: bool = False,
     supervised_only: bool = False,
+    neighbor_unlabeled_count: int | None = None,
 ):
     """
         Main training method for the staged workflow.
@@ -785,6 +1096,10 @@ def train(
         raise ValueError("--supervised_only is only supported for neighbor_semisupervised training.")
     if supervised_only and (skip_supervised or force_semisupervised):
         raise ValueError("--supervised_only cannot be combined with --skip_supervised or --force_semisupervised.")
+    if neighbor_unlabeled_count is not None and train_cfg.training_regime != "neighbor_semisupervised":
+        raise ValueError("--neighbor_unlabeled_count is only supported for neighbor_semisupervised training.")
+    if neighbor_unlabeled_count is not None and supervised_only:
+        raise ValueError("--neighbor_unlabeled_count cannot be combined with --supervised_only.")
     if fully_supervised_stage is None:
         if train_cfg.training_regime == "semisupervised":
             run_semisupervised_staged_training(exp_config)
@@ -801,6 +1116,7 @@ def train(
                 skip_supervised=skip_supervised,
                 force_semisupervised=force_semisupervised,
                 supervised_only=supervised_only,
+                neighbor_unlabeled_count=neighbor_unlabeled_count,
             )
             return
         raise ValueError(f"Unknown training_regime: {train_cfg.training_regime}")
@@ -842,6 +1158,16 @@ def main():
         action="store_true",
         help="For neighbor_semisupervised training, run only the supervised warmup phase.",
     )
+    parser.add_argument(
+        "--neighbor_unlabeled_count",
+        type=int,
+        default=None,
+        help=(
+            "For neighbor_semisupervised curriculum training, run only one cumulative "
+            "unlabeled-pool size, e.g. 5000 for best_semisupervised_U5000.ckpt. "
+            "The phase starts from best_supervised.ckpt."
+        ),
+    )
     
     args = parser.parse_args()
     print("Loading experiment config from:", args.exp_config)
@@ -854,6 +1180,7 @@ def main():
         skip_supervised=args.skip_supervised,
         force_semisupervised=args.force_semisupervised,
         supervised_only=args.supervised_only,
+        neighbor_unlabeled_count=args.neighbor_unlabeled_count,
     )
 
 

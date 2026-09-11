@@ -352,6 +352,9 @@ class SemisupervisedDataset(Dataset):
         neighbor_sampling_mode: str = "spatial",
         neighbor_label_mode: str = "pseudo",
         deterministic_neighbor_selection: bool = False,
+        neighbor_selection_start_index: int = 0,
+        neighbor_unlabeled_limit: Optional[int] = None,
+        neighbor_unlabeled_limit_seed: Optional[int] = None,
         samples_per_class: Dict[int, int] | None = None,
         coordinate_records: Optional[List[Dict[str, int]]] = None,
     ):
@@ -387,6 +390,16 @@ class SemisupervisedDataset(Dataset):
             neighbor_samples_per_anchor: int, optional
                 Number of stored neighbors to randomly emit per anchor at __getitem__ time.
                 Defaults to n_neighbors for backwards compatibility.
+            deterministic_neighbor_selection: bool
+                If true, emit a fixed contiguous neighbor window instead of sampling randomly.
+            neighbor_selection_start_index: int
+                Zero-based index of the first stored neighbor used when deterministic selection is enabled.
+            neighbor_unlabeled_limit: int, optional
+                Limit semisupervised training to a deterministic cumulative subset of
+                stored unlabeled neighbor slots.
+            neighbor_unlabeled_limit_seed: int, optional
+                Seed used to shuffle unlabeled neighbor slots before applying
+                neighbor_unlabeled_limit.
             samples_per_class: dict (Default: None)
                 Optional per-class override for number of centers to sample from each class.
                 Key: class label (int), Value: number of centers to sample (int).
@@ -415,12 +428,22 @@ class SemisupervisedDataset(Dataset):
         self.neighbor_sampling_mode = neighbor_sampling_mode
         self.neighbor_label_mode = neighbor_label_mode
         self.deterministic_neighbor_selection = deterministic_neighbor_selection
+        self.neighbor_selection_start_index = self._resolve_neighbor_selection_start_index(
+            neighbor_selection_start_index
+        )
+        self.neighbor_unlabeled_limit = self._resolve_neighbor_unlabeled_limit(neighbor_unlabeled_limit)
+        self.neighbor_unlabeled_limit_seed = (
+            int(neighbor_unlabeled_limit_seed)
+            if neighbor_unlabeled_limit_seed is not None
+            else int(seed)
+        )
         self.seed = seed
         self.rng = random.Random(self.seed)
         self.samples_per_class = samples_per_class or {}
         self.default_samples_per_class = 1
         self.dim = dim
         self.groups = self._prepare_metadata()
+        self.groups = self._apply_neighbor_unlabeled_limit(self.groups)
         self._refresh_group_index_cache()
         self._report_dataset_summary()
 
@@ -429,17 +452,20 @@ class SemisupervisedDataset(Dataset):
             raise ValueError("stage must be 'supervised' or 'semisupervised'")
         self.mode = mode
         self.groups = self._prepare_metadata()
+        self.groups = self._apply_neighbor_unlabeled_limit(self.groups)
         self._refresh_group_index_cache()
 
     def set_radius(self, radius: int):
         if self.radius != radius:
             self.radius = radius
             self.groups = self._modify_metadata()
+            self.groups = self._apply_neighbor_unlabeled_limit(self.groups)
             self._refresh_group_index_cache()
 
     def increase_radius(self):
         self.radius += 1
         self.groups = self._modify_metadata()
+        self.groups = self._apply_neighbor_unlabeled_limit(self.groups)
         self._refresh_group_index_cache()
 
     def _is_valid_coord(
@@ -487,18 +513,92 @@ class SemisupervisedDataset(Dataset):
             )
         return value
 
-    def _sample_group_neighbors(self, g: dict) -> List[Tuple[int, int, int]]:
-        neighbor_coords = [tuple(map(int, xyz)) for xyz in g["coords"][1:]]
-        if len(neighbor_coords) < self.neighbor_samples_per_anchor:
+    def _resolve_neighbor_selection_start_index(self, neighbor_selection_start_index: int) -> int:
+        value = int(neighbor_selection_start_index)
+        if value < 0:
+            raise ValueError("neighbor_selection_start_index must be >= 0.")
+        if value >= self.n_neighbors:
+            raise ValueError(
+                "neighbor_selection_start_index must be smaller than n_neighbors "
+                f"({value} >= {self.n_neighbors})."
+            )
+        if self.deterministic_neighbor_selection and value + self.neighbor_samples_per_anchor > self.n_neighbors:
+            raise ValueError(
+                "Deterministic neighbor selection window exceeds stored neighbors: "
+                f"start={value}, samples={self.neighbor_samples_per_anchor}, n_neighbors={self.n_neighbors}."
+            )
+        return value
+
+    def _resolve_neighbor_unlabeled_limit(self, neighbor_unlabeled_limit: Optional[int]) -> Optional[int]:
+        if neighbor_unlabeled_limit is None:
+            return None
+        value = int(neighbor_unlabeled_limit)
+        if value < 1:
+            raise ValueError("neighbor_unlabeled_limit must be >= 1 when provided.")
+        return value
+
+    def _apply_neighbor_unlabeled_limit(self, groups: List[dict]) -> List[dict]:
+        for group in groups:
+            group.pop("active_neighbor_indices", None)
+
+        if self.mode != "semisupervised" or self.neighbor_unlabeled_limit is None:
+            return groups
+
+        unlabeled_slots = [
+            (group_idx, neighbor_idx)
+            for group_idx, group in enumerate(groups)
+            for neighbor_idx in range(len(group["coords"]) - 1)
+        ]
+        if not unlabeled_slots:
+            raise ValueError("No unlabeled neighbor slots are available for the requested curriculum.")
+
+        shuffled_slots = list(unlabeled_slots)
+        random.Random(self.neighbor_unlabeled_limit_seed).shuffle(shuffled_slots)
+        selected_slots = shuffled_slots[: min(self.neighbor_unlabeled_limit, len(shuffled_slots))]
+
+        filtered_groups = []
+        selected_anchor_indices = set()
+        for slot_index, (group_idx, neighbor_idx) in enumerate(selected_slots):
+            selected_anchor_indices.add(int(group_idx))
+            group = groups[group_idx]
+            limited_group = dict(group)
+            limited_group["active_neighbor_indices"] = [int(neighbor_idx)]
+            limited_group["curriculum_slot_index"] = int(slot_index)
+            filtered_groups.append(limited_group)
+
+        selected_count = sum(len(group["active_neighbor_indices"]) for group in filtered_groups)
+        print(
+            "Using cumulative unlabeled neighbor subset: "
+            f"{selected_count}/{len(unlabeled_slots)} neighbor slots paired with "
+            f"{len(selected_anchor_indices)}/{len(groups)} anchors "
+            f"(limit={self.neighbor_unlabeled_limit}, seed={self.neighbor_unlabeled_limit_seed})."
+        )
+        return filtered_groups
+
+    def _candidate_neighbor_indices(self, g: dict) -> List[int]:
+        if "active_neighbor_indices" in g:
+            return [int(index) for index in g["active_neighbor_indices"]]
+        return list(range(len(g["coords"]) - 1))
+
+    def _sample_group_neighbor_indices(self, g: dict) -> List[int]:
+        candidate_indices = self._candidate_neighbor_indices(g)
+        if len(candidate_indices) < self.neighbor_samples_per_anchor:
             raise ValueError(
                 "Semisupervised group has fewer stored neighbors than requested: "
-                f"{len(neighbor_coords)} < {self.neighbor_samples_per_anchor}."
+                f"{len(candidate_indices)} < {self.neighbor_samples_per_anchor}."
             )
-        if len(neighbor_coords) == self.neighbor_samples_per_anchor:
-            return neighbor_coords
         if self.deterministic_neighbor_selection:
-            return neighbor_coords[: self.neighbor_samples_per_anchor]
-        return self.rng.sample(neighbor_coords, self.neighbor_samples_per_anchor)
+            start = self.neighbor_selection_start_index
+            stop = start + self.neighbor_samples_per_anchor
+            if stop > len(candidate_indices):
+                raise ValueError(
+                    "Deterministic neighbor selection window exceeds group neighbors: "
+                    f"start={start}, samples={self.neighbor_samples_per_anchor}, group_neighbors={len(candidate_indices)}."
+                )
+            return candidate_indices[start:stop]
+        if len(candidate_indices) == self.neighbor_samples_per_anchor:
+            return candidate_indices
+        return self.rng.sample(candidate_indices, self.neighbor_samples_per_anchor)
 
     def __getitem__(self, idx):
         g = self.groups[idx]
@@ -514,9 +614,10 @@ class SemisupervisedDataset(Dataset):
             return patch, label, segment, torch.tensor(g["coords"][0])
 
         anchor_coord = tuple(map(int, g["coords"][0]))
-        selected_neighbor_coords = self._sample_group_neighbors(g)
-        selected_neighbor_indices = [
-            int(g["coords"][1:].index(tuple(coord))) for coord in selected_neighbor_coords
+        selected_neighbor_indices = self._sample_group_neighbor_indices(g)
+        selected_neighbor_coords = [
+            tuple(map(int, g["coords"][index + 1]))
+            for index in selected_neighbor_indices
         ]
         coords = torch.tensor([anchor_coord, *selected_neighbor_coords])
         coord_names = g.get("coord_names", [g["name"]] * len(g["coords"]))

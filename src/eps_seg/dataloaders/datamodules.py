@@ -38,6 +38,8 @@ class EPSSegDataModule(L.LightningDataModule):
         scheduler_stage_index: int = 0,
         fit_dataset_kind: Literal["scheduler", "neighbor"] = "scheduler",
         fit_dataset_mode: Optional[Literal["supervised", "semisupervised"]] = None,
+        neighbor_selection_start_index: Optional[int] = None,
+        neighbor_unlabeled_limit: Optional[int] = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -47,6 +49,8 @@ class EPSSegDataModule(L.LightningDataModule):
         self.scheduler_stage_index = scheduler_stage_index
         self.fit_dataset_kind = fit_dataset_kind
         self.fit_dataset_mode = fit_dataset_mode
+        self.neighbor_selection_start_index = neighbor_selection_start_index
+        self.neighbor_unlabeled_limit = neighbor_unlabeled_limit
         self.cache_dir = cfg.get_cache_folder()
         self.cache = DatasetCache(cfg, train_cfg=train_cfg)
 
@@ -97,6 +101,11 @@ class EPSSegDataModule(L.LightningDataModule):
 
     def _runtime_stage_seed(self) -> int:
         return int(self.cfg.seed) + int(self.scheduler_stage_index)
+
+    def _runtime_neighbor_selection_start_index(self) -> int:
+        if self.neighbor_selection_start_index is not None:
+            return int(self.neighbor_selection_start_index)
+        return int(self.train_cfg.neighbor_selection_start_index)
 
     def prepare_data(self):
         """
@@ -242,6 +251,14 @@ class EPSSegDataModule(L.LightningDataModule):
                     samples_per_class=self.cfg.samples_per_class,
                     n_neighbors=self.cfg.n_neighbors,
                     neighbor_samples_per_anchor=self.train_cfg.neighbor_samples_per_anchor,
+                    deterministic_neighbor_selection=self.train_cfg.deterministic_neighbor_selection,
+                    neighbor_selection_start_index=self._runtime_neighbor_selection_start_index(),
+                    neighbor_unlabeled_limit=self.neighbor_unlabeled_limit,
+                    neighbor_unlabeled_limit_seed=(
+                        self.train_cfg.neighbor_unlabeled_curriculum_seed
+                        if self.train_cfg.neighbor_unlabeled_curriculum_seed is not None
+                        else self.train_cfg.semisupervised_seed
+                    ),
                     radius=self.train_cfg.neighbor_radius,
                     coordinate_records=self.data["train_coordinate_records"],
                 )
@@ -269,6 +286,7 @@ class EPSSegDataModule(L.LightningDataModule):
                 neighbor_sampling_mode=neighbor_sampling_mode,
                 neighbor_label_mode=neighbor_label_mode,
                 deterministic_neighbor_selection=True,
+                neighbor_selection_start_index=self.train_cfg.neighbor_selection_start_index,
                 radius=self.train_cfg.neighbor_radius,
                 coordinate_records=self.data["val_coordinate_records"],
             )
