@@ -893,6 +893,11 @@ class SemisupervisedDataset(Dataset):
             if coord in used_coords:
                 tries += 1
                 continue
+            # 3D patches span [z - offset, z + offset + 2): keep the whole neighbour patch inside its substack.
+            if self.dim == 3 and z_start is not None and z_stop is not None:
+                if not (z_start + self.offset <= nz < z_stop - self.offset - 1):
+                    tries += 1
+                    continue
             if self._is_valid_coord(name, nz, ny, nx, Z, H, W, z_start=z_start, z_stop=z_stop):
                 used_coords.add(coord)
                 neighbors.append(

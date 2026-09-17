@@ -155,6 +155,15 @@ class DatasetCache:
     def max_patch_offsets(self) -> Tuple[int, int, int]:
         return tuple(max(0, int(size) // 2 - 1) for size in self.cfg.max_patch_size)
 
+    def max_patch_upper_margins(self) -> Tuple[int, int, int]:
+        """
+        Exclusive upper-bound margin per axis: a center ``c`` is valid while ``c < size_axis - margin``.
+
+        Even patch sizes need ``size // 2`` voxels past the center. A size of 1 (2D-only along Z)
+        needs only the center voxel, so the last slice of a volume stays usable.
+        """
+        return tuple(int(size) // 2 for size in self.cfg.max_patch_size)
+
     def is_valid_anchor_coord(
         self,
         labels: Dict[str, np.ndarray],
@@ -176,13 +185,14 @@ class DatasetCache:
         """
         Z, H, W = labels[name].shape
         z_offset, y_offset, x_offset = self.max_patch_offsets()
+        z_upper, y_upper, x_upper = self.max_patch_upper_margins()
         valid = (
-            z_offset <= z < Z - z_offset - 1
-            and y_offset <= y < H - y_offset - 1
-            and x_offset <= x < W - x_offset - 1
+            z_offset <= z < Z - z_upper
+            and y_offset <= y < H - y_upper
+            and x_offset <= x < W - x_upper
         )
         if z_start is not None and z_stop is not None:
-            valid = valid and (int(z_start) + z_offset <= z < int(z_stop) - z_offset - 1)
+            valid = valid and (int(z_start) + z_offset <= z < int(z_stop) - z_upper)
         return valid and labels[name][z, y, x] != -1
 
     def load_source_and_labels(

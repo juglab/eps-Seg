@@ -69,6 +69,16 @@ class InitialLabelSamplingContext:
             return z_offset, offset, offset
         return tuple(max(0, int(size) // 2 - self.label_size) for size in self.max_patch_size)
 
+    @property
+    def max_patch_upper_margins(self) -> tuple[int, int, int]:
+        """
+        Return the exclusive upper-bound margin per axis: a center ``c`` is valid while ``c < size_axis - margin``.
+        A max_patch_size of 1 (2D-only along Z) needs only the center voxel.
+        """
+        if self.max_patch_size is None:
+            return tuple(offset + 1 for offset in self.max_patch_offsets)
+        return tuple(max(0, int(size) // 2 - self.label_size + 1) for size in self.max_patch_size)
+
 
 class InitialLabelSamplingStrategy(Protocol):
     """Interface for constructing the initial labelled scheduler at stage K0.
@@ -175,13 +185,14 @@ def _is_valid_coord(context: InitialLabelSamplingContext, name: str, z: int, y: 
 
     z_size, height, width = context.images[name].shape
     z_offset, y_offset, x_offset = context.max_patch_offsets
-    valid = y_offset <= y < height - y_offset - 1 and x_offset <= x < width - x_offset - 1
+    z_upper, y_upper, x_upper = context.max_patch_upper_margins
+    valid = y_offset <= y < height - y_upper and x_offset <= x < width - x_upper
     if z_offset >= 0:
-        valid = valid and (z_offset <= z < z_size - z_offset - 1)
+        valid = valid and (z_offset <= z < z_size - z_upper)
     bounds = _substack_bounds_for_coord(context=context, name=name, z=z)
     if context.max_patch_size is not None and bounds is not None:
         z_start, z_stop = bounds
-        valid = valid and (z_start + z_offset <= z < z_stop - z_offset - 1)
+        valid = valid and (z_start + z_offset <= z < z_stop - z_upper)
     return bool(valid and context.labels[name][z, y, x] != context.ignore_lbl)
 
 

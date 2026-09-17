@@ -51,7 +51,8 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         None,
         description=(
             "Maximum patch size [Z, Y, X] the dataset can support. Canonical coordinates "
-            "are sampled far enough from image and substack boundaries for this size."
+            "are sampled far enough from image and substack boundaries for this size. "
+            "Z=1 declares a 2D-only dataset (no Z margin; only 2D models can use it)."
         ),
     )
     n_channels: int = Field(..., description="Number of image channels in the dataset")
@@ -153,8 +154,9 @@ class BaseEPSDatasetConfig(BaseEPSConfig):
         self.max_patch_size = [int(size) for size in self.max_patch_size]
         if any(size <= 0 for size in self.max_patch_size):
             raise ValueError("All max_patch_size values must be > 0.")
-        if any(size % 2 != 0 for size in self.max_patch_size):
-            raise ValueError("All max_patch_size values must be even.")
+        z_size, y_size, x_size = self.max_patch_size
+        if y_size % 2 != 0 or x_size % 2 != 0 or (z_size != 1 and z_size % 2 != 0):
+            raise ValueError("max_patch_size Y and X must be even; Z must be even, or 1 for 2D-only datasets.")
         if not 0.0 < self.train_to_val_ratio < 1.0:
             raise ValueError("train_to_val_ratio must be between 0 and 1.")
 
