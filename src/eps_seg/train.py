@@ -1045,24 +1045,36 @@ def run_neighbor_semisupervised_training(
         run_neighbor_unlabeled_curriculum(exp_config, supervised_best)
         return
 
-    ssl_resume = (
-        supervised_best
-        if force_semisupervised
-        else semisupervised_last if train_cfg.auto_resume and semisupervised_last.exists()
-        else supervised_best
-    )
-    supervised_best_epoch = checkpoint_epoch(supervised_best)
-    ssl_max_epochs = (
-        supervised_best_epoch
-        + 1
-        + train_cfg.resolved_neighbor_semisupervised_max_epochs
-    )
+    if train_cfg.auto_resume and semisupervised_last.exists() and not force_semisupervised:
+        # Resume a genuinely interrupted semi-supervised phase, including its
+        # trainer and checkpoint-callback state.
+        semisupervised_last_epoch = checkpoint_epoch(semisupervised_last)
+        train_neighbor_phase(
+            exp_config=exp_config,
+            mode="semisupervised",
+            fit_dataset_mode="semisupervised",
+            max_epochs=(
+                semisupervised_last_epoch
+                + 1
+                + train_cfg.resolved_neighbor_semisupervised_max_epochs
+            ),
+            ckpt_path=semisupervised_last,
+            neighbor_selection_start_index=train_cfg.neighbor_selection_start_index,
+        )
+        return
+
+    # Start a new trainer phase while transferring model, optimizer, scheduler,
+    # precision, and module-buffer state. Passing the supervised checkpoint as
+    # Trainer.fit(ckpt_path=...) would also restore the supervised
+    # ModelCheckpoint callback, causing the SSL best path/score to remain tied
+    # to best_supervised.ckpt and preventing best_semisupervised.ckpt creation.
     train_neighbor_phase(
         exp_config=exp_config,
         mode="semisupervised",
         fit_dataset_mode="semisupervised",
-        max_epochs=ssl_max_epochs,
-        ckpt_path=ssl_resume,
+        max_epochs=train_cfg.resolved_neighbor_semisupervised_max_epochs,
+        weights_checkpoint_path=supervised_best,
+        training_state_checkpoint_path=supervised_best,
         neighbor_selection_start_index=train_cfg.neighbor_selection_start_index,
     )
 

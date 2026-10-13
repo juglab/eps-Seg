@@ -228,3 +228,20 @@ results.DS_Store
 *.sbatch
 *.sh
 *.pdf
+
+# Keep the six-run main-table launcher while ignoring other local scripts.
+!scripts/
+scripts/*
+!scripts/hpc/
+scripts/hpc/*
+!scripts/hpc/spatial_anchorGT_missing6/
+!scripts/hpc/spatial_anchorGT_missing6/jobs.py
+!scripts/hpc/spatial_anchorGT_missing6/README.md
+!scripts/hpc/spatial_anchorGT_missing6/run.sbatch
+!scripts/hpc/spatial_anchorGT_missing6/submit.sh
+!scripts/hpc/spatial_anchorGT_missing6/evaluate_last.py
+!scripts/hpc/spatial_anchorGT_missing6/evaluate_last.sbatch
+!scripts/hpc/spatial_anchorGT_missing6/submit_evaluation.sh
+*.png
+*.csv
+docs/
