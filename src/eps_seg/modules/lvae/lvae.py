@@ -21,6 +21,7 @@ from eps_seg.modules.lvae.layers import (
     BottomUpDeterministicResBlock,
     BlurPool,
 )
+from eps_seg.modules.masking import apply_centre_mask
 from eps_seg.config import LVAEConfig
 
 
@@ -471,50 +472,17 @@ class LadderVAE(nn.Module):
 
     def _mask_input(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Applies masking to the input tensor x according to the specified masking strategy.
+        Mask the centre of every patch. See eps_seg.modules.masking.apply_centre_mask.
+
+        `mask_strategy` is the fill rule: 0 = zeros (the published behaviour), N > 0 = the mean of
+        an N-wide annulus computed per sample and per channel, excluding the masked region.
         """
-        ann_width = self.cfg.mask_strategy  # Depth of the annulus for average masking
-
-        x_masked = x.clone()
-        ps = x.shape[-1]
-        ms = self.mask_size
-        b = (ps - ms) // 2
-        e = b + ms
-
-        mask_binary = torch.zeros_like(x).bool()
-        if self.conv_mult == 2:
-            mask_binary[:, :, b:e, b:e] = 1
-        else:
-            mask_binary[:, :, b:e, b:e, b:e] = 1
-
-        mask_value = 0.0
-        average_mask = None
-        if ann_width > 0:  # If ann_width == 0, fill mask with zeros
-            average_mask = torch.zeros_like(x).bool()
-            if ann_width <= b:
-                # Take an annulus around the masked region
-                if self.conv_mult == 2:
-                    average_mask[
-                        :, :, b - ann_width : e + ann_width, b - ann_width : e + ann_width
-                    ] = 1
-                    average_mask[mask_binary] = 0  # Exclude the masked region itself
-                else:
-                    average_mask[
-                        :,
-                        :,
-                        b - ann_width : e + ann_width,
-                        b - ann_width : e + ann_width,
-                        b - ann_width : e + ann_width,
-                    ] = 1
-                    average_mask[mask_binary] = 0  # Exclude the masked region itself
-            else:
-                # If the annulus would go out of bounds, use the entire unmasked area
-                average_mask = ~mask_binary
-            mask_value = x[average_mask].mean().item()
-
-        x_masked[mask_binary] = mask_value
-
-        return x_masked
+        return apply_centre_mask(
+            x,
+            mask_size=self.mask_size,
+            ann_width=self.cfg.mask_strategy,
+            conv_mult=self.conv_mult,
+        )
 
     def _centre_crop(self, x: torch.Tensor) -> torch.Tensor:
         """Crop the centre window used for inpainting loss."""

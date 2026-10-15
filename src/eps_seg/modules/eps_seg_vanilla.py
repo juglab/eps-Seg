@@ -24,6 +24,7 @@ from eps_seg.modules.lvae.utils import (
     cross_entropy_from_probs,
     pad_img_tensor,
 )
+from eps_seg.modules.masking import apply_centre_mask
 from eps_seg.modules.top_prior import TopPriorSchedulingMixin, build_top_prior_params
 
 
@@ -859,42 +860,18 @@ class EpsSegVanilla(nn.Module):
         }
 
     def _mask_input(self, x: torch.Tensor) -> torch.Tensor:
-        ann_width = self.cfg.mask_strategy
-        x_masked = x.clone()
-        patch_size = x.shape[-1]
-        mask_size = self.mask_size
-        begin = (patch_size - mask_size) // 2
-        end = begin + mask_size
+        """
+        Mask the centre of every patch. See eps_seg.modules.masking.apply_centre_mask.
 
-        mask_binary = torch.zeros_like(x).bool()
-        if self.conv_mult == 2:
-            mask_binary[:, :, begin:end, begin:end] = 1
-        else:
-            mask_binary[:, :, begin:end, begin:end, begin:end] = 1
-
-        mask_value = 0.0
-        if ann_width > 0:
-            average_mask = torch.zeros_like(x).bool()
-            if ann_width <= begin:
-                if self.conv_mult == 2:
-                    average_mask[
-                        :, :, begin - ann_width : end + ann_width, begin - ann_width : end + ann_width
-                    ] = 1
-                else:
-                    average_mask[
-                        :,
-                        :,
-                        begin - ann_width : end + ann_width,
-                        begin - ann_width : end + ann_width,
-                        begin - ann_width : end + ann_width,
-                    ] = 1
-                average_mask[mask_binary] = 0
-            else:
-                average_mask = ~mask_binary
-            mask_value = x[average_mask].mean().item()
-
-        x_masked[mask_binary] = mask_value
-        return x_masked
+        `mask_strategy` is the fill rule: 0 = zeros (the published behaviour), N > 0 = the mean of
+        an N-wide annulus computed per sample and per channel, excluding the masked region.
+        """
+        return apply_centre_mask(
+            x,
+            mask_size=self.mask_size,
+            ann_width=self.cfg.mask_strategy,
+            conv_mult=self.conv_mult,
+        )
 
     def _centre_crop(self, x: torch.Tensor) -> torch.Tensor:
         patch_size = x.shape[-1]
