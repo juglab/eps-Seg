@@ -10,7 +10,7 @@ import torch
 import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger, WandbLogger
 
 from eps_seg.config.train import ExperimentConfig, TrainConfig, metric_tag
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
@@ -119,12 +119,20 @@ def build_model_for_stage(
     return model
 
 
+# Flush the CSV sink several times per epoch (epochs are 100 batches by default) so a running
+# experiment is readable within a couple of minutes, without a write per step on shared storage.
+CSV_FLUSH_EVERY_N_STEPS = 50
+
+
 def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str, stage_idx: int | str | None):
     """
         Build the experiment logger for one stage run.
 
         Each stage gets its own logger name so curves and checkpoints can be
         inspected stage by stage.
+
+        Returns a single logger, or `[primary, CSVLogger]` when `use_csv_logger` is set, so the
+        same metrics are also written to a local `metrics.csv`.
     """
     if stage_idx is None:
         logger_name = f"{exp_config.experiment_name}_{mode}"
@@ -132,16 +140,29 @@ def build_logger(exp_config: ExperimentConfig, train_cfg: TrainConfig, mode: str
         logger_name = f"{exp_config.experiment_name}_{mode}_K{stage_idx}"
     else:
         logger_name = f"{exp_config.experiment_name}_{mode}_{stage_idx}"
+    save_dir = exp_config.get_log_dir()
     if train_cfg.use_wandb:
-        return WandbLogger(
+        primary = WandbLogger(
             name=logger_name,
             project=exp_config.project_name,
-            save_dir=exp_config.get_log_dir(),
+            save_dir=save_dir,
         )
-    return TensorBoardLogger(
+    else:
+        primary = TensorBoardLogger(
+            name=logger_name,
+            save_dir=save_dir,
+        )
+    if not train_cfg.use_csv_logger:
+        return primary
+    # A second, local sink so a running experiment can be read from disk:
+    # <log_dir>/<logger_name>/version_N/metrics.csv. `version` is left to auto-increment, so a
+    # restarted run lands beside the truncated one instead of overwriting it.
+    csv_logger = CSVLogger(
+        save_dir=save_dir,
         name=logger_name,
-        save_dir=exp_config.get_log_dir(),
+        flush_logs_every_n_steps=CSV_FLUSH_EVERY_N_STEPS,
     )
+    return [primary, csv_logger]
 
 
 def checkpoint_epoch(checkpoint_path: Path) -> int:

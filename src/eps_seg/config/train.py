@@ -229,6 +229,15 @@ class TrainConfig(BaseEPSConfig):
     )
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
     log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
+    use_csv_logger: bool = Field(
+        True,
+        description=(
+            "Attach a Lightning CSVLogger alongside the primary logger, writing "
+            "<log_dir>/<run_name>/version_N/metrics.csv. Lets a running experiment be read from disk "
+            "without querying W&B. Purely additive: it logs the same metrics and changes nothing "
+            "about training, seeding or checkpointing."
+        ),
+    )
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
     train_fully_supervised: bool = Field(default=False, description="Whether to use ground truth labels also for pseudo-labeled samples. Used to set the upper bound of the performances achievable by the model.")
     model_confidence_threshold: float = Field(
