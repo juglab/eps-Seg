@@ -159,6 +159,25 @@ class InitialLabelSamplingConfig(BaseEPSConfig):
     )
 
 
+
+# Metrics whose name implies "higher is better". Everything else is treated as a loss (min).
+_MAXIMISED_METRIC_TOKENS = ("dice", "f1", "iou", "accuracy", "precision", "recall", "auc")
+
+
+def metric_mode(metric: str) -> str:
+    """'max' for score-like metrics, 'min' for loss-like ones."""
+    lowered = metric.lower()
+    return "max" if any(token in lowered for token in _MAXIMISED_METRIC_TOKENS) else "min"
+
+
+def metric_tag(metric: str) -> str:
+    """Filename-safe short tag: 'val/CE_epoch' -> 'CE', 'val/dice_score_mean' -> 'dice_score_mean'."""
+    tag = metric.split("/")[-1]
+    if tag.endswith("_epoch"):
+        tag = tag[: -len("_epoch")]
+    return tag.replace("/", "_")
+
+
 class TrainConfig(BaseEPSConfig):
     training_regime: Literal[
         "semisupervised",
@@ -189,8 +208,25 @@ class TrainConfig(BaseEPSConfig):
     alpha: float = Field(default=1.0, description="Weight for the inpainting loss")
     beta: float = Field(default=1e-2, description="Weight for the KLD loss")
     gamma: float = Field(default=0.1, description="Weight for the contrastive loss")
-    monitored_metric: str = Field(default="val/CE_epoch", description="Validation metric used for model checkpointing, early stopping, and staged best-score carry-over.")
-    monitored_metric_mode: Literal["min", "max"] = Field(default="min", description="Optimization direction for the monitored metric. Use 'max' for scores such as Dice and 'min' for losses such as CE.")
+    monitored_metric: str = Field(default="val/CE_epoch", description="Primary validation metric: drives `best_<mode>.ckpt`, staged best-score carry-over, and (unless `early_stopping_metric` is set) early stopping.")
+    monitored_metric_mode: Literal["min", "max"] = Field(default="min", description="Optimization direction for the primary metric. Must agree with the direction implied by its name.")
+    monitored_metrics: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Additional validation metrics to checkpoint on. One `best_<mode>_<tag>.ckpt` is saved "
+            "per extra metric from a SINGLE training run, so monitors can be compared without "
+            "retraining. The primary metric stays `monitored_metric` and keeps the unsuffixed "
+            "filename. None means checkpoint on the primary metric only."
+        ),
+    )
+    early_stopping_metric: Optional[str] = Field(
+        default=None,
+        description=(
+            "Metric that decides when training STOPS. Named explicitly because a run has exactly "
+            "one stopping decision and it is irreversible: stopping late wastes compute, stopping "
+            "early loses accuracy undetectably. None falls back to the primary metric."
+        ),
+    )
     use_wandb: bool = Field(default=True, description="Use Weights and Biases for logging (if key is set in .env file)")
     log_every_n_steps: int = Field(default=1, description="Logging frequency in steps")
     accumulate_grad_batches: int = Field(default=1, description="Number of batches to accumulate gradients over before performing an optimizer step. Useful for simulating larger batch sizes with limited GPU memory.")
@@ -368,6 +404,25 @@ class TrainConfig(BaseEPSConfig):
 
         if not self.monitored_metric:
             raise ValueError("monitored_metric must be a non-empty string.")
+        implied = metric_mode(self.monitored_metric)
+        if self.monitored_metric_mode != implied:
+            raise ValueError(
+                f"monitored_metric_mode={self.monitored_metric_mode!r} disagrees with "
+                f"{self.monitored_metric!r}, whose name implies {implied!r}. A score must be "
+                "maximised and a loss minimised; fix whichever is wrong."
+            )
+        for metric in self.monitored_metrics or []:
+            if not metric:
+                raise ValueError("monitored_metrics entries must be non-empty strings.")
+        if self.early_stopping_metric is not None:
+            if not self.early_stopping_metric:
+                raise ValueError("early_stopping_metric must be a non-empty string when provided.")
+            if self.early_stopping_metric not in self.resolved_monitored_metrics:
+                raise ValueError(
+                    f"early_stopping_metric={self.early_stopping_metric!r} is not checkpointed. "
+                    "Add it to monitored_metrics (or make it monitored_metric) so the epoch that "
+                    "stops training is also the epoch that can be loaded."
+                )
         if not 0.0 <= self.min_initial_label_fraction <= 1.0:
             raise ValueError("min_initial_label_fraction must be between 0 and 1.")
         if not 0.0 <= self.model_confidence_threshold <= 1.0:
@@ -449,6 +504,25 @@ class TrainConfig(BaseEPSConfig):
     @property
     def resolved_neighbor_semisupervised_max_epochs(self) -> int:
         return int(self.neighbor_semisupervised_max_epochs or self.max_epochs)
+
+    @property
+    def resolved_monitored_metrics(self) -> list[str]:
+        """Primary metric first, then any extras, de-duplicated and order-preserving."""
+        metrics = [self.monitored_metric]
+        for metric in self.monitored_metrics or []:
+            if metric not in metrics:
+                metrics.append(metric)
+        return metrics
+
+    @property
+    def resolved_early_stopping_metric(self) -> str:
+        return self.early_stopping_metric or self.monitored_metric
+
+    def mode_for_metric(self, metric: str) -> str:
+        """Direction for a metric. The primary honours `monitored_metric_mode`."""
+        if metric == self.monitored_metric:
+            return self.monitored_metric_mode
+        return metric_mode(metric)
 
     @property
     def resolved_validation_variant(self) -> str:
@@ -548,9 +622,16 @@ class ExperimentConfig(BaseEPSConfig):
         self,
         mode: Literal["supervised", "semisupervised", "active_learning"],
         kind: Literal["best", "last"],
+        metric_suffix: Optional[str] = None,
     ) -> Path:
+        """
+        Path for a checkpoint. `metric_suffix` names a non-primary monitored metric, giving
+        `best_<mode>_<tag>.ckpt`; the primary metric keeps the unsuffixed name so existing
+        prediction, evaluation and reporting tooling is unaffected.
+        """
         train_cfg, dataset_cfg, model_cfg = self.get_configs()
-        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}.ckpt"
+        suffix = f"_{metric_suffix}" if metric_suffix else ""
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}{suffix}.ckpt"
 
     def best_checkpoint_path(self, mode: Literal["supervised", "semisupervised", "active_learning"]) -> Path:
         """Return the path to the best model checkpoint based on the training mode."""
@@ -561,9 +642,11 @@ class ExperimentConfig(BaseEPSConfig):
         mode: Literal["supervised", "semisupervised", "active_learning"],
         stage_idx: int,
         kind: Literal["best", "last"],
+        metric_suffix: Optional[str] = None,
     ) -> Path:
         train_cfg, _, _ = self.get_configs()
-        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}_K{stage_idx}.ckpt"
+        suffix = f"_{metric_suffix}" if metric_suffix else ""
+        return self.checkpoints_dir.resolve() / self.experiment_name / train_cfg.model_name / f"{kind}_{mode}_K{stage_idx}{suffix}.ckpt"
 
     def stage_scheduler_path(self, stage_idx: int) -> Path:
         train_cfg, _, _ = self.get_configs()

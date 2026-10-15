@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
-from eps_seg.config.train import ExperimentConfig, TrainConfig
+from eps_seg.config.train import ExperimentConfig, TrainConfig, metric_tag
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
 from eps_seg.models import LVAEModel
 from eps_seg.training.callbacks import (
@@ -36,6 +36,57 @@ The staged training loop works as follows:
    or the maximum number of stages is reached.
 
 """
+
+
+
+def build_monitor_callbacks(train_cfg, best_ckpt_path):
+    """
+    Builds the Lightning Callbacks for every metric listed in the configuration, plus the early stopping one.
+
+    The primary metric keeps `best_ckpt_path` exactly as given, so prediction, evaluation and
+    reporting see the filename they always did. Each extra metric gets a sibling
+    `<stem>_<tag>.ckpt` next to it, written from the SAME run. 
+    Sibling names are derived from the path, so this works for both
+    the plain (`best_supervised.ckpt`) and staged (`best_supervised_K3.ckpt`) layouts.
+
+    ModelCheckpoint.state_key is built from (monitor, mode, every_n_*), so the instances have
+    distinct state keys and cannot restore each other's checkpoint state on a resume.
+
+    Early stopping is bound to exactly one metric: a run has one stopping decision.
+    """
+    metrics = train_cfg.resolved_monitored_metrics
+    primary = metrics[0]
+    checkpoints = []
+    for metric in metrics:
+        if metric == primary:
+            path = best_ckpt_path
+        else:
+            tag = metric_tag(metric)
+            path = best_ckpt_path.with_name(f"{best_ckpt_path.stem}_{tag}{best_ckpt_path.suffix}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoints.append(
+            ModelCheckpoint(
+                monitor=metric,
+                dirpath=path.parent,
+                filename=path.stem,
+                mode=train_cfg.mode_for_metric(metric),
+                save_top_k=1,
+                save_last=False,
+            )
+        )
+    stopping_metric = train_cfg.resolved_early_stopping_metric
+    early_stopping = EarlyStopping(
+        monitor=stopping_metric,
+        patience=train_cfg.early_stopping_patience,
+        mode=train_cfg.mode_for_metric(stopping_metric),
+        check_on_train_epoch_end=False,
+    )
+    extra = [f"{m} -> {c.filename}.ckpt" for m, c in zip(metrics, checkpoints) if m != primary]
+    print(f"[Checkpointing] primary {primary} -> {best_ckpt_path.name}"
+          + ("; " + "; ".join(extra) if extra else ""))
+    print(f"[EarlyStopping] monitor={stopping_metric} "
+          f"mode={train_cfg.mode_for_metric(stopping_metric)} patience={train_cfg.early_stopping_patience}")
+    return checkpoints, early_stopping
 
 
 def build_model_for_stage(
@@ -183,23 +234,12 @@ def train_one_stage(
             raise FileNotFoundError(f"Previous stage best checkpoint not found: {previous_best_path}")
         shutil.copy2(previous_best_path, best_ckpt_path)
 
-    best_checkpoint = ModelCheckpoint(
-        monitor=train_cfg.monitored_metric,
-        dirpath=best_ckpt_path.parent,
-        filename=best_ckpt_path.stem,
-        mode=train_cfg.monitored_metric_mode,
-        save_top_k=1,
-        save_last=False,
-    )
+    metric_checkpoints, early_stopping = build_monitor_callbacks(train_cfg, best_ckpt_path)
+    best_checkpoint = metric_checkpoints[0]
 
     callbacks = [
-        best_checkpoint,
-        EarlyStopping(
-            monitor=train_cfg.monitored_metric,
-            patience=train_cfg.early_stopping_patience,
-            mode=train_cfg.monitored_metric_mode,
-            check_on_train_epoch_end=False,
-        ),
+        *metric_checkpoints,
+        early_stopping,
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
@@ -222,7 +262,7 @@ def train_one_stage(
                 reference_checkpoint_path=str(weights_checkpoint_path),
                 carried_best_path=str(best_ckpt_path),
                 monitor=train_cfg.monitored_metric,
-                mode=train_cfg.monitored_metric_mode,
+                mode=train_cfg.mode_for_metric(train_cfg.monitored_metric),
             )
         )
 
@@ -337,23 +377,12 @@ def train_neighbor_phase(
             raise FileNotFoundError(f"Previous neighbor best checkpoint not found: {previous_best_path}")
         shutil.copy2(previous_best_path, best_ckpt_path)
 
-    best_checkpoint = ModelCheckpoint(
-        monitor=train_cfg.monitored_metric,
-        dirpath=best_ckpt_path.parent,
-        filename=best_ckpt_path.stem,
-        mode=train_cfg.monitored_metric_mode,
-        save_top_k=1,
-        save_last=False,
-    )
+    metric_checkpoints, early_stopping = build_monitor_callbacks(train_cfg, best_ckpt_path)
+    best_checkpoint = metric_checkpoints[0]
 
     callbacks = [
-        best_checkpoint,
-        EarlyStopping(
-            monitor=train_cfg.monitored_metric,
-            patience=train_cfg.early_stopping_patience,
-            mode=train_cfg.monitored_metric_mode,
-            check_on_train_epoch_end=False,
-        ),
+        *metric_checkpoints,
+        early_stopping,
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
@@ -374,7 +403,7 @@ def train_neighbor_phase(
                 reference_checkpoint_path=str(weights_checkpoint_path),
                 carried_best_path=str(best_ckpt_path),
                 monitor=train_cfg.monitored_metric,
-                mode=train_cfg.monitored_metric_mode,
+                mode=train_cfg.mode_for_metric(train_cfg.monitored_metric),
             )
         )
 
