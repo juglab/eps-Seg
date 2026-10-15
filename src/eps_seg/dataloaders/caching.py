@@ -16,6 +16,16 @@ from eps_seg.data.initial_label_sampling import InitialLabelSamplingContext
 from eps_seg.data.schedule import DataSchedule
 
 
+class CacheValidationError(RuntimeError):
+    """
+    Raised when a cache directory exists but does not match the requested configuration.
+
+    This is NOT a signal to rebuild: these directories are shared between campaigns and a
+    fold_* entry may be a symlink into a parent cache, so rebuilding in place can destroy data
+    belonging to other experiments. The caller must either fix the config or delete the cache.
+    """
+
+
 class DatasetCache:
     """
     Helper class responsible for cache validation, cache building, and fold

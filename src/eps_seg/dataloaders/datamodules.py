@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from eps_seg.config.datasets import BaseEPSDatasetConfig
 from eps_seg.config.models import BaseEPSModelConfig
 from eps_seg.config.train import TrainConfig
-from eps_seg.dataloaders.caching import DatasetCache
+from eps_seg.dataloaders.caching import CacheValidationError, DatasetCache
 from eps_seg.dataloaders.datasets import PredictionDataset, PseudoLabelDataset, SemisupervisedDataset
 from eps_seg.dataloaders.samplers import (
     BalancedScheduledBatchSampler,
@@ -113,14 +113,29 @@ class EPSSegDataModule(L.LightningDataModule):
         """
         if not self.cfg.enable_cache:
             print("[DataModule] Training cache is mandatory. Ignoring enable_cache=false and using cache-v2.")
-        try:
-            print(f"[DataModule] Checking cache at {self.cache_dir}...")
-            self.cache.check_cache_dir()
-            print("[DataModule] Cache is valid. Reusing cached fold data.")
-        except Exception:
-            print("[DataModule] Cache is missing or incomplete. Building fold cache...")
+
+        # A cache is built ONLY when nothing exists at the target path. If a cache is present but
+        # does not match this configuration we abort instead of rebuilding: `build_cache` writes in
+        # place, caches are shared between campaigns, and `fold_*` entries may be symlinks into a
+        # parent cache, so an automatic rebuild can silently destroy another experiment's data.
+        if not self.cache_dir.exists():
+            print(f"[DataModule] No cache at {self.cache_dir}. Building fold cache...")
             self.cache.build_cache()
             print("[DataModule] Cache build complete.")
+            return
+
+        print(f"[DataModule] Checking cache at {self.cache_dir}...")
+        try:
+            self.cache.check_cache_dir()
+        except Exception as exc:
+            raise CacheValidationError(
+                f"Cache at {self.cache_dir} exists but does not match this configuration: {exc}\n"
+                "Refusing to rebuild, because that would overwrite it in place and these caches are "
+                "shared (fold_* may be symlinks into a parent cache).\n"
+                "Either correct the dataset config so it matches the cache, delete or backup the directory "
+                " to force a rebuild."
+            ) from exc
+        print("[DataModule] Cache is valid. Reusing cached fold data.")
 
     def get_data_statistics(self) -> Tuple[float, float]:
         return self.data["data_mean"], self.data["data_std"]
